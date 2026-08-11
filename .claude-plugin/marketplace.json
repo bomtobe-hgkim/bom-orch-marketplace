@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "bom-orch-marketplace",
+  "description": "Claude와 GPT CLI 워커를 교차검증하는 Bom Orchestration 플러그인 마켓플레이스",
+  "owner": {
+    "name": "hyeongi-home"
+  },
+  "plugins": [
+    {
+      "name": "bom-orch",
+      "description": "Claude와 GPT 두 CLI 워커를 교차검증으로 오케스트레이션하고 무엇이 통했는지 학습하는 MCP 서버",
+      "author": {
+        "name": "hyeongi-home"
+      },
+      "source": "./claude-plugins/bom-orch",
+      "homepage": "https://github.com/bomtobe-hgkim/bom-orch-marketplace",
+      "repository": "https://github.com/bomtobe-hgkim/bom-orch-marketplace",
+      "license": "MIT",
+      "keywords": [
+        "MCP",
+        "Claude",
+        "GPT",
+        "orchestration"
+      ],
+      "category": "development"
+    }
+  ]
+}

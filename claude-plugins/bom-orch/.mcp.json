@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "bom-orch": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/dist/server.mjs"
+      ],
+      "timeout": 3600000
+    }
+  }
+}

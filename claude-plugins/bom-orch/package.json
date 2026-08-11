@@ -1,0 +1,14 @@
+{
+  "name": "bom-orch",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude와 GPT 두 CLI 워커를 교차검증으로 오케스트레이션하고 무엇이 통했는지 학습하는 MCP 서버",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.10"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0"
+  }
+}

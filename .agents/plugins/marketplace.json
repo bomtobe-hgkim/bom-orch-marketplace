@@ -1,0 +1,23 @@
+{
+  "name": "bom-orch-marketplace",
+  "interface": {
+    "displayName": "Bom Orchestration Marketplace"
+  },
+  "plugins": [
+    {
+      "name": "bom-orch",
+      "source": {
+        "source": "local",
+        "path": "./plugins/bom-orch"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL",
+        "products": [
+          "CODEX"
+        ]
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
