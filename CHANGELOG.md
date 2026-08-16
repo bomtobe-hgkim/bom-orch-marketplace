@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 - 2026-08-16
+
+- Correct the README: learning is **not** scoped per repository. Runs are bucketed by task
+  class into a single `.bom-orch` store shared by every project and both hosts, and 0.2.1
+  said otherwise. `BOM_ORCH_HOME` is the way to keep projects apart.
+
 ## 0.2.1 - 2026-08-16
 
 - Rewrite the marketplace and plugin READMEs to lead with the limits this release enforces

@@ -179,8 +179,15 @@ skills, which both hosts read.
 
 Every run records which decisions it made — which vendor wrote, which verified,
 which tier ran — and whether the outcome held up under machine evidence. A
-Bayesian bandit uses that history to pick the next run's strategy, per task class,
-per repository.
+Bayesian bandit uses that history to pick the next run's strategy.
+
+**The history is one store, not one per project.** Runs are bucketed by task
+class — a code change in a repository that has a usable test command lands in a
+different bucket from one that does not — and those buckets live in a single
+`.bom-orch` directory under your profile, shared by every repository you point
+`orch_run` at and by both hosts. That is the design: a strategy that works for
+test-bearing code is not a fact about one checkout. Set `BOM_ORCH_HOME` to a
+per-project absolute path if you would rather keep them apart.
 
 It is deliberately conservative about what counts as evidence:
 
