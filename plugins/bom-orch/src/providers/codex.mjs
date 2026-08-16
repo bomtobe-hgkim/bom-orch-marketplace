@@ -1,6 +1,6 @@
 /**
- * codex 프로바이더 — contract.mjs 의 세 함수(`CONTRACT_METHODS`) 뒤로 기존 조각을
- * 조립한다. 「네 함수」였던 것은 계획 3 태스크 9 가 `pickModel` 을 지우기 전 수다.
+ * codex 프로바이더 — contract.mjs 의 네 함수(`CONTRACT_METHODS`) 뒤로 기존 조각을
+ * 조립한다. 계획 3 태스크 9 가 `pickModel` 을 지운 뒤 quality-gate preflight 가 추가됐다.
  *
  * claude.mjs 와 같은 구조다. 다른 점만 codex 쪽 조각(resolveLaunch 의 execPathVar
  * 없음, buildCodexArgs, runCodex, turnStatus 어휘, notice 없음)으로 바꿨다.
@@ -82,6 +82,35 @@ function describeError(error) {
   } catch {
     // describeError 자신이 깨지면 호출부가 오류를 보고할 방법이 없어진다.
     return { error: '알 수 없는 오류', recovery: 'codex 실행 로그를 확인하세요.' };
+  }
+}
+
+async function preflight(signal, deps = {}) {
+  const resolveLaunchFn = deps.resolveLaunch ?? defaultResolveLaunch;
+  try {
+    const launch = await resolveLaunchFn({ basename: 'codex' });
+    if (!launch || typeof launch.command !== 'string' || launch.command === '') {
+      return {
+        available: false,
+        error: 'codex CLI 실행 경로를 확인하지 못했습니다.',
+        recovery: 'codex CLI 설치와 PATH 설정을 확인하세요.',
+      };
+    }
+    return { available: true };
+  } catch (error) {
+    if (error?.code === 'cli_not_found') return { available: false, ...describeError(error) };
+    if (error?.code === 'cli_shim_only') {
+      return {
+        available: false,
+        error: 'codex CLI 네이티브 실행 파일을 찾지 못했습니다.',
+        recovery: '네이티브 codex 실행 파일을 설치하고 PATH 설정을 확인하세요.',
+      };
+    }
+    return {
+      available: false,
+      error: 'codex CLI 실행 경로 확인에 실패했습니다.',
+      recovery: 'codex CLI 설치와 PATH 설정을 확인하세요.',
+    };
   }
 }
 
@@ -258,6 +287,7 @@ async function run({
 
 export const codexProvider = {
   id: 'codex',
+  preflight,
   discover,
   run,
   describeError,

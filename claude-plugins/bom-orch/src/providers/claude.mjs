@@ -1,6 +1,6 @@
 /**
- * claude 프로바이더 — contract.mjs 의 세 함수(`CONTRACT_METHODS`) 뒤로 기존 조각을
- * 조립한다. 「네 함수」였던 것은 계획 3 태스크 9 가 `pickModel` 을 지우기 전 수다.
+ * claude 프로바이더 — contract.mjs 의 네 함수(`CONTRACT_METHODS`) 뒤로 기존 조각을
+ * 조립한다. 계획 3 태스크 9 가 `pickModel` 을 지운 뒤 quality-gate preflight 가 추가됐다.
  *
  * 범용 코드는 이 파일의 존재를 알 뿐, 안에서 resolveBinary/buildClaudeArgs/runClaude 를
  * 어떻게 엮었는지는 몰라야 한다. 새 로직은 여기 최소로 둔다 — 나머지는 이미 개별
@@ -110,6 +110,35 @@ function describeError(error) {
   } catch {
     // describeError 자신이 깨지면 호출부가 오류를 보고할 방법이 없어진다.
     return { error: '알 수 없는 오류', recovery: 'claude 실행 로그를 확인하세요.' };
+  }
+}
+
+async function preflight(signal, deps = {}) {
+  const resolveLaunchFn = deps.resolveLaunch ?? defaultResolveLaunch;
+  try {
+    const launch = await resolveLaunchFn({ basename: 'claude', execPathVar: 'CLAUDE_CODE_EXECPATH' });
+    if (!launch || typeof launch.command !== 'string' || launch.command === '') {
+      return {
+        available: false,
+        error: 'claude CLI 실행 경로를 확인하지 못했습니다.',
+        recovery: 'Claude Code 설치와 PATH 설정을 확인하세요.',
+      };
+    }
+    return { available: true };
+  } catch (error) {
+    if (error?.code === 'cli_not_found') return { available: false, ...describeError(error) };
+    if (error?.code === 'cli_shim_only') {
+      return {
+        available: false,
+        error: 'claude CLI 네이티브 실행 파일을 찾지 못했습니다.',
+        recovery: '네이티브 Claude Code 실행 파일을 설치하고 PATH 설정을 확인하세요.',
+      };
+    }
+    return {
+      available: false,
+      error: 'claude CLI 실행 경로 확인에 실패했습니다.',
+      recovery: 'Claude Code 설치와 PATH 설정을 확인하세요.',
+    };
   }
 }
 
@@ -272,9 +301,83 @@ async function run({
   return envelope;
 }
 
+
+/**
+ * 설계 §5.8 S2(a) — 쓰기 역할의 보안 하한.
+ *
+ * ★★ CVE-2026-40068: 2.1.84 미만 Claude Code 가 worktree `commondir` 신뢰 검증을 우회해
+ *   hook 을 실행한다. 완화책 (c)(우리 git 호출의 `core.hooksPath` 등 강제)로는 못 막는다 —
+ *   취약한 쪽은 **델리게이트 자신의 프로세스**이고, 우리가 쓰기 가능한 워크트리를 건네준
+ *   CLI 를 우리 플래그로 묶을 수는 없다. 그래서 읽기 전용 역할은 그대로 두고 `worker` 만
+ *   막는다. 이것이 설계가 말한 "read-only 로 강등" 이다.
+ *
+ * ★★ **모르면 막지 않는다.** 이 저장소의 평소 본능은 fail-closed 지만 여기서만 반대다:
+ *   읽지 못한 버전은 "취약하다" 의 증거가 아니고, 추측하는 게이트는 버전 문자열 형식이
+ *   바뀌는 날 멀쩡한 설치를 전부 벽돌로 만든다. 막아야 할 것보다 게이트가 더 위험해진다.
+ *   실제로 파싱해서 실제로 하한 미만인 경우에만 막는다.
+ *
+ * ★ `preflight` 에 넣지 않은 이유: 그쪽은 CLI 를 실행하지 않는다는 계약이다(닫힌 계약 #9).
+ *   그래서 자기 이름을 가진 선택적 메서드로 둔다 — 권고가 없는 프로바이더는 구현하지 않는다.
+ */
+const CLAUDE_WRITER_FLOOR = [2, 1, 84];
+
+/** 자유형 버전 문자열에서 major.minor.patch 를 뽑는다. `src/git.mjs` 와 같은 모양이다. */
+function parseCliVersion(text) {
+  const match = /(\d+)\.(\d+)\.(\d+)/.exec(typeof text === 'string' ? text : '');
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
+function meetsFloor(version, floor) {
+  for (let i = 0; i < floor.length; i += 1) {
+    const value = version[i] ?? 0;
+    if (value > floor[i]) return true;
+    if (value < floor[i]) return false;
+  }
+  return true;
+}
+
+async function securityFloor(signal, deps = {}) {
+  const unknown = (reason) => ({ writable: true, version: null, reason });
+  const resolveLaunchFn = deps.resolveLaunch ?? defaultResolveLaunch;
+  const runFn = deps.run ?? ((options) => runCli({ ...options, collect: (text) => ({ text }), sendStdin: true }));
+  let launch;
+  try {
+    launch = await resolveLaunchFn({ basename: 'claude', execPathVar: 'CLAUDE_CODE_EXECPATH' });
+  } catch { return unknown('launch_unresolved'); }
+  let result;
+  try {
+    result = await runFn({
+      binary: launch.command,
+      prefixArgs: launch.prefixArgs,
+      args: ['--version'],
+      instruction: '',
+      signal,
+      authNames: CLAUDE_AUTH_NAMES,
+    });
+  } catch { return unknown('version_probe_failed'); }
+  if (!result || result.spawnError || (result.exitCode !== 0 && result.exitCode !== null)) {
+    return unknown('version_probe_failed');
+  }
+  const parsed = parseCliVersion(result.text);
+  if (parsed === null) return unknown('version_unparsed');
+  const version = parsed.join('.');
+  if (meetsFloor(parsed, CLAUDE_WRITER_FLOOR)) {
+    return { writable: true, version, reason: 'meets_floor' };
+  }
+  return {
+    writable: false,
+    version,
+    reason: 'below_floor',
+    error: `claude ${version} 은(는) 워크트리 탈출 취약점(CVE-2026-40068)이 있어 쓰기 역할을 맡길 수 없습니다. 하한은 2.1.84 입니다.`,
+    recovery: 'Claude Code 를 2.1.84 이상으로 올리거나, 다른 벤더를 writer 로 지정하세요. 이 버전도 planner·verifier 로는 쓸 수 있습니다.',
+  };
+}
+
 export const claudeProvider = {
   id: 'claude',
+  preflight,
   discover,
   run,
   describeError,
+  securityFloor,
 };

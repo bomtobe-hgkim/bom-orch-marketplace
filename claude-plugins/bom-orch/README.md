@@ -10,6 +10,21 @@ Bom Orchestration runs locally as an MCP server and coordinates authenticated Cl
 - `orch_stats` reports execution and learning statistics.
 - `orch_reward` records human reward feedback for a completed run.
 
+## Before you rely on an `orch_run` result
+
+- The verifier returns a **structured verifier** verdict, not a prose approval.
+- `candidates: 2` competes two independent candidates and roughly doubles provider, writer,
+  and test cost.
+- `wait_ms` is one shared deadline for the whole run, not a per-lane budget.
+- A `tie` keeps both candidate patches as recoverable artifacts and produces
+  no representative patch.
+- A missing or untrusted test runner caps the result at `unverified`.
+- An overly long state path ends as `blocked` before any worktree or artifact is created;
+  set `BOM_ORCH_HOME` to a shorter directory and call again.
+- Patches are **not applied automatically** — you apply the returned patch file yourself.
+- The disposable worktree is **not an OS sandbox**; worker code and repository test scripts
+  run with your user privileges.
+
 ## Post-install check
 
 After installation, open a new host session and ask it to list the Bom Orchestration tools. Confirm that all five `orch_*` tools above are present, then call `orch_models`. Call `orch_run` only after both worker CLIs are authenticated.

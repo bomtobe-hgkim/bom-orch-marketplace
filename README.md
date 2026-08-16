@@ -56,6 +56,32 @@ CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1 claude plugin marketplace add bomtobe-hgkim/bo
 
 Automation that may already configure this variable should preserve the existing value. For example, use `if (-not $env:CLAUDE_CODE_PLUGIN_PREFER_HTTPS) { $env:CLAUDE_CODE_PLUGIN_PREFER_HTTPS = '1' }` in PowerShell or `: "${CLAUDE_CODE_PLUGIN_PREFER_HTTPS:=1}"` in Bash/Zsh before invoking Claude.
 
+## What `orch_run` promises, and what it does not
+
+`orch_run` decides an outcome from a structured verifier verdict and revision-bound machine
+evidence, not from a worker's prose report. Opt in to `candidates: 2` to compete two
+independent candidates. Read these eight limits before you rely on a result.
+
+- **Structured verifier migration.** The verifier now returns structured JSON checks and
+  issues. Callers that treated a prose approval as a pass need to be updated.
+- **`candidates: 2` roughly doubles cost.** Two lanes each author, each cross-verify, and each
+  run their own regression evidence, so provider, writer, and test calls all roughly double.
+- **One shared deadline.** `wait_ms` bounds the whole run, not each lane. After it passes no
+  new provider, test, or judge call starts.
+- **A `tie` has no representative patch.** When the judges disagree, both candidate patches
+  stay on disk as recoverable artifacts and no top-level patch is produced. Read both and
+  choose yourself.
+- **Missing or untrusted tests cap confidence at `unverified`.** If no test command was found,
+  or the runner cannot prove which test covers which changed file, the envelope stops there.
+- **Overly long state or artifact paths block before execution.** A state root deep enough to
+  overflow the response budget ends as `blocked` before any worktree or artifact is created.
+  Point `BOM_ORCH_HOME` at a shorter directory and call again.
+- **Patches are not applied automatically.** The result is a patch file path; you apply it
+  with `git apply` after reading it.
+- **A disposable worktree is not an OS sandbox.** Worker-authored code and the repository's
+  own test scripts run with your user privileges. Do not point this at a repository you do
+  not trust.
+
 ## Runtime and data handling
 
 The repository publishes readable source plus a prebuilt, self-contained server bundle. Execution remains local on your machine. Prompts and results may be sent to the selected Claude or OpenAI CLI provider according to that provider's configuration and terms. Learning state is stored under the user's profile `.bom-orch` directory by default. No hosted Bom Orchestration service receives prompts, results, or learning state.

@@ -79,9 +79,29 @@ const DEFAULT_LIMIT = 500;
  *   관계는 `appliedAxes ⊆ rewardableAxes` 이고, 갱신에 실패한 축이 있으면 진부분집합이다.
  *   이 키에도 같은 규칙이 걸린다 — 옛 줄에는 없으므로 `Array.isArray` 로 갈라라.
  */
+/**
+ * ★ 태스크 14(정책 v2)가 더한 여덟 키. 앞의 열넷은 **하나도 지우지 않는다.**
+ *
+ *   · `policyVersion` — 이 줄을 어느 규칙으로 읽어야 하는지. 없거나 1이면 v1 이다.
+ *     `orch_reward` 가 이 값 하나로 갈라진다(폴백하지 않는다 — 그랬다가는 v2 줄의 동결된
+ *     arm 대신 `decisions` 를 읽어 **실행하지 않은 팔**을 보상한다).
+ *   · `candidateCount` · `selection` — 왜 어떤 축이 빠졌는지를 사후에 설명하는 사실.
+ *     c2 는 두 arm 을 다 돌렸으므로 placement 가 없고, `single_survivor` 는 mix 가 없다.
+ *   · `effectiveChoices` — `axis → { arm, identifiable, reason }`. 실제로 무엇이 돌았고
+ *     왜 배울 수 없었는지를 남긴다. **보상 권위는 아니다**(아래 두 map 이다).
+ *   · `appliedChoices` · `rewardableChoices` — `axis → arm`. **arm 까지** 동결하는 것이
+ *     핵심이다(설계 §14.3): `decisions[axis]` 로 나중에 재구성하면 다중 후보에서 실행하지
+ *     않은 arm 에 보상이 간다. `appliedAxes`/`rewardableAxes` 는 이 map 의 키에서 파생해
+ *     계속 채우므로 두 형식이 한 소비자로 읽힌다.
+ *   · `attemptRefs` · `artifactRefs` — **논리 ID 와 ref 만**이다. attempt 본문·패치 바이트는
+ *     저널에 들어오지 않는다. artifact 는 30일 뒤 만료되지만 그것이 정정을 막지 않는다 —
+ *     보상 권위는 동결된 choice map 이지 패치 내용이 아니다.
+ */
 export const RUN_ENTRY_KEYS = Object.freeze([
   'runId', 'at', 'updatedAt', 'taskClass', 'decisions', 'outcome',
   'appliedGrade', 'appliedAxes', 'rewardableAxes', 'appliedGenerations', 'rewardableGenerations', 'operationId', 'rewardApplied', 'note',
+  'policyVersion', 'candidateCount', 'attemptRefs', 'artifactRefs', 'selection',
+  'effectiveChoices', 'appliedChoices', 'rewardableChoices',
 ]);
 
 const pathsFor = (stateRoot) =>

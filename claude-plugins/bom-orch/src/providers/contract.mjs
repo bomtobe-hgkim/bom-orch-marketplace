@@ -2,10 +2,15 @@
  * 프로바이더 계약.
  *
  * 프로바이더는 서로 근본적으로 다를 수 있다 — 지금은 둘 다 서브프로세스지만, 범용
- * 코드(tools.mjs, orchestra/)는 프로바이더 이름을 절대 알면 안 되고 아래 **세 함수**와
+ * 코드(tools.mjs, orchestra/)는 프로바이더 이름을 절대 알면 안 되고 아래 **네 함수**와
  * `id` 로만 닿는다(계획 3 태스크 9 가 `pickModel` 을 지웠다 — 아래 ★ 참조).
  *
  *   id            문자열 식별자. 도구 스키마의 enum 이 여기서 만들어진다.
+ *
+ *   preflight(signal, deps?)
+ *       -> { available, error?, recovery? }
+ *       CLI 실행 경로를 찾는 것만 한다. 버전·help·모델 프로브나 실행 경로는
+ *       돌려주지 않는다. 코디네이터는 실행 시작 전 이 결과를 한 번 얼린다.
  *
  *   discover(signal)
  *       -> { reachable, version?, models?, error?, recovery?, discoveryTimeout? }
@@ -51,12 +56,12 @@
  *   나빠진다. 프로바이더가 모델을 따로 고르는 길을 다시 만들면 같은 결정을 두 곳이
  *   내리게 된다.
  *
- * 세 함수 전부 "throw 하지 않는다"가 문서화된 기대지만, 이 파일도 assertProviderShape
+ * 네 함수 전부 "throw 하지 않는다"가 문서화된 기대지만, 이 파일도 assertProviderShape
  * 도 그것을 강제하지 않는다 — 서브프로세스 spawn 이 동기로 던지는 경우가 실제로
  * 있다. 호출자가 매 호출 지점을 safe* 로 감싸 정상 봉투로 강등한다. describeError
  * 자신이 깨지는 경우까지 포함이다.
  */
-export const CONTRACT_METHODS = Object.freeze(['discover', 'run', 'describeError']);
+export const CONTRACT_METHODS = Object.freeze(['preflight', 'discover', 'run', 'describeError']);
 
 /** 등록 시점에 형태를 검증한다 — 잘못된 모듈은 첫 호출이 아니라 로드에서 죽어야 한다. */
 export function assertProviderShape(provider) {

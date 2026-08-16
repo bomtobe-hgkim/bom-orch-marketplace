@@ -1,8 +1,17 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
+import { lstat, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { resolveBinary } from './providers/resolve-binary.mjs';
 import { canonical } from './real-path.mjs';
+import {
+  MAX_JSON_ARTIFACT_BYTES,
+  MAX_RUN_MANIFEST_BYTES,
+  RUN_ARTIFACT_RETENTION_MS,
+  normalizeRunManifestV1,
+  validateRunManifestTransitionV1,
+  verifyArtifactOwnerOnly,
+} from './run-artifacts.mjs';
 
 /**
  * 고아 프로세스 reaper.
@@ -104,14 +113,17 @@ const SCRATCH_NAMES = Object.freeze([
  * 사용자가 나중에 열어 보는 것이 정상 사용법이다. 30일은 "그 실행을 다시 들여다볼 일이
  * 없다" 고 볼 수 있는 여유이자, 이 디렉터리가 무한히 자라지 않게 하는 상한이다.
  */
-const PATCH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
-
 /**
  * `src/engine.mjs` 가 `patches/` 에 만드는 이름 모양. `<runId>.patch` 하나뿐이고 runId 는
  * `src/worktree.mjs` 의 `RUN_ID_PATTERN` 을 지난 값이다. scratch 와 같은 이유로 모양을
  * 요구한다 — 사용자가 그 디렉터리에 둔 파일에게 나이 문턱은 아무 의미가 없다.
  */
 const PATCH_NAMES = Object.freeze([/^[a-z0-9][a-z0-9_-]{0,63}\.patch$/]);
+const RUN_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const WINDOWS_DEVICE_PATTERN = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
+const INIT_LOCK_PATTERN = /^\.init-lock-([a-z0-9][a-z0-9_-]{0,63})\.json$/;
+const GENERATION_PATTERN = /^[0-9a-f]{12}$/;
+const CHECKPOINT_TEMP_PATTERN = /^\.tmp-manifest\.json-(0|[1-9]\d*)-([0-9a-f]{12})$/;
 
 const ledgerPath = (stateRoot) => join(stateRoot, LEDGER);
 
@@ -135,7 +147,7 @@ let tempCounter = 0;
 async function updateRecords(stateRoot, mutate) {
   const run = async () => {
     try {
-      const next = mutate(await readRecords(stateRoot));
+      const next = await mutate(await readRecords(stateRoot));
       await mkdir(stateRoot, { recursive: true });
       const target = ledgerPath(stateRoot);
       const temp = `${target}.${process.pid}.${tempCounter++}.tmp`;
@@ -235,26 +247,53 @@ export async function trackWorktree({ stateRoot, runId, worktree, deps = {} }) {
  * 부팅 시 한 번 훑는다. **절대 throw 하지 않는다** — 부팅 경로에서 불리므로 여기서
  * 던지면 서버가 안 뜬다.
  */
-export async function sweepOrphans({ stateRoot, deps = {} } = {}) {
+export async function sweepOrphans({
+  stateRoot,
+  deps = {},
+  sweepPatches: shouldSweepPatches = true,
+  sweepRuns: shouldSweepRuns = true,
+  excludeRunId,
+} = {}) {
   const result = {
     killed: [],
     stale: [],
     skipped: [],
     scratch: { removed: 0, checked: 0 },
     patches: { removed: 0, checked: 0 },
+    runs: { removed: [], checked: 0, skipped: [] },
   };
   try {
     const {
       selfPid = process.pid,
       getStartTime = defaultGetStartTime,
       treeKill: kill = treeKill,
+      nowMs: getNowMs = Date.now,
+      patchSweep = sweepPatches,
+      runSweep = sweepRuns,
+      rm: removeWorktree = rm,
     } = deps;
 
-    // ★ 원장 조회 **앞**이다. 원장이 비어 있어도 scratch 와 patches 에는 평문 내용이
+    // ★ 원장 조회 **앞**이다. 원장이 비어 있어도 scratch 와 artifact 에는 평문 내용이
     //   남아 있을 수 있는데, 아래 early return 뒤에 두면 정확히 그 경우에 안 돈다.
-    const nowMs = Date.now();
+    const nowMs = getNowMs();
     result.scratch = await sweepScratch(stateRoot, nowMs);
-    result.patches = await sweepPatches(stateRoot, nowMs);
+    const hasExclusion = excludeRunId !== undefined;
+    const artifactFlagsValid = typeof shouldSweepPatches === 'boolean' && typeof shouldSweepRuns === 'boolean';
+    const exclusionValid = !hasExclusion || validRunId(excludeRunId);
+    const exclusionUsable = exclusionValid && (shouldSweepPatches || shouldSweepRuns || !hasExclusion);
+    if (artifactFlagsValid && exclusionUsable) {
+      const options = hasExclusion ? { excludeRunId } : undefined;
+      if (shouldSweepPatches) {
+        result.patches = options === undefined
+          ? await patchSweep(stateRoot, nowMs)
+          : await patchSweep(stateRoot, nowMs, options);
+      }
+      if (shouldSweepRuns) {
+        result.runs = options === undefined
+          ? await runSweep(stateRoot, nowMs)
+          : await runSweep(stateRoot, nowMs, options);
+      }
+    }
 
     const records = await readRecords(stateRoot);
     if (records.length === 0) return result;
@@ -300,18 +339,38 @@ export async function sweepOrphans({ stateRoot, deps = {} } = {}) {
       }
 
       // 프로세스만 치우고 워크트리를 남기면 디스크가 샌다.
-      const target = await resolveSafeWorktree(stateRoot, record.worktree);
-      if (target !== null) await rm(target, { recursive: true, force: true }).catch(() => {});
-      done.add(`${record.pid}:${record.runId}`);
+      const hasWorktree = typeof record.worktree === 'string' && record.worktree !== '';
+      const target = hasWorktree ? await resolveSafeWorktree(stateRoot, record.worktree) : null;
+      if (hasWorktree && target === null) continue;
+      if (target !== null) {
+        const removed = await removeWorktree(target, { recursive: true, force: true }).then(() => true, () => false);
+        if (!removed) continue;
+      }
+      done.add(worktreeCompletionKey(record.pid, record.runId, target));
     }
 
     if (done.size > 0) {
-      await updateRecords(stateRoot, (current) => current.filter((r) => !done.has(`${r.pid}:${r.runId}`)));
+      await updateRecords(stateRoot, async (current) => {
+        const kept = [];
+        for (const record of current) {
+          const hasWorktree = typeof record.worktree === 'string' && record.worktree !== '';
+          const target = hasWorktree ? await resolveSafeWorktree(stateRoot, record.worktree) : null;
+          if (hasWorktree && target === null || !done.has(worktreeCompletionKey(record.pid, record.runId, target))) {
+            kept.push(record);
+          }
+        }
+        return kept;
+      });
     }
   } catch {
     // 부팅을 막지 않는다.
   }
   return result;
+}
+
+function worktreeCompletionKey(pid, runId, canonicalWorktree) {
+  const path = WINDOWS && typeof canonicalWorktree === 'string' ? canonicalWorktree.toLowerCase() : canonicalWorktree;
+  return JSON.stringify([pid, runId, path]);
 }
 
 /**
@@ -378,6 +437,1200 @@ function isUnder(base, target) {
   return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
 }
 
+function validRunId(value) {
+  return typeof value === 'string' && RUN_ID_PATTERN.test(value) && !WINDOWS_DEVICE_PATTERN.test(value);
+}
+
+function sameCanonicalPath(left, right) {
+  return WINDOWS ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+function compareAscii(left, right) {
+  return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
+}
+
+const exactLstat = (path) => lstat(path, { bigint: true });
+
+function deepFreeze(value) {
+  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const key of Object.keys(value)) deepFreeze(value[key]);
+  return value;
+}
+
+function frozenRunResult({ removed = [], checked = 0, skipped = [] } = {}) {
+  const unique = new Map();
+  for (const record of skipped) unique.set(JSON.stringify([record.runId, record.code]), record);
+  const orderedSkipped = [...unique.values()].sort((left, right) => {
+    if (left.runId === null && right.runId !== null) return -1;
+    if (left.runId !== null && right.runId === null) return 1;
+    return compareAscii(left.runId ?? '', right.runId ?? '') || compareAscii(left.code, right.code);
+  });
+  return deepFreeze({
+    removed: [...new Set(removed)].sort(compareAscii),
+    checked,
+    skipped: orderedSkipped.map((record) => ({ runId: record.runId, code: record.code })),
+  });
+}
+
+function exactFunctionOptions(value, allowed) {
+  if (value === undefined) return {};
+  try {
+    if (value === null || typeof value !== 'object' || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return null;
+    const result = {};
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== 'string' || !allowed.has(key)) return null;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value') || descriptor.value === undefined) return null;
+      if (key !== 'excludeRunId' && typeof descriptor.value !== 'function') return null;
+      result[key] = descriptor.value;
+    }
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+async function canonicalValue(canonicalPath, path) {
+  try {
+    const value = await canonicalPath(path);
+    return typeof value === 'string' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+async function lstatStatus(path, operation) {
+  try {
+    return { exists: true, info: await operation(path, { bigint: true }) };
+  } catch (error) {
+    return error?.code === 'ENOENT' ? { exists: false, info: null } : { exists: null, info: null };
+  }
+}
+
+function kindOf(info) {
+  try {
+    if (info.isSymbolicLink()) return 'link';
+    if (info.isFile()) return 'file';
+    if (info.isDirectory()) return 'directory';
+    return 'other';
+  } catch {
+    return 'other';
+  }
+}
+
+function direntKind(entry) {
+  try {
+    if (entry.isSymbolicLink()) return 'link';
+    if (entry.isFile()) return 'file';
+    if (entry.isDirectory()) return 'directory';
+    return 'other';
+  } catch {
+    return 'other';
+  }
+}
+
+function exactStatInteger(value, family) {
+  if (family === 'bigint') return typeof value === 'bigint' && value >= 0n ? value.toString() : null;
+  if (family === 'synthetic') return Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
+  return null;
+}
+
+function statFamily(info) {
+  const values = [info?.dev, info?.ino, info?.size];
+  if (values.every((value) => typeof value === 'bigint')) return 'bigint';
+  if (values.every((value) => typeof value === 'number')) return 'synthetic';
+  return null;
+}
+
+function safeSizeInteger(value) {
+  if (typeof value === 'bigint') return value >= 0n ? value.toString() : null;
+  return Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
+}
+
+function exactStatTime(info, name, family) {
+  if (family === 'bigint') {
+    const ns = info[`${name}Ns`];
+    return typeof ns === 'bigint' && ns >= 0n ? ns.toString() : null;
+  }
+  const ms = info[`${name}Ms`];
+  return family === 'synthetic' && Number.isFinite(ms) && ms >= 0 && ms <= Number.MAX_SAFE_INTEGER
+    ? String(ms)
+    : null;
+}
+
+function statAuthority(info, kind) {
+  const family = statFamily(info);
+  const dev = exactStatInteger(info?.dev, family);
+  const ino = exactStatInteger(info?.ino, family);
+  const size = exactStatInteger(info?.size, family);
+  const birthtime = exactStatTime(info ?? {}, 'birthtime', family);
+  const mtime = exactStatTime(info ?? {}, 'mtime', family);
+  const ctime = exactStatTime(info ?? {}, 'ctime', family);
+  if (dev === null || ino === null || size === null || birthtime === null || mtime === null || ctime === null) {
+    return null;
+  }
+  return {
+    physicalKey: JSON.stringify([family, kind, dev, ino]),
+    observationKey: JSON.stringify([family, kind, dev, ino, size, birthtime, mtime, ctime]),
+    stableKey: JSON.stringify([family, kind, dev, ino, size, birthtime, mtime]),
+    anchorKey: JSON.stringify([family, kind, dev, ino, birthtime]),
+    deviceKey: JSON.stringify([family, dev]),
+    size,
+    mtime,
+  };
+}
+
+function statIdentity(info, kind) {
+  return statAuthority(info, kind)?.observationKey ?? null;
+}
+
+function quarantineIdentity(info, kind) {
+  return statAuthority(info, kind)?.stableKey ?? null;
+}
+
+function anchorIdentity(info, kind) {
+  return statAuthority(info, kind)?.anchorKey ?? null;
+}
+
+function physicalIdentity(info, kind) {
+  return statAuthority(info, kind)?.physicalKey ?? null;
+}
+
+function safeStatSize(info) {
+  const value = safeSizeInteger(info?.size);
+  if (value === null) return null;
+  const size = Number(value);
+  return Number.isSafeInteger(size) && size >= 0 ? size : null;
+}
+
+function expiredStatMtime(info, nowMs, maxAgeMs) {
+  const family = statFamily(info);
+  if (family === 'bigint') {
+    const mtime = exactStatTime(info, 'mtime', family);
+    return mtime !== null && BigInt(nowMs) * 1_000_000n - BigInt(mtime) >= BigInt(maxAgeMs) * 1_000_000n;
+  }
+  const mtime = exactStatTime(info ?? {}, 'mtime', family);
+  return mtime !== null && nowMs - Number(mtime) >= maxAgeMs;
+}
+
+function samePhysicalFile(left, right) {
+  const leftKey = physicalIdentity(left, 'file');
+  return leftKey !== null && leftKey === physicalIdentity(right, 'file');
+}
+
+function newSnapshot(root) {
+  return { root, paths: new Map(), absent: new Set(), listings: new Map() };
+}
+
+function recordPath(snapshot, path, kind, info) {
+  const authority = statAuthority(info, kind);
+  if (authority === null) return false;
+  snapshot.paths.set(path, {
+    kind,
+    identity: authority.observationKey,
+    quarantineIdentity: authority.stableKey,
+    anchorIdentity: authority.anchorKey,
+    deviceIdentity: authority.deviceKey,
+    physicalIdentity: authority.physicalKey,
+  });
+  return true;
+}
+
+function recordListing(snapshot, path, entries) {
+  const normalized = entries.map((entry) => [entry.name, direntKind(entry)]).sort((a, b) => compareAscii(a[0], b[0]));
+  snapshot.listings.set(path, JSON.stringify(normalized));
+}
+
+async function safeExisting(path, kind, context, codes = {}) {
+  const status = await lstatStatus(path, context.deps.lstat);
+  if (status.exists !== true || kindOf(status.info) !== kind) return { ok: false, code: codes.type ?? 'unsafe_type' };
+  const real = await canonicalValue(context.deps.canonicalPath, path);
+  if (real === null || !sameCanonicalPath(real, resolve(path)) ||
+      !sameCanonicalPath(real, context.root) && !isUnder(context.root, real)) {
+    return { ok: false, code: codes.alias ?? 'alias_mismatch' };
+  }
+  let privatePath = false;
+  try {
+    privatePath = await context.deps.verifyOwnerOnly({ path, kind }) === true;
+  } catch {
+    privatePath = false;
+  }
+  if (!privatePath) return { ok: false, code: codes.permission ?? 'permission_unverified' };
+  if (!recordPath(context.snapshot, path, kind, status.info)) return { ok: false, code: codes.type ?? 'unsafe_type' };
+  return { ok: true, info: status.info };
+}
+
+async function safeReadFile(path, context, { min = 0, max = Number.MAX_SAFE_INTEGER, code = 'invalid_inventory' } = {}) {
+  const checked = await safeExisting(path, 'file', context);
+  if (!checked.ok) return checked;
+  const size = safeStatSize(checked.info);
+  if (size === null || size < min || size > max) return { ok: false, code };
+  try {
+    const bytes = await context.deps.readFile(path);
+    if (!Buffer.isBuffer(bytes) || bytes.length !== size) return { ok: false, code };
+    const after = await context.deps.lstat(path, { bigint: true });
+    if (kindOf(after) !== 'file' || statIdentity(after, 'file') !== statIdentity(checked.info, 'file')) {
+      return { ok: false, code: 'validation_changed' };
+    }
+    return { ok: true, info: after, bytes };
+  } catch {
+    return { ok: false, code };
+  }
+}
+
+async function listDirectory(path, context) {
+  try {
+    const entries = await context.deps.readdir(path, { withFileTypes: true });
+    if (!Array.isArray(entries)) return null;
+    recordListing(context.snapshot, path, entries);
+    return entries;
+  } catch {
+    return null;
+  }
+}
+
+function canonicalJsonBytes(value) {
+  try {
+    return Buffer.from(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function decodeUtf8(bytes) {
+  const text = bytes.toString('utf8');
+  return Buffer.from(text, 'utf8').equals(bytes) ? text : null;
+}
+
+function sha256(bytes) {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+function validCanonicalPid(value) {
+  if (!/^(0|[1-9]\d*)$/.test(value)) return false;
+  const pid = Number(value);
+  return Number.isSafeInteger(pid) && pid >= 0 && String(pid) === value;
+}
+
+function validArtifactTempSuffix(value) {
+  const match = /^(\d+)-([0-9a-f]{12})$/.exec(value);
+  return match !== null && validCanonicalPid(match[1]);
+}
+
+function validCheckpointTempName(name) {
+  const match = CHECKPOINT_TEMP_PATTERN.exec(name);
+  if (match === null) return false;
+  return validCanonicalPid(match[1]);
+}
+
+async function readManifest(path, runId, context) {
+  const file = await safeReadFile(path, context, { min: 1, max: MAX_RUN_MANIFEST_BYTES, code: 'invalid_manifest' });
+  if (!file.ok) return file;
+  const text = decodeUtf8(file.bytes);
+  if (text === null) return { ok: false, code: 'invalid_manifest' };
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { ok: false, code: 'invalid_manifest' };
+  }
+  const normalized = normalizeRunManifestV1(parsed);
+  if (normalized === null || normalized.runId !== runId || !Number.isSafeInteger(normalized.expiresAt) || normalized.expiresAt < 0) {
+    return { ok: false, code: 'invalid_manifest' };
+  }
+  const canonicalBytes = canonicalJsonBytes(normalized);
+  if (canonicalBytes === null || !file.bytes.equals(canonicalBytes)) return { ok: false, code: 'noncanonical_manifest' };
+  return { ok: true, manifest: normalized, bytes: canonicalBytes };
+}
+
+function exactInitLock(parsed, runId) {
+  try {
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed) || Object.getPrototypeOf(parsed) !== Object.prototype) return null;
+    const keys = ['schemaVersion', 'kind', 'runId', 'generation', 'pid', 'finalBasename', 'createdAt', 'expiresAt'];
+    if (Reflect.ownKeys(parsed).length !== keys.length || keys.some((key) => !Object.hasOwn(parsed, key))) return null;
+    if (parsed.schemaVersion !== 1 || parsed.kind !== 'run-artifact-init-lock' || parsed.runId !== runId ||
+        !GENERATION_PATTERN.test(parsed.generation) || !Number.isSafeInteger(parsed.pid) || parsed.pid < 0 ||
+        parsed.finalBasename !== runId || !Number.isSafeInteger(parsed.createdAt) || parsed.createdAt < 0 ||
+        parsed.expiresAt !== parsed.createdAt + RUN_ARTIFACT_RETENTION_MS || !Number.isSafeInteger(parsed.expiresAt)) return null;
+    return {
+      schemaVersion: 1,
+      kind: 'run-artifact-init-lock',
+      runId,
+      generation: parsed.generation,
+      pid: parsed.pid,
+      finalBasename: runId,
+      createdAt: parsed.createdAt,
+      expiresAt: parsed.expiresAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readInitLock(path, runId, context) {
+  const checked = await safeExisting(path, 'file', context);
+  if (!checked.ok) return checked;
+  const size = safeStatSize(checked.info);
+  if (size === 0) return { ok: true, zero: true, info: checked.info, value: null };
+  if (size === null || size > MAX_RUN_MANIFEST_BYTES) {
+    return { ok: false, code: 'invalid_lock' };
+  }
+  let bytes;
+  try {
+    bytes = await context.deps.readFile(path);
+  } catch {
+    return { ok: false, code: 'invalid_lock' };
+  }
+  if (!Buffer.isBuffer(bytes) || bytes.length !== size) return { ok: false, code: 'invalid_lock' };
+  const text = decodeUtf8(bytes);
+  let parsed;
+  try {
+    parsed = text === null ? null : JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  const value = exactInitLock(parsed, runId);
+  const canonicalBytes = value === null ? null : canonicalJsonBytes(value);
+  if (canonicalBytes === null || !bytes.equals(canonicalBytes)) return { ok: false, code: 'invalid_lock' };
+  return { ok: true, zero: false, info: checked.info, value };
+}
+
+async function validatePartialFinal(runDir, lock, context) {
+  const entries = await listDirectory(runDir, context);
+  if (entries === null) return { ok: false, code: 'unexpected_entry' };
+  const names = entries.map((entry) => entry.name);
+  const tempNames = names.filter((name) => name.startsWith('.tmp-manifest.json-'));
+  const expectedTemp = `.tmp-manifest.json-${lock.pid}-`;
+  if (tempNames.length > 1 || tempNames.some((name) =>
+    !name.startsWith(expectedTemp) || !GENERATION_PATTERN.test(name.slice(expectedTemp.length)))) {
+    return { ok: false, code: 'unexpected_entry' };
+  }
+  const children = names.filter((name) => !tempNames.includes(name));
+  const allowedPrefixes = [
+    [],
+    ['candidates'],
+    ['candidates', 'attempts'],
+    ['candidates', 'attempts', 'evidence'],
+  ];
+  const prefix = allowedPrefixes.find((candidate) =>
+    candidate.length === children.length && candidate.every((name) => children.includes(name)));
+  if (prefix === undefined || tempNames.length === 1 && prefix.length !== 3) return { ok: false, code: 'unexpected_entry' };
+  for (const name of prefix) {
+    const entry = entries.find((candidate) => candidate.name === name);
+    if (direntKind(entry) !== 'directory') return { ok: false, code: 'unsafe_type' };
+    const path = join(runDir, name);
+    const checked = await safeExisting(path, 'directory', context);
+    if (!checked.ok) return checked;
+    const nested = await listDirectory(path, context);
+    if (nested === null || nested.length !== 0) return { ok: false, code: 'unexpected_entry' };
+  }
+  if (tempNames.length === 1) {
+    const path = join(runDir, tempNames[0]);
+    const temp = await safeReadFile(path, context, { max: MAX_RUN_MANIFEST_BYTES, code: 'invalid_manifest' });
+    if (!temp.ok) return temp;
+    if (temp.bytes.length > 0) {
+      const text = decodeUtf8(temp.bytes);
+      let parsed = null;
+      let parseable = false;
+      try {
+        if (text !== null) {
+          parsed = JSON.parse(text);
+          parseable = true;
+        }
+      } catch {
+        // An interrupted byte prefix is owned by the exact lock and prefix.
+      }
+      if (parseable) {
+        const manifest = normalizeRunManifestV1(parsed);
+        const bytes = manifest === null ? null : canonicalJsonBytes(manifest);
+        if (manifest === null || manifest.revision !== 0 || manifest.runId !== lock.runId ||
+            manifest.generation !== lock.generation || manifest.createdAt !== lock.createdAt ||
+            manifest.expiresAt !== lock.expiresAt || bytes === null || !bytes.equals(temp.bytes)) {
+          return { ok: false, code: 'invalid_manifest' };
+        }
+      }
+    }
+  }
+  return { ok: true };
+}
+
+function artifactIdentityPath(manifest, entry) {
+  if (entry.artifactKind === 'attempt') {
+    return `runs/${manifest.runId}/attempts/${entry.laneId}-${String(entry.attemptOrdinal).padStart(3, '0')}.json`;
+  }
+  if (entry.artifactKind === 'evidence') {
+    return `runs/${manifest.runId}/evidence/${entry.laneId}-${String(entry.attemptOrdinal).padStart(3, '0')}-${String(entry.evidenceOrdinal).padStart(3, '0')}.json`;
+  }
+  if (entry.artifactKind === 'candidate') return `runs/${manifest.runId}/candidates/${entry.laneId}.patch`;
+  if (entry.artifactKind === 'winner') return `patches/${manifest.runId}.patch`;
+  return null;
+}
+
+function absoluteRelativePath(root, relativePath) {
+  if (typeof relativePath !== 'string' || relativePath === '' || relativePath.includes('\\') ||
+      relativePath.startsWith('/') || relativePath.includes(':')) return null;
+  const parts = relativePath.split('/');
+  if (parts.some((part) => part === '' || part === '.' || part === '..' || part.endsWith('.') || part.endsWith(' '))) return null;
+  const path = resolve(root, ...parts);
+  return isUnder(root, path) ? path : null;
+}
+
+async function streamInventoryFile(path, expected, expectedSize) {
+  let handle;
+  let result;
+  try {
+    handle = await open(path, 'r');
+    const opened = await handle.stat({ bigint: true });
+    if (kindOf(opened) !== 'file' || statIdentity(opened, 'file') !== statIdentity(expected, 'file')) {
+      result = { ok: false, code: 'validation_changed' };
+    } else {
+      const hash = createHash('sha256');
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      let size = 0;
+      while (size < expectedSize) {
+        const length = Math.min(chunk.length, expectedSize - size);
+        const { bytesRead } = await handle.read(chunk, 0, length, size);
+        if (!Number.isSafeInteger(bytesRead) || bytesRead <= 0 || bytesRead > length) {
+          throw new Error('artifact ended before its prevalidated size');
+        }
+        size += bytesRead;
+        hash.update(chunk.subarray(0, bytesRead));
+      }
+      const afterRead = await handle.stat({ bigint: true });
+      result = statIdentity(afterRead, 'file') === statIdentity(opened, 'file')
+        ? { ok: true, size, hash: hash.digest('hex') }
+        : { ok: false, code: 'validation_changed' };
+    }
+  } catch {
+    result = { ok: false, code: 'invalid_inventory' };
+  }
+  try {
+    await handle?.close();
+  } catch {
+    return { ok: false, code: 'invalid_inventory' };
+  }
+  return result;
+}
+
+async function inspectInventoryFile(path, context, {
+  requiredHash = null, requiredBytes = null, maxBytes = null, stream = false,
+} = {}) {
+  const status = await lstatStatus(path, context.deps.lstat);
+  if (status.exists === false) {
+    context.snapshot.absent.add(path);
+    return { ok: true, exists: false, info: null, bytes: null, size: 0, hash: null };
+  }
+  if (status.exists !== true || kindOf(status.info) !== 'file') return { ok: false, code: 'unsafe_type' };
+  if (stream) {
+    const checked = await safeExisting(path, 'file', context);
+    if (!checked.ok) return checked;
+    const size = safeStatSize(checked.info);
+    if (size === null || maxBytes !== null && size > maxBytes ||
+        requiredBytes !== null && size !== requiredBytes) {
+      return { ok: false, code: 'invalid_inventory' };
+    }
+    const streamed = await streamInventoryFile(path, checked.info, size);
+    if (!streamed.ok) return streamed;
+    const after = await lstatStatus(path, context.deps.lstat);
+    if (after.exists !== true || kindOf(after.info) !== 'file' ||
+        statIdentity(after.info, 'file') !== statIdentity(checked.info, 'file')) {
+      return { ok: false, code: 'validation_changed' };
+    }
+    if (streamed.size !== size || requiredBytes !== null && streamed.size !== requiredBytes ||
+        requiredHash !== null && streamed.hash !== requiredHash) return { ok: false, code: 'invalid_inventory' };
+    return { ok: true, exists: true, info: after.info, bytes: null, size: streamed.size, hash: streamed.hash };
+  }
+  const checked = await safeReadFile(path, context, {
+    max: maxBytes ?? Number.MAX_SAFE_INTEGER,
+    code: 'invalid_inventory',
+  });
+  if (!checked.ok) return checked;
+  if (requiredBytes !== null && checked.bytes.length !== requiredBytes ||
+      requiredHash !== null && sha256(checked.bytes) !== requiredHash) return { ok: false, code: 'invalid_inventory' };
+  return {
+    ok: true,
+    exists: true,
+    info: checked.info,
+    bytes: checked.bytes,
+    size: checked.bytes.length,
+    hash: sha256(checked.bytes),
+  };
+}
+
+async function validatePendingArtifact(entry, finalPath, tempPath, context) {
+  const boundedJson = entry.artifactKind === 'attempt' || entry.artifactKind === 'evidence';
+  if (boundedJson && entry.expectedBytes > MAX_JSON_ARTIFACT_BYTES) return { ok: false, code: 'invalid_inventory' };
+  const final = await inspectInventoryFile(finalPath, context, {
+    requiredHash: entry.expectedSha256,
+    requiredBytes: entry.expectedBytes,
+    maxBytes: boundedJson ? MAX_JSON_ARTIFACT_BYTES : null,
+    stream: !boundedJson,
+  });
+  if (!final.ok) return final;
+  const temp = await inspectInventoryFile(tempPath, context, {
+    maxBytes: entry.expectedBytes,
+    stream: !boundedJson,
+  });
+  if (!temp.ok) return temp;
+  if (temp.exists && temp.size === entry.expectedBytes && temp.hash !== entry.expectedSha256) {
+    return { ok: false, code: 'invalid_inventory' };
+  }
+  if (final.exists && temp.exists &&
+      (!samePhysicalFile(final.info, temp.info) || temp.size !== entry.expectedBytes ||
+        final.hash !== temp.hash)) return { ok: false, code: 'invalid_inventory' };
+  return { ok: true, final, temp };
+}
+
+async function validateCommittedArtifact(entry, finalPath, context, { allowAbsent = false } = {}) {
+  if (!sameCanonicalPath(entry.ref.path, finalPath)) return { ok: false, code: 'invalid_inventory' };
+  const boundedJson = entry.artifactKind === 'attempt' || entry.artifactKind === 'evidence';
+  if (boundedJson && entry.ref.bytes > MAX_JSON_ARTIFACT_BYTES) return { ok: false, code: 'invalid_inventory' };
+  const final = await inspectInventoryFile(finalPath, context, {
+    requiredHash: entry.ref.sha256,
+    requiredBytes: entry.ref.bytes,
+    maxBytes: boundedJson ? MAX_JSON_ARTIFACT_BYTES : null,
+    stream: !boundedJson,
+  });
+  if (!final.ok || !allowAbsent && !final.exists) return final.ok ? { ok: false, code: 'invalid_inventory' } : final;
+  return { ok: true, final };
+}
+
+async function validateCheckpointTemp(path, current, currentBytes, context) {
+  const temp = await safeReadFile(path, context, { max: MAX_RUN_MANIFEST_BYTES, code: 'checkpoint_temp_invalid' });
+  if (!temp.ok) return temp;
+  if (temp.bytes.length === 0 || temp.bytes.equals(currentBytes)) return { ok: true };
+  const text = decodeUtf8(temp.bytes);
+  let parsed;
+  try {
+    if (text === null) return { ok: true };
+    parsed = JSON.parse(text);
+  } catch {
+    return { ok: true };
+  }
+  const next = normalizeRunManifestV1(parsed);
+  const canonicalBytes = next === null ? null : canonicalJsonBytes(next);
+  if (next === null || canonicalBytes === null || !canonicalBytes.equals(temp.bytes) || next.runId !== current.runId ||
+      next.generation !== current.generation || next.createdAt !== current.createdAt || next.expiresAt !== current.expiresAt) {
+    return { ok: false, code: 'checkpoint_temp_invalid' };
+  }
+  let validated;
+  try {
+    validated = context.deps.validateTransition(current, next);
+  } catch {
+    validated = null;
+  }
+  const validatedBytes = validated === null ? null : canonicalJsonBytes(validated);
+  return validatedBytes !== null && validatedBytes.equals(temp.bytes)
+    ? { ok: true }
+    : { ok: false, code: 'checkpoint_temp_invalid' };
+}
+
+async function patchesView(manifest, context) {
+  const patchesDir = join(context.root, 'patches');
+  const status = await lstatStatus(patchesDir, context.deps.lstat);
+  if (status.exists === false) {
+    context.snapshot.absent.add(patchesDir);
+    return { ok: true, path: patchesDir, entries: [], exists: false };
+  }
+  if (status.exists !== true || kindOf(status.info) !== 'directory') return { ok: false, code: 'alias_mismatch' };
+  const checked = await safeExisting(patchesDir, 'directory', context, {
+    type: 'alias_mismatch', alias: 'alias_mismatch', permission: 'permission_unverified',
+  });
+  if (!checked.ok) return checked;
+  const entries = await listDirectory(patchesDir, context);
+  return entries === null ? { ok: false, code: 'alias_mismatch' } : { ok: true, path: patchesDir, entries, exists: true };
+}
+
+async function validateWinnerInventory(manifest, winner, context, targets) {
+  const view = await patchesView(manifest, context);
+  if (!view.ok) return { ok: false, code: 'alias_mismatch' };
+  const aliasName = `${manifest.runId}.patch`;
+  const tempPrefix = `.tmp-${aliasName}-`;
+  const relevant = view.entries.filter((entry) => entry.name === aliasName || entry.name.startsWith(tempPrefix));
+  if (winner === null) return relevant.length === 0 ? { ok: true } : { ok: false, code: 'alias_mismatch' };
+  const finalPath = join(view.path, aliasName);
+  const expectedRelative = artifactIdentityPath(manifest, winner);
+  if (winner.relativePath !== expectedRelative || absoluteRelativePath(context.root, winner.relativePath) !== finalPath) {
+    return { ok: false, code: 'invalid_inventory' };
+  }
+  if (Object.hasOwn(winner, 'tempRelativePath')) {
+    const tempPath = absoluteRelativePath(context.root, winner.tempRelativePath);
+    const expectedPrefix = `patches/${tempPrefix}`;
+    if (tempPath === null || !winner.tempRelativePath.startsWith(expectedPrefix)) return { ok: false, code: 'invalid_inventory' };
+    const suffix = winner.tempRelativePath.slice(expectedPrefix.length);
+    if (!validArtifactTempSuffix(suffix)) return { ok: false, code: 'invalid_inventory' };
+    const state = await validatePendingArtifact(winner, finalPath, tempPath, context);
+    if (!state.ok) return { ok: false, code: 'alias_mismatch' };
+    const allowed = new Set([
+      ...(state.final.exists ? [aliasName] : []),
+      ...(state.temp.exists ? [basename(tempPath)] : []),
+    ]);
+    if (relevant.some((entry) => !allowed.has(entry.name)) || relevant.length !== allowed.size) {
+      return { ok: false, code: 'alias_mismatch' };
+    }
+    if (state.final.exists) targets.push(finalPath);
+    if (state.temp.exists) targets.push(tempPath);
+    return { ok: true };
+  }
+  const state = await validateCommittedArtifact(winner, finalPath, context, { allowAbsent: true });
+  if (!state.ok) return { ok: false, code: 'alias_mismatch' };
+  if (relevant.some((entry) => entry.name !== aliasName) || relevant.length !== (state.final.exists ? 1 : 0)) {
+    return { ok: false, code: 'alias_mismatch' };
+  }
+  const candidate = manifest.candidateRefs.find((entry) => entry.candidateId === winner.candidateId);
+  if (candidate?.patchRef === null || candidate?.patchRef === undefined ||
+      candidate.patchRef.sha256 !== winner.ref.sha256 || candidate.patchRef.bytes !== winner.ref.bytes) {
+    return { ok: false, code: 'alias_mismatch' };
+  }
+  if (state.final.exists) targets.push(finalPath);
+  return { ok: true };
+}
+
+async function validateCompleteFinal(runDir, manifestRecord, context) {
+  const { manifest, bytes: manifestBytes } = manifestRecord;
+  const rootEntries = await listDirectory(runDir, context);
+  if (rootEntries === null) return { ok: false, code: 'unexpected_entry' };
+  const checkpointLookalikes = rootEntries.filter((entry) => entry.name.startsWith('.tmp-manifest.json-'));
+  const checkpointEntries = checkpointLookalikes.filter((entry) => validCheckpointTempName(entry.name));
+  if (checkpointEntries.length !== checkpointLookalikes.length) return { ok: false, code: 'checkpoint_temp_invalid' };
+  if (checkpointEntries.length > 1) return { ok: false, code: 'checkpoint_temp_invalid' };
+  const allowedRoot = new Set(['manifest.json', 'candidates', 'attempts', 'evidence', ...checkpointEntries.map((entry) => entry.name)]);
+  if (rootEntries.some((entry) => !allowedRoot.has(entry.name)) || rootEntries.length !== allowedRoot.size) {
+    return { ok: false, code: 'unexpected_entry' };
+  }
+  const directories = new Map();
+  for (const name of ['candidates', 'attempts', 'evidence']) {
+    const entry = rootEntries.find((candidate) => candidate.name === name);
+    if (entry === undefined || direntKind(entry) !== 'directory') return { ok: false, code: 'unsafe_type' };
+    const path = join(runDir, name);
+    const checked = await safeExisting(path, 'directory', context);
+    if (!checked.ok) return checked;
+    const entries = await listDirectory(path, context);
+    if (entries === null) return { ok: false, code: 'unexpected_entry' };
+    directories.set(name, { path, entries, allowed: new Set() });
+  }
+  if (checkpointEntries.length === 1) {
+    if (direntKind(checkpointEntries[0]) !== 'file') return { ok: false, code: 'unsafe_type' };
+    const checkpoint = await validateCheckpointTemp(join(runDir, checkpointEntries[0].name), manifest, manifestBytes, context);
+    if (!checkpoint.ok) return checkpoint;
+  }
+
+  const targets = [runDir];
+  const inventories = [...manifest.pendingArtifacts, ...manifest.committedArtifacts];
+  const winner = inventories.find((entry) => entry.artifactKind === 'winner') ?? null;
+  for (const entry of inventories.filter((item) => item.artifactKind !== 'winner')) {
+    const expectedRelative = artifactIdentityPath(manifest, entry);
+    const finalPath = absoluteRelativePath(context.root, entry.relativePath);
+    if (expectedRelative === null || entry.relativePath !== expectedRelative || finalPath === null) {
+      return { ok: false, code: 'invalid_inventory' };
+    }
+    const owner = entry.artifactKind === 'candidate' ? 'candidates'
+      : entry.artifactKind === 'attempt' ? 'attempts' : 'evidence';
+    const directory = directories.get(owner);
+    if (dirname(finalPath) !== directory.path) return { ok: false, code: 'invalid_inventory' };
+    if (Object.hasOwn(entry, 'tempRelativePath')) {
+      const tempPath = absoluteRelativePath(context.root, entry.tempRelativePath);
+      if (tempPath === null || dirname(tempPath) !== directory.path) return { ok: false, code: 'invalid_inventory' };
+      const expectedTempPrefix = `.tmp-${basename(finalPath)}-`;
+      const suffix = basename(tempPath).startsWith(expectedTempPrefix)
+        ? basename(tempPath).slice(expectedTempPrefix.length) : '';
+      if (!validArtifactTempSuffix(suffix)) return { ok: false, code: 'invalid_inventory' };
+      const state = await validatePendingArtifact(entry, finalPath, tempPath, context);
+      if (!state.ok) return state;
+      if (state.final.exists) directory.allowed.add(basename(finalPath));
+      if (state.temp.exists) directory.allowed.add(basename(tempPath));
+    } else {
+      const state = await validateCommittedArtifact(entry, finalPath, context);
+      if (!state.ok) return state;
+      directory.allowed.add(basename(finalPath));
+    }
+  }
+  for (const { entries, allowed } of directories.values()) {
+    if (entries.some((entry) => !allowed.has(entry.name)) || entries.length !== allowed.size) {
+      return { ok: false, code: 'unexpected_entry' };
+    }
+  }
+  const alias = await validateWinnerInventory(manifest, winner, context, targets);
+  if (!alias.ok) return alias;
+  return { ok: true, targets };
+}
+
+async function validateRunUnit({ root, runsDir, runId, finalEntry, lockEntry, nowMs, deps }) {
+  const context = { root, deps, snapshot: newSnapshot(root) };
+  for (const [path, kind] of [[root, 'directory'], [runsDir, 'directory']]) {
+    const checked = await safeExisting(path, kind, context);
+    if (!checked.ok) return checked;
+  }
+  const currentRuns = await listDirectory(runsDir, context);
+  if (currentRuns === null) return { ok: false, code: 'unsafe_type' };
+  // Discovery establishes which logical IDs are counted. Ownership validation uses
+  // a fresh directory view so a lock/final published in between cannot be mistaken
+  // for the older half-unit that discovery observed.
+  finalEntry = currentRuns.find((entry) => entry.name === runId) ?? null;
+  lockEntry = currentRuns.find((entry) => entry.name === `.init-lock-${runId}.json`) ?? null;
+  const finalPath = join(runsDir, runId);
+  const lockPath = join(runsDir, `.init-lock-${runId}.json`);
+  let lock = null;
+  if (lockEntry !== null) {
+    if (direntKind(lockEntry) !== 'file') return { ok: false, code: 'unsafe_type' };
+    lock = await readInitLock(lockPath, runId, context);
+    if (!lock.ok) return lock.code === 'unsafe_type' || lock.code === 'permission_unverified' || lock.code === 'alias_mismatch'
+      ? lock : { ok: false, code: 'invalid_lock' };
+  } else {
+    context.snapshot.absent.add(lockPath);
+  }
+
+  if (lock?.zero) {
+    if (finalEntry !== null) return { ok: false, code: 'invalid_lock' };
+    const expired = expiredStatMtime(lock.info, nowMs, RUN_ARTIFACT_RETENTION_MS);
+    return { ok: true, expired, targets: expired ? [lockPath] : [], snapshot: context.snapshot };
+  }
+  if (lock !== null && nowMs < lock.value.expiresAt) {
+    return { ok: true, expired: false, targets: [], snapshot: context.snapshot };
+  }
+  if (finalEntry === null) {
+    context.snapshot.absent.add(finalPath);
+    return lock === null
+      ? { ok: false, code: 'missing_manifest' }
+      : { ok: true, expired: true, targets: [lockPath], snapshot: context.snapshot };
+  }
+  if (direntKind(finalEntry) !== 'directory') return { ok: false, code: 'unsafe_type' };
+  const final = await safeExisting(finalPath, 'directory', context);
+  if (!final.ok) return final;
+  const finalEntries = await listDirectory(finalPath, context);
+  if (finalEntries === null) return { ok: false, code: 'unexpected_entry' };
+  const manifestEntry = finalEntries.find((entry) => entry.name === 'manifest.json') ?? null;
+  if (manifestEntry === null) {
+    if (lock === null) return { ok: false, code: 'missing_manifest' };
+    const partial = await validatePartialFinal(finalPath, lock.value, context);
+    if (!partial.ok) return partial;
+    return {
+      ok: true,
+      expired: true,
+      targets: [finalPath, lockPath],
+      snapshot: context.snapshot,
+    };
+  }
+  if (direntKind(manifestEntry) !== 'file') return { ok: false, code: 'unsafe_type' };
+  const manifest = await readManifest(join(finalPath, 'manifest.json'), runId, context);
+  if (!manifest.ok) return manifest;
+  if (lock !== null && (manifest.manifest.generation !== lock.value.generation ||
+      manifest.manifest.createdAt !== lock.value.createdAt || manifest.manifest.expiresAt !== lock.value.expiresAt)) {
+    return { ok: false, code: 'generation_mismatch' };
+  }
+  if (nowMs < manifest.manifest.expiresAt) {
+    return { ok: true, expired: false, targets: [], snapshot: context.snapshot };
+  }
+  const complete = await validateCompleteFinal(finalPath, manifest, context);
+  if (!complete.ok) return complete;
+  return {
+    ok: true,
+    expired: true,
+    targets: [...complete.targets, ...(lock === null ? [] : [lockPath])],
+    snapshot: context.snapshot,
+  };
+}
+
+async function revalidateSnapshot(snapshot, deps) {
+  for (const [path, expected] of snapshot.paths) {
+    const status = await lstatStatus(path, deps.lstat);
+    if (status.exists !== true || kindOf(status.info) !== expected.kind ||
+        statIdentity(status.info, expected.kind) !== expected.identity) return false;
+    const real = await canonicalValue(deps.canonicalPath, path);
+    if (real === null || !sameCanonicalPath(real, resolve(path)) ||
+        !sameCanonicalPath(real, snapshot.root) && !isUnder(snapshot.root, real)) return false;
+  }
+  for (const path of snapshot.absent) {
+    if ((await lstatStatus(path, deps.lstat)).exists !== false) return false;
+  }
+  for (const [path, expected] of snapshot.listings) {
+    try {
+      const entries = await deps.readdir(path, { withFileTypes: true });
+      const actual = JSON.stringify(entries.map((entry) => [entry.name, direntKind(entry)])
+        .sort((a, b) => compareAscii(a[0], b[0])));
+      if (actual !== expected) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function createQuarantineParent(snapshot, deps) {
+  const runsDir = join(snapshot.root, 'runs');
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    let path;
+    try {
+      path = join(runsDir, `.reap-${randomBytes(16).toString('hex')}`);
+      await mkdir(path, { mode: 0o700 });
+    } catch (error) {
+      if (error?.code === 'EEXIST') continue;
+      return null;
+    }
+    const status = await lstatStatus(path, deps.lstat);
+    if (status.exists !== true || kindOf(status.info) !== 'directory') return null;
+    const real = await canonicalValue(deps.canonicalPath, path);
+    if (real === null || !sameCanonicalPath(real, resolve(path)) || !isUnder(snapshot.root, real)) return null;
+    let privatePath = false;
+    try {
+      privatePath = await deps.verifyOwnerOnly({ path, kind: 'directory' }) === true;
+    } catch {
+      return null;
+    }
+    if (!privatePath) return null;
+    let entries;
+    try {
+      entries = await deps.readdir(path, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(entries) || entries.length !== 0) return null;
+    const authority = statAuthority(status.info, 'directory');
+    if (authority === null) return null;
+    return { path, anchorIdentity: authority.anchorKey };
+  }
+  return null;
+}
+
+function remapQuarantinedPath(path, movedTargets) {
+  const target = movedTargets.find((candidate) =>
+    sameCanonicalPath(path, candidate.path) || isUnder(candidate.path, path));
+  if (target === undefined) return null;
+  const suffix = relative(target.path, path);
+  const mapped = suffix === '' ? target.movedPath : resolve(target.movedPath, suffix);
+  return sameCanonicalPath(mapped, target.movedPath) || isUnder(target.movedPath, mapped)
+    ? { path: mapped, target }
+    : null;
+}
+
+function intentionallyChangedParent(path, movedTargets, quarantine) {
+  return sameCanonicalPath(path, dirname(quarantine.path)) ||
+    movedTargets.some((target) => sameCanonicalPath(path, dirname(target.path)));
+}
+
+function expectedQuarantinedListing(path, expected, movedTargets, quarantine, afterRemoval) {
+  let entries;
+  try {
+    entries = JSON.parse(expected);
+  } catch {
+    return null;
+  }
+  let changed = false;
+  for (const target of movedTargets) {
+    if (!sameCanonicalPath(path, dirname(target.path))) continue;
+    entries = entries.filter(([name]) => name !== basename(target.path));
+    changed = true;
+  }
+  if (sameCanonicalPath(path, dirname(quarantine.path))) {
+    if (!afterRemoval) entries.push([basename(quarantine.path), 'directory']);
+    changed = true;
+  }
+  return changed
+    ? JSON.stringify(entries.sort((a, b) => compareAscii(a[0], b[0])))
+    : expected;
+}
+
+async function validateQuarantinedSnapshot(snapshot, movedTargets, quarantine, deps, { afterRemoval = false } = {}) {
+  for (const [path, expected] of snapshot.paths) {
+    const mapped = remapQuarantinedPath(path, movedTargets);
+    if (mapped !== null) {
+      if (afterRemoval) continue;
+      const status = await lstatStatus(mapped.path, deps.lstat);
+      const topLevel = sameCanonicalPath(path, mapped.target.path);
+      if (status.exists !== true || kindOf(status.info) !== expected.kind ||
+          (topLevel
+            ? quarantineIdentity(status.info, expected.kind) !== expected.quarantineIdentity
+            : statIdentity(status.info, expected.kind) !== expected.identity)) return false;
+      const real = await canonicalValue(deps.canonicalPath, mapped.path);
+      if (real === null || !sameCanonicalPath(real, resolve(mapped.path)) ||
+          !sameCanonicalPath(real, mapped.target.movedPath) && !isUnder(mapped.target.movedPath, real)) return false;
+      continue;
+    }
+    const status = await lstatStatus(path, deps.lstat);
+    const mutableParent = intentionallyChangedParent(path, movedTargets, quarantine);
+    if (status.exists !== true || kindOf(status.info) !== expected.kind ||
+        (mutableParent
+          ? anchorIdentity(status.info, expected.kind) !== expected.anchorIdentity
+          : statIdentity(status.info, expected.kind) !== expected.identity)) return false;
+    const real = await canonicalValue(deps.canonicalPath, path);
+    if (real === null || !sameCanonicalPath(real, resolve(path)) ||
+        !sameCanonicalPath(real, snapshot.root) && !isUnder(snapshot.root, real)) return false;
+  }
+  for (const path of snapshot.absent) {
+    const mapped = remapQuarantinedPath(path, movedTargets);
+    if (mapped !== null && !afterRemoval) {
+      if ((await lstatStatus(mapped.path, deps.lstat)).exists !== false) return false;
+    } else if (mapped === null && (await lstatStatus(path, deps.lstat)).exists !== false) {
+      return false;
+    }
+  }
+  for (const [path, expected] of snapshot.listings) {
+    const mapped = remapQuarantinedPath(path, movedTargets);
+    if (mapped !== null && afterRemoval) continue;
+    const listingPath = mapped?.path ?? path;
+    try {
+      const entries = await deps.readdir(listingPath, { withFileTypes: true });
+      if (!Array.isArray(entries)) return false;
+      const actual = JSON.stringify(entries.map((entry) => [entry.name, direntKind(entry)])
+        .sort((a, b) => compareAscii(a[0], b[0])));
+      const expectedListing = mapped === null
+        ? expectedQuarantinedListing(path, expected, movedTargets, quarantine, afterRemoval)
+        : expected;
+      if (expectedListing === null || actual !== expectedListing) return false;
+    } catch {
+      return false;
+    }
+  }
+  for (const { path } of movedTargets) {
+    if ((await lstatStatus(path, deps.lstat)).exists !== false) return false;
+  }
+  return true;
+}
+
+async function classifyRenameFailure(path, movedPath, expected, movedTargets, deps) {
+  const source = await lstatStatus(path, deps.lstat);
+  const destination = await lstatStatus(movedPath, deps.lstat);
+  const sourceUnchanged = source.exists === true && kindOf(source.info) === expected.kind &&
+    expectedSourceUnchanged(source.info, expected, movedTargets);
+  const destinationExpected = destination.exists === true && kindOf(destination.info) === expected.kind &&
+    quarantineIdentity(destination.info, expected.kind) === expected.quarantineIdentity;
+  if (source.exists === false && destinationExpected) {
+    return { completed: true, info: destination.info };
+  }
+  if (sourceUnchanged && destination.exists === false) return { completed: false, code: 'removal_failed' };
+  return { completed: false, code: 'validation_changed' };
+}
+
+function patchRemovalTarget(path, root) {
+  if (!sameCanonicalPath(dirname(path), join(root, 'patches'))) return false;
+  const name = basename(path);
+  if (name.endsWith('.patch') && !name.startsWith('.tmp-')) {
+    return validRunId(name.slice(0, -'.patch'.length));
+  }
+  const match = /^\.tmp-([a-z0-9][a-z0-9_-]{0,63})\.patch-(\d+-[0-9a-f]{12})$/.exec(name);
+  return match !== null && validRunId(match[1]) && validArtifactTempSuffix(match[2]);
+}
+
+function prepareRemovalTargets(targets, snapshot) {
+  const runsDir = join(snapshot.root, 'runs');
+  const quarantineDevice = snapshot.paths.get(runsDir)?.deviceIdentity ?? null;
+  if (quarantineDevice === null) return null;
+  const unique = [...new Set(targets)];
+  const prepared = [];
+  for (const path of unique) {
+    if (typeof path !== 'string' || !isAbsolute(path) || !sameCanonicalPath(resolve(path), path) ||
+        !isUnder(snapshot.root, path)) return null;
+    const expected = snapshot.paths.get(path);
+    if (expected === undefined || expected.deviceIdentity !== quarantineDevice) return null;
+    const lockMatch = INIT_LOCK_PATTERN.exec(basename(path));
+    let rank;
+    if (expected.kind === 'file' && patchRemovalTarget(path, snapshot.root)) rank = 0;
+    else if (expected.kind === 'file' && sameCanonicalPath(dirname(path), runsDir) &&
+        lockMatch !== null && validRunId(lockMatch[1])) rank = 1;
+    else if (expected.kind === 'directory' && sameCanonicalPath(dirname(path), runsDir) &&
+        validRunId(basename(path))) rank = 2;
+    else return null;
+    prepared.push({ path, expected, rank });
+  }
+  for (let left = 0; left < prepared.length; left += 1) {
+    for (let right = left + 1; right < prepared.length; right += 1) {
+      if (sameCanonicalPath(prepared[left].path, prepared[right].path) ||
+          isUnder(prepared[left].path, prepared[right].path) ||
+          isUnder(prepared[right].path, prepared[left].path)) return null;
+    }
+  }
+  return prepared.sort((left, right) => left.rank - right.rank || compareAscii(left.path, right.path));
+}
+
+function movedHardlinkPeer(expected, movedTargets) {
+  if (expected.kind !== 'file') return null;
+  return movedTargets.find((target) => target.expected.physicalIdentity === expected.physicalIdentity) ?? null;
+}
+
+function expectedSourceUnchanged(info, expected, movedTargets) {
+  const hardlinkPeer = movedHardlinkPeer(expected, movedTargets);
+  if (hardlinkPeer === null) return statIdentity(info, expected.kind) === expected.identity;
+  return quarantineIdentity(info, expected.kind) === expected.quarantineIdentity &&
+    quarantineIdentity(info, expected.kind) === quarantineIdentity(hardlinkPeer.movedInfo, expected.kind);
+}
+
+async function removeOwnedTargets(targets, snapshot, deps) {
+  const prepared = prepareRemovalTargets(targets, snapshot);
+  if (prepared === null || prepared.length === 0) return 'validation_changed';
+  const quarantine = await createQuarantineParent(snapshot, deps);
+  if (quarantine === null) return 'removal_failed';
+  const movedTargets = [];
+  for (const [index, { path, expected }] of prepared.entries()) {
+    const status = await lstatStatus(path, deps.lstat);
+    if (status.exists !== true || kindOf(status.info) !== expected.kind ||
+        !expectedSourceUnchanged(status.info, expected, movedTargets)) return 'validation_changed';
+    const movedPath = join(quarantine.path, `unit-${String(index).padStart(3, '0')}`);
+    if ((await lstatStatus(movedPath, deps.lstat)).exists !== false) return 'validation_changed';
+    let moved;
+    try {
+      await rename(path, movedPath);
+    } catch {
+      const classified = await classifyRenameFailure(path, movedPath, expected, movedTargets, deps);
+      if (!classified.completed) return classified.code;
+      moved = { exists: true, info: classified.info };
+    }
+    moved ??= await lstatStatus(movedPath, deps.lstat);
+    if (moved.exists !== true || kindOf(moved.info) !== expected.kind ||
+        quarantineIdentity(moved.info, expected.kind) !== expected.quarantineIdentity) {
+      return 'validation_changed';
+    }
+    movedTargets.push({ path, movedPath, expected, movedInfo: moved.info });
+  }
+  const parent = await lstatStatus(quarantine.path, deps.lstat);
+  if (parent.exists !== true || kindOf(parent.info) !== 'directory' ||
+      anchorIdentity(parent.info, 'directory') !== quarantine.anchorIdentity) return 'validation_changed';
+  const parentIdentity = statIdentity(parent.info, 'directory');
+  let listing;
+  try {
+    listing = await deps.readdir(quarantine.path, { withFileTypes: true });
+  } catch {
+    return 'validation_changed';
+  }
+  if (!Array.isArray(listing)) return 'validation_changed';
+  listing.sort((left, right) => compareAscii(left.name, right.name));
+  if (listing.length !== movedTargets.length || listing.some((entry, index) =>
+    entry.name !== `unit-${String(index).padStart(3, '0')}` ||
+    direntKind(entry) !== movedTargets[index].expected.kind)) return 'validation_changed';
+  const parentBeforeRemoval = await lstatStatus(quarantine.path, deps.lstat);
+  if (parentBeforeRemoval.exists !== true || kindOf(parentBeforeRemoval.info) !== 'directory' ||
+      statIdentity(parentBeforeRemoval.info, 'directory') !== parentIdentity) return 'validation_changed';
+  const parentReal = await canonicalValue(deps.canonicalPath, quarantine.path);
+  if (parentReal === null || !sameCanonicalPath(parentReal, resolve(quarantine.path)) ||
+      !isUnder(snapshot.root, parentReal)) return 'validation_changed';
+  let privateParent = false;
+  try {
+    privateParent = await deps.verifyOwnerOnly({ path: quarantine.path, kind: 'directory' }) === true;
+  } catch {
+    privateParent = false;
+  }
+  if (!privateParent) return 'validation_changed';
+  for (const { movedPath, expected } of movedTargets) {
+    const moved = await lstatStatus(movedPath, deps.lstat);
+    if (moved.exists !== true || kindOf(moved.info) !== expected.kind ||
+        quarantineIdentity(moved.info, expected.kind) !== expected.quarantineIdentity) return 'validation_changed';
+    const real = await canonicalValue(deps.canonicalPath, movedPath);
+    if (real === null || !sameCanonicalPath(real, resolve(movedPath)) || !isUnder(quarantine.path, real)) {
+      return 'validation_changed';
+    }
+  }
+  if (!await validateQuarantinedSnapshot(snapshot, movedTargets, quarantine, deps)) return 'validation_changed';
+  try {
+    await deps.rm(quarantine.path, { recursive: true, force: true });
+  } catch {
+    return 'removal_failed';
+  }
+  if ((await lstatStatus(quarantine.path, deps.lstat)).exists !== false) return 'removal_failed';
+  if (!await validateQuarantinedSnapshot(snapshot, movedTargets, quarantine, deps, { afterRemoval: true })) {
+    return 'validation_changed';
+  }
+  return null;
+}
+
+/**
+ * Fully validates and reaps expired run ownership units. This function never throws and
+ * never exposes physical paths or filesystem errors in its bounded result.
+ */
+export async function sweepRuns(stateRoot, nowMs, options) {
+  const emptyUnsafe = (code) => frozenRunResult({ skipped: [{ runId: null, code }] });
+  const parsed = exactFunctionOptions(options, new Set([
+    'excludeRunId', 'canonicalPath', 'lstat', 'readdir', 'readFile', 'rm',
+    'verifyOwnerOnly', 'validateTransition', 'barrier',
+  ]));
+  if (parsed === null || typeof stateRoot !== 'string' || stateRoot === '' || !isAbsolute(stateRoot) ||
+      !sameCanonicalPath(resolve(stateRoot), stateRoot) || !Number.isSafeInteger(nowMs) || nowMs < 0) {
+    return emptyUnsafe('unsafe_root');
+  }
+  if (Object.hasOwn(parsed, 'excludeRunId') && !validRunId(parsed.excludeRunId)) return emptyUnsafe('invalid_exclusion');
+  const deps = {
+    canonicalPath: parsed.canonicalPath ?? canonical,
+    lstat: parsed.lstat ?? exactLstat,
+    readdir: parsed.readdir ?? readdir,
+    readFile: parsed.readFile ?? readFile,
+    rm: parsed.rm ?? rm,
+    verifyOwnerOnly: parsed.verifyOwnerOnly ?? verifyArtifactOwnerOnly,
+    validateTransition: parsed.validateTransition ?? validateRunManifestTransitionV1,
+    barrier: parsed.barrier ?? (async () => {}),
+  };
+  try {
+    const rootStatus = await lstatStatus(stateRoot, deps.lstat);
+    if (rootStatus.exists !== true || kindOf(rootStatus.info) !== 'directory') return emptyUnsafe('unsafe_root');
+    const root = await canonicalValue(deps.canonicalPath, stateRoot);
+    if (root === null || !sameCanonicalPath(root, resolve(stateRoot))) return emptyUnsafe('unsafe_root');
+    const runsDir = join(root, 'runs');
+    const runsStatus = await lstatStatus(runsDir, deps.lstat);
+    if (runsStatus.exists === false) return frozenRunResult();
+    if (runsStatus.exists !== true || kindOf(runsStatus.info) !== 'directory') {
+      return frozenRunResult({ skipped: [{ runId: null, code: 'unsafe_type' }] });
+    }
+    const preflight = { root, deps, snapshot: newSnapshot(root) };
+    for (const [path, kind] of [[root, 'directory'], [runsDir, 'directory']]) {
+      const checked = await safeExisting(path, kind, preflight);
+      if (!checked.ok) return frozenRunResult({ skipped: [{ runId: null, code: checked.code }] });
+    }
+    let entries;
+    try {
+      entries = await deps.readdir(runsDir, { withFileTypes: true });
+    } catch {
+      return frozenRunResult({ skipped: [{ runId: null, code: 'unsafe_type' }] });
+    }
+    const groups = new Map();
+    let foreign = false;
+    const excluded = parsed.excludeRunId;
+    for (const entry of entries) {
+      const lockMatch = INIT_LOCK_PATTERN.exec(entry.name);
+      const finalRunId = validRunId(entry.name) ? entry.name : null;
+      const lockRunId = lockMatch !== null && validRunId(lockMatch[1]) ? lockMatch[1] : null;
+      const runId = finalRunId ?? lockRunId;
+      if (runId === null) {
+        foreign = true;
+        continue;
+      }
+      if (runId === excluded) continue;
+      const group = groups.get(runId) ?? { finalEntry: null, lockEntry: null };
+      if (finalRunId !== null) group.finalEntry = entry;
+      else group.lockEntry = entry;
+      groups.set(runId, group);
+    }
+
+    const removed = [];
+    const skipped = foreign ? [{ runId: null, code: 'unrecognized_entry' }] : [];
+    const ordered = [...groups.entries()].sort((left, right) => compareAscii(left[0], right[0]));
+    for (const [runId, group] of ordered) {
+      const validation = await validateRunUnit({ root, runsDir, runId, ...group, nowMs, deps });
+      if (!validation.ok) {
+        skipped.push({ runId, code: validation.code });
+        continue;
+      }
+      if (!validation.expired) continue;
+      try {
+        await deps.barrier('before-run-delete');
+      } catch {
+        skipped.push({ runId, code: 'validation_changed' });
+        continue;
+      }
+      if (!await revalidateSnapshot(validation.snapshot, deps)) {
+        skipped.push({ runId, code: 'validation_changed' });
+        continue;
+      }
+      const removalCode = await removeOwnedTargets(validation.targets, validation.snapshot, deps);
+      if (removalCode !== null) {
+        skipped.push({ runId, code: removalCode });
+        continue;
+      }
+      removed.push(runId);
+    }
+    return frozenRunResult({ removed, checked: groups.size, skipped });
+  } catch {
+    return emptyUnsafe('unsafe_root');
+  }
+}
+
 /**
  * 상태 루트 밑의 디렉터리 하나에서 **우리가 만든 이름 모양**의 낡은 파일만 지운다.
  * **절대 throw 하지 않는다.**
@@ -392,7 +1645,7 @@ function isUnder(base, target) {
  *
  * @returns `{ removed, checked }` — `checked` 는 이름 모양이 맞아 나이를 본 개수다.
  */
-async function sweepAged({ stateRoot, name, shapes, maxAgeMs, nowMs }) {
+async function sweepAged({ stateRoot, name, shapes, maxAgeMs, nowMs, excludeName = null, acceptName = null }) {
   const empty = { removed: 0, checked: 0 };
   const realRoot = await canonical(stateRoot);
   if (realRoot === null) return empty;
@@ -412,9 +1665,11 @@ async function sweepAged({ stateRoot, name, shapes, maxAgeMs, nowMs }) {
   let removed = 0;
   let checked = 0;
   for (const entry of entries) {
+    if (entry.name === excludeName) continue;
     // `withFileTypes` 의 판정은 lstat 계열이라 심링크는 여기서 이미 걸러진다. 아래
     // `canonical` 확인은 그 위의 두 번째 겹이다(디렉터리 정션·마운트 포인트).
-    if (!entry.isFile() || !shapes.some((shape) => shape.test(entry.name))) continue;
+    if (!entry.isFile() || !shapes.some((shape) => shape.test(entry.name)) ||
+        acceptName !== null && !acceptName(entry.name)) continue;
     checked += 1;
     const full = await canonical(join(dir, entry.name));
     if (full === null || !isUnder(dir, full)) continue;
@@ -441,8 +1696,20 @@ export function sweepScratch(stateRoot, nowMs) {
 /**
  * 보존 기간이 지난 최종 패치를 치운다 (계획 2 이월 2). scratch 와 같은 두 자리에서 돈다.
  */
-export function sweepPatches(stateRoot, nowMs) {
-  return sweepAged({ stateRoot, name: 'patches', shapes: PATCH_NAMES, maxAgeMs: PATCH_RETENTION_MS, nowMs });
+export function sweepPatches(stateRoot, nowMs, options) {
+  const parsed = exactFunctionOptions(options, new Set(['excludeRunId']));
+  if (parsed === null || Object.hasOwn(parsed, 'excludeRunId') && !validRunId(parsed.excludeRunId)) {
+    return Promise.resolve({ removed: 0, checked: 0 });
+  }
+  return sweepAged({
+    stateRoot,
+    name: 'patches',
+    shapes: PATCH_NAMES,
+    maxAgeMs: RUN_ARTIFACT_RETENTION_MS,
+    nowMs,
+    excludeName: Object.hasOwn(parsed, 'excludeRunId') ? `${parsed.excludeRunId}.patch` : null,
+    acceptName: (name) => validRunId(name.slice(0, -'.patch'.length)),
+  });
 }
 
 /** undefined = 조회 실패, null = 없는 프로세스, 객체 = 살아 있음. */

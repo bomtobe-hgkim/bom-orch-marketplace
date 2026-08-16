@@ -1,6 +1,6 @@
 {
   "name": "bom-orch",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Claude와 GPT 두 CLI 워커를 교차검증으로 오케스트레이션하고 무엇이 통했는지 학습하는 MCP 서버",
   "author": {
     "name": "hyeongi-home"

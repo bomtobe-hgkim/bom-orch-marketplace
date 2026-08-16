@@ -349,13 +349,32 @@ export async function commitLearningMutationUnlocked(stateRoot, mutation, option
   return target.notes.length > 0 ? { ok: true, notes: target.notes } : { ok: true, notes: [] };
 }
 
+/**
+ * 트랜잭션 한 건의 갱신 목록을 검증한다. **전부 아니면 전무**다.
+ *
+ * ★★ 같은 `cellKey` 가 두 번 오면 **팔이 달라도** 거절한다(설계 §14.1: 한 Run 은 한 축에
+ *   관측을 하나만 만든다). 형제 함수 `updatePosteriors` 는 같은 셀·팔을 순서대로 누적하지만
+ *   그것은 호출자가 델타를 통제하는 저수준 경로다. 이쪽은 **사후분포와 저널 한 줄을 짝지어**
+ *   커밋하므로 셀이 겹치면 그 줄의 스칼라 `appliedGrade` 로는 무엇이 몇 번 반영됐는지 적을
+ *   수가 없고, 다음 `orch_reward` 가 정확히 되돌리지 못한다 — winner 에 success · loser 에
+ *   failure 를 함께 적는 이중계상이 정확히 이 모양으로 들어온다.
+ *
+ * ★ 거절은 **WAL 을 만들기 전**이다. 여기서 막으면 사후분포·저널·`learning.pending.json`
+ *   어느 바이트도 움직이지 않는다. 학습 정책 버전 2 는 WAL 스키마 변경이 아니다 —
+ *   `learning.mjs` 의 작업 형식은 그대로 version 1 이다.
+ */
 function normalizeUpdates(updates) {
   if (!Array.isArray(updates)) return { ok: false, reason: 'updates 가 배열이 아닙니다.' };
   const plan = [];
+  const seenCells = new Set();
   for (const options of updates) {
     const { cellKey, arm, alphaDelta = 0, betaDelta = 0 } = options !== null && typeof options === 'object' ? options : {};
     if (typeof cellKey !== 'string' || cellKey === '') return { ok: false, reason: 'cellKey 가 비어 있습니다.' };
     if (typeof arm !== 'string' || arm === '') return { ok: false, reason: 'arm 이 비어 있습니다.' };
+    if (seenCells.has(cellKey)) {
+      return { ok: false, reason: `한 트랜잭션에 같은 cellKey 가 두 번 왔습니다: ${cellKey}` };
+    }
+    seenCells.add(cellKey);
     plan.push({ cellKey, arm, alphaDelta, betaDelta });
   }
   return { ok: true, plan };

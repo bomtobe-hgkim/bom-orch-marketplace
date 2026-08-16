@@ -1,4 +1,5 @@
-import { mkdir, readFile, rm, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { lstat, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { runGit } from './git.mjs';
 import { canonical } from './real-path.mjs';
@@ -112,6 +113,39 @@ const WORKTREE_TIMEOUT_MS = 300_000;
  *     못 막는다.
  */
 const RUN_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const PURPOSE_PATTERN = /^(?:lane-[ab]|lane-[ab]-\d{3}-(?:b0|br|c)-[12])$/;
+const FULL_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const REGULAR_FILE_MODES = new Set(['100644', '100755']);
+const UNSAFE_FILE_MODES = new Set(['120000', '160000']);
+const WINDOWS_INVALID_COMPONENT_PATTERN = /[<>:"|?*\u0000-\u001f\u007f]/;
+const WINDOWS_DEVICE_BASENAME_PATTERN = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+
+/**
+ * A logical Run ID is durable authority; this value is only its bounded filesystem projection.
+ * The digest binds bytes that may be truncated from the visible prefix as well as the purpose.
+ */
+export function makeWorktreeId({ runId, purpose } = {}) {
+  if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)) {
+    throw new TypeError('실행 runId 는 소문자 안전 문자로 된 1~64자 값이어야 합니다.');
+  }
+  if (typeof purpose !== 'string' || !PURPOSE_PATTERN.test(purpose)) {
+    throw new TypeError('워크트리 purpose 가 허용된 lane/evidence 용도가 아닙니다.');
+  }
+  const digest = createHash('sha256')
+    .update(runId, 'utf8')
+    .update(Buffer.from([0]))
+    .update(purpose, 'utf8')
+    .digest('hex')
+    .slice(0, 12);
+  const suffix = `-${purpose}-${digest}`;
+  const prefix = runId.slice(0, 64 - suffix.length);
+  const id = `${prefix}${suffix}`;
+  if (!RUN_ID_PATTERN.test(id) || id.length > 64) {
+    throw new RangeError('워크트리 filesystem ID 를 안전한 64자 안에 만들 수 없습니다.');
+  }
+  return id;
+}
 
 const GENERIC_RECOVERY = '오류 로그를 확인하거나 다시 시도하세요.';
 
@@ -150,6 +184,215 @@ function gitReason(result) {
   if (out !== '') return out.slice(0, 500);
   if (result?.failed) return 'git 을 실행하지 못했습니다.';
   return `git 이 종료 코드 ${result?.exitCode} 로 끝났습니다.`;
+}
+
+async function absenceProven(path) {
+  try {
+    await stat(path);
+    return false;
+  } catch (error) {
+    return error?.code === 'ENOENT';
+  }
+}
+
+const isFullObjectId = (value) => typeof value === 'string' && FULL_OBJECT_ID_PATTERN.test(value);
+
+function validateEvidencePaths(paths, { enforceInputLimit = true } = {}) {
+  if (paths === undefined) return { ok: true, paths: null };
+  if (!Array.isArray(paths)) {
+    return { ok: false, error: '경로 allowlist 는 문자열 배열이어야 합니다.' };
+  }
+  if (enforceInputLimit && paths.length > 4_000) {
+    return { ok: false, error: '경로 allowlist 가 너무 큽니다(최대 4000개).' };
+  }
+  const seen = new Set();
+  const safe = [];
+  for (const path of paths) {
+    if (typeof path !== 'string' || path === '') {
+      return { ok: false, error: '경로 allowlist 의 모든 항목은 비어 있지 않은 문자열이어야 합니다.' };
+    }
+    if (path.includes('\0') || path.includes('\ufffd')) {
+      return { ok: false, error: 'NUL 또는 잘못 디코딩된 문자가 든 경로는 사용할 수 없습니다.' };
+    }
+    // Git emits repository-relative paths with '/'. Reject '\\' too: on Windows it is a path
+    // separator, while on POSIX accepting it would make the same persisted authority non-portable.
+    if (isAbsolute(path) || path.startsWith('/') || /^[A-Za-z]:/.test(path) || path.includes('\\')) {
+      return { ok: false, error: `절대 경로나 플랫폼 경계가 모호한 경로는 사용할 수 없습니다: ${JSON.stringify(path)}` };
+    }
+    const segments = path.split('/');
+    if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
+      return { ok: false, error: `저장소 밖으로 빠질 수 있는 경로는 사용할 수 없습니다: ${JSON.stringify(path)}` };
+    }
+    if (seen.has(path)) {
+      return { ok: false, error: `중복 경로는 권위 목록으로 사용할 수 없습니다: ${JSON.stringify(path)}` };
+    }
+    seen.add(path);
+    safe.push(path);
+  }
+  return { ok: true, paths: safe };
+}
+
+function validateMaterializationPaths(paths) {
+  const evidence = validateEvidencePaths(paths, { enforceInputLimit: false });
+  if (!evidence.ok) return evidence;
+  const seenAliases = new Set();
+  for (const path of evidence.paths) {
+    for (const segment of path.split('/')) {
+      if (
+        WINDOWS_INVALID_COMPONENT_PATTERN.test(segment) ||
+        segment.endsWith('.') ||
+        segment.endsWith(' ') ||
+        WINDOWS_DEVICE_BASENAME_PATTERN.test(segment)
+      ) {
+        return {
+          ok: false,
+          error: `Windows 에서 다른 파일/ADS/device 로 해석될 수 있는 경로는 적용할 수 없습니다: ${JSON.stringify(path)}`,
+        };
+      }
+    }
+    const alias = path.normalize('NFC').toLowerCase();
+    if (seenAliases.has(alias)) {
+      return { ok: false, error: `대소문자/정규화 별칭 경로는 함께 적용할 수 없습니다: ${JSON.stringify(path)}` };
+    }
+    seenAliases.add(alias);
+  }
+  return evidence;
+}
+
+function validateRevisionPair(spec) {
+  const options = spec ?? {};
+  if (!isFullObjectId(options.from) || !isFullObjectId(options.to)) {
+    return { ok: false, error: 'from/to revision 은 Git 에서 얻은 full lowercase object ID 여야 합니다.' };
+  }
+  const paths = validateEvidencePaths(options.paths);
+  if (!paths.ok) return paths;
+  return { ok: true, from: options.from, to: options.to, paths: paths.paths };
+}
+
+function parseRawRevisionDelta(stdout) {
+  if (typeof stdout !== 'string') {
+    return { ok: false, error: 'Git raw delta 출력이 문자열이 아닙니다.' };
+  }
+  if (stdout.includes('\ufffd')) {
+    return { ok: false, error: 'Git 경로가 유효한 UTF-8 로 디코딩되지 않아 추측하지 않고 막았습니다.' };
+  }
+  if (stdout === '') return { ok: true, entries: [] };
+  if (!stdout.endsWith('\0')) {
+    return { ok: false, error: 'Git raw delta 의 NUL 종결자가 없습니다.' };
+  }
+  const records = stdout.split('\0');
+  records.pop();
+  if (records.length % 2 !== 0) {
+    return { ok: false, error: 'Git raw delta 레코드가 중간에서 잘렸습니다.' };
+  }
+
+  const checkedPaths = validateEvidencePaths(
+    records.filter((_, index) => index % 2 === 1),
+    { enforceInputLimit: false },
+  );
+  if (!checkedPaths.ok) return checkedPaths;
+
+  const entries = [];
+  for (let index = 0; index < records.length; index += 2) {
+    const header = records[index];
+    const path = records[index + 1];
+    const match = /^:([0-7]{6}) ([0-7]{6}) ((?:[0-9a-f]{40}|[0-9a-f]{64})) ((?:[0-9a-f]{40}|[0-9a-f]{64})) ([AMDT])$/.exec(header);
+    if (!match) return { ok: false, error: 'Git raw delta 헤더가 허용된 형식이 아닙니다.' };
+    const [, oldMode, newMode, oldOid, newOid, code] = match;
+    if (oldOid.length !== newOid.length) {
+      return { ok: false, error: 'Git raw delta object ID 길이가 서로 다릅니다.' };
+    }
+    if (UNSAFE_FILE_MODES.has(oldMode) || UNSAFE_FILE_MODES.has(newMode)) {
+      return { ok: false, error: `symlink/gitlink mode 가 든 delta 는 적용 권위로 사용할 수 없습니다: ${path}` };
+    }
+    const oldRegular = REGULAR_FILE_MODES.has(oldMode);
+    const newRegular = REGULAR_FILE_MODES.has(newMode);
+    let status;
+    if (code === 'A' && oldMode === '000000' && newRegular) status = 'added';
+    else if (code === 'D' && oldRegular && newMode === '000000') status = 'deleted';
+    else if (code === 'M' && oldRegular && newRegular) status = 'modified';
+    else if (code === 'T') {
+      return { ok: false, error: `파일 type change 는 안전한 path-only delta 로 다룰 수 없습니다: ${path}` };
+    } else {
+      return { ok: false, error: `mode/status 조합이 일관되지 않습니다: ${path}` };
+    }
+    entries.push({
+      path,
+      status,
+      oldMode: oldMode === '000000' ? null : oldMode,
+      newMode: newMode === '000000' ? null : newMode,
+    });
+  }
+  entries.sort((a, b) => Buffer.compare(Buffer.from(a.path, 'utf8'), Buffer.from(b.path, 'utf8')));
+  return { ok: true, entries };
+}
+
+function revisionDiffArgs({ from, to, paths, raw }) {
+  const args = [];
+  if (paths !== null) args.push('--literal-pathspecs');
+  args.push('diff');
+  // runGit injects `-U3` after `diff` as a patch-output hardening. Reset that presentation mode
+  // before re-enabling raw output so stdout remains NUL-only authority instead of raw+patch text.
+  if (raw) args.push('--no-patch', '--raw', '-z', '--no-abbrev');
+  else args.push('--binary');
+  args.push('--no-renames', from, to);
+  if (paths !== null) args.push('--', ...paths);
+  return args;
+}
+
+async function resolveExactCommit({ run, cwd, revision, label }) {
+  const result = await run({
+    args: ['rev-parse', '--verify', `${revision}^{commit}`],
+    cwd,
+    timeoutMs: WORKTREE_TIMEOUT_MS,
+  }).catch(() => null);
+  const commit = result?.ok && typeof result.stdout === 'string' ? result.stdout.trim() : '';
+  if (!isFullObjectId(commit) || commit !== revision) {
+    return blocked(
+      `${label} revision 이 정확한 commit object 가 아닙니다: ${gitReason(result)}`,
+      'Git 이 반환한 full lowercase commit ID 를 사용하세요.',
+    );
+  }
+  return { ok: true, commit };
+}
+
+async function authenticateRevisionPair({ run, cwd, revisions }) {
+  const from = await resolveExactCommit({ run, cwd, revision: revisions.from, label: 'from' });
+  if (from.blocked) return from;
+  const to = await resolveExactCommit({ run, cwd, revision: revisions.to, label: 'to' });
+  if (to.blocked) return to;
+  return { ok: true, from: from.commit, to: to.commit, paths: revisions.paths };
+}
+
+async function resolveRevisionIdentity({ run, cwd, revision, requireExact = true }) {
+  if (requireExact && !isFullObjectId(revision)) {
+    return blocked('revision 은 full lowercase commit ID 여야 합니다.', 'Git 이 반환한 전체 commit ID 를 사용하세요.');
+  }
+  const commitResult = await run({
+    args: ['rev-parse', '--verify', `${revision}^{commit}`],
+    cwd,
+    timeoutMs: WORKTREE_TIMEOUT_MS,
+  }).catch(() => null);
+  const commit = commitResult?.ok && typeof commitResult.stdout === 'string' ? commitResult.stdout.trim() : '';
+  if (!isFullObjectId(commit) || (requireExact && commit !== revision)) {
+    return blocked(
+      `revision 을 정확한 commit 으로 확인하지 못했습니다: ${gitReason(commitResult)}`,
+      '존재하는 full lowercase commit ID 를 사용하세요.',
+    );
+  }
+  const treeResult = await run({
+    args: ['rev-parse', '--verify', `${commit}^{tree}`],
+    cwd,
+    timeoutMs: WORKTREE_TIMEOUT_MS,
+  }).catch(() => null);
+  const tree = treeResult?.ok && typeof treeResult.stdout === 'string' ? treeResult.stdout.trim() : '';
+  if (!isFullObjectId(tree)) {
+    return blocked(
+      `revision 의 tree 를 확인하지 못했습니다: ${gitReason(treeResult)}`,
+      '저장소와 commit object 가 정상인지 확인하세요.',
+    );
+  }
+  return { ok: true, commit, tree };
 }
 
 // ── 워크트리 등록 조회 ────────────────────────────────────────────────────
@@ -242,23 +485,22 @@ async function looksLikeLinkedWorktree({ run, path }) {
 // ── 패치를 바이트로 뜨기 ──────────────────────────────────────────────────
 
 /**
- * 임시 패치 파일 이름의 충돌 방지용 일련번호. `snapshotStep`·`collectPatch` 는 생성
- * 큐를 지나지 않으므로 서로 다른 워크트리에서 동시에 불릴 수 있고, 같은 상태 루트를
- * 공유하면 이름이 겹친다. pid 만으로는 부족하다.
- */
-let patchSeq = 0;
-
-/**
  * `git diff` 의 출력을 **파일로 직접 받는다**(모듈 상단의 바이트 계약 참조).
  *
- * `--output=<파일>` 은 서브커맨드 **뒤**라 `runGit` 의 선행 전역 옵션 스크리닝에 걸리지
- * 않는다(실측: 선행 자리에 놓으면 허용 목록에 없다고 정상적으로 거부된다).
+ * `--output=<파일>` 은 서브커맨드 **뒤**, path separator `--` **앞**에 둔다. 그래야
+ * `runGit` 의 선행 전역 옵션 스크리닝에 걸리지 않고, literal allowlist가 있을 때도
+ * 출력 옵션 자체를 경로로 오인하지 않는다.
  *
  * @returns `{ size }` (성공) 또는 `{ failure }` (git 봉투 그대로).
  */
 async function diffToFile({ run, args, cwd, env, patchPath }) {
+  const separator = args.indexOf('--');
+  const outputArg = `--output=${patchPath}`;
+  const finalArgs = separator === -1
+    ? [...args, outputArg]
+    : [...args.slice(0, separator), outputArg, ...args.slice(separator)];
   const got = await run({
-    args: [...args, `--output=${patchPath}`],
+    args: finalArgs,
     cwd,
     env,
     timeoutMs: WORKTREE_TIMEOUT_MS,
@@ -302,19 +544,61 @@ async function diffToFile({ run, args, cwd, env, patchPath }) {
  * @returns `{ bytes }` · `{ failure }` · `{ crashed }`
  */
 async function diffToBytes({ run, args, cwd, env, stateRoot, tag }) {
-  patchSeq += 1;
-  const patchPath = join(stateRoot, 'scratch', `${tag}-${process.pid}-${patchSeq}.patch`);
+  const requestedScratch = join(stateRoot, 'scratch');
+  let operationPath = null;
+  let operationIdentity = null;
+  let operationOwned = false;
+  let patchPath = null;
+  let outcome;
   try {
-    await mkdir(join(stateRoot, 'scratch'), { recursive: true });
+    await mkdir(requestedScratch, { recursive: true });
+    const [realStateRoot, scratch] = await Promise.all([canonical(stateRoot), canonical(requestedScratch)]);
+    const scratchRel = realStateRoot === null || scratch === null ? null : relative(realStateRoot, scratch);
+    if (scratchRel === null || scratchRel === '' || scratchRel.startsWith('..') || isAbsolute(scratchRel)) {
+      throw new Error('scratch 경로의 실체가 상태 루트 밖을 가리킵니다.');
+    }
+    operationPath = await mkdtemp(join(scratch, 'diff-'));
+    operationOwned = true;
+    const [operationEntry, realOperation] = await Promise.all([
+      lstat(operationPath, { bigint: true }),
+      canonical(operationPath),
+    ]);
+    const operationRel = realOperation === null ? null : relative(scratch, realOperation);
+    if (
+      !operationEntry.isDirectory() ||
+      operationEntry.isSymbolicLink() ||
+      operationRel === null ||
+      operationRel === '' ||
+      operationRel.startsWith('..') ||
+      isAbsolute(operationRel) ||
+      !samePath(operationPath, realOperation)
+    ) {
+      throw new Error('diff 전용 scratch 디렉터리의 소유권/containment 를 증명하지 못했습니다.');
+    }
+    operationIdentity = { dev: operationEntry.dev, ino: operationEntry.ino };
+    patchPath = join(operationPath, 'patch');
     const wrote = await diffToFile({ run, args, cwd, env, patchPath });
-    if (wrote.failure) return wrote;
-    if (wrote.size === 0) return { bytes: Buffer.alloc(0) };
-    return { bytes: await readFile(patchPath) };
+    if (wrote.failure) outcome = wrote;
+    else if (wrote.size === 0) outcome = { bytes: Buffer.alloc(0) };
+    else outcome = { bytes: await readFile(patchPath) };
   } catch (error) {
-    return { crashed: error };
-  } finally {
-    await rm(patchPath, { force: true }).catch(() => {});
+    outcome = { crashed: new Error(`${tag} patch scratch 처리 실패: ${String(error?.message ?? error)}`) };
   }
+  if (operationOwned) {
+    const entry = await lstat(operationPath, { bigint: true }).catch(() => null);
+    const sameOwnedDirectory =
+      entry?.isDirectory() &&
+      !entry.isSymbolicLink() &&
+      operationIdentity !== null &&
+      entry.dev === operationIdentity.dev &&
+      entry.ino === operationIdentity.ino;
+    if (sameOwnedDirectory) {
+      await rm(operationPath, { recursive: true, force: true }).catch(() => {});
+    }
+    const removed = await absenceProven(operationPath);
+    if (!removed) return { crashed: new Error(`${tag} patch scratch 전용 디렉터리를 지우지 못했습니다.`) };
+  }
+  return outcome;
 }
 
 // ── 동시 생성 직렬화 ──────────────────────────────────────────────────────
@@ -511,7 +795,8 @@ function enqueue(body) {
  *     I-6 를 고친 지금은 등록 잔재가 실제로 남는다. 그 교환은 의도한 것이다:
  *     고아 등록 하나가 사용자 워크트리의 비가역 파괴보다 낫다. 리퍼는 확장하지 않는다.
  *
- * @param {{ projectPath: string, stateRoot: string, runId: string, deps?: { run?: Function } }} spec
+ * @param {{ projectPath: string, stateRoot: string, runId: string, worktreeId?: string,
+ *   purpose?: string, deps?: { run?: Function } }} spec
  *   `deps.run` 은 주입 자리다(reaper.mjs 와 같은 형태). 기본값은 하드닝된 `runGit` 이고,
  *   테스트가 특정 git 호출의 결과를 흔들어 실패 경로를 재는 데 쓴다.
  * @returns {Promise<object>} 성공하면 이후 함수들에 그대로 넘기는 핸들
@@ -538,6 +823,8 @@ export async function createWorktree(spec) {
     const projectPath = options.projectPath;
     const stateRoot = options.stateRoot;
     const runId = options.runId;
+    const worktreeId = options.worktreeId ?? runId;
+    const purpose = options.purpose ?? null;
     const deps = options.deps ?? {};
     const run = deps.run ?? runGit;
 
@@ -553,6 +840,15 @@ export async function createWorktree(spec) {
         '소문자/숫자로 시작하고 소문자·숫자·`_`·`-` 만 쓰는 64자 이내의 이름을 주세요 ' +
           '(대문자와 `.` 는 Windows 가 같은 디렉터리로 접기 때문에 받지 않습니다).',
       );
+    }
+    if (typeof worktreeId !== 'string' || !RUN_ID_PATTERN.test(worktreeId)) {
+      return blocked(
+        `워크트리 ID 가 디렉터리 이름으로 쓸 수 없는 값입니다: ${JSON.stringify(worktreeId)}`,
+        'makeWorktreeId 가 만든 64자 이내의 안전한 filesystem ID 를 사용하세요.',
+      );
+    }
+    if (purpose !== null && (typeof purpose !== 'string' || !PURPOSE_PATTERN.test(purpose))) {
+      return blocked('워크트리 purpose 가 허용된 lane/evidence 용도가 아닙니다.', '정해진 lane/evidence purpose 를 사용하세요.');
     }
 
     // ★★ C-1. 여기서 **한 번** 실체 경로로 편 값을 이후 모든 판정·핸들에 쓴다. 아래
@@ -596,7 +892,7 @@ export async function createWorktree(spec) {
       );
     }
 
-    const worktreePath = join(realStateRoot, 'worktrees', runId);
+    const worktreePath = join(realStateRoot, 'worktrees', worktreeId);
     // 위 RUN_ID_PATTERN 과 이 검사는 서로 다른 축을 좁힌다: 패턴은 **문자 집합**을,
     // 이쪽은 **결과 경로**를 본다.
     //
@@ -629,6 +925,8 @@ export async function createWorktree(spec) {
         projectPath: realProject,
         stateRoot: realStateRoot,
         runId,
+        worktreeId,
+        purpose,
         worktreePath,
         state,
       });
@@ -649,11 +947,142 @@ export async function createWorktree(spec) {
   });
 }
 
+/** Create a detached worktree at one immutable full commit without inspecting the user checkout. */
+export async function createRevisionWorktree(spec, deps = {}) {
+  return enqueue(async () => {
+    const options = spec ?? {};
+    const sourceWorktree = options.sourceWorktree;
+    const stateRoot = options.stateRoot;
+    const runId = options.runId;
+    const purpose = options.purpose;
+    const revision = options.revision;
+    const run = deps?.run ?? runGit;
+
+    const sourceGuard = checkHandle(sourceWorktree);
+    if (sourceGuard) return sourceGuard;
+    if (typeof stateRoot !== 'string' || stateRoot === '') {
+      return blocked('상태 루트 경로가 비어 있습니다.', '절대 경로를 지정하세요.');
+    }
+    if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)) {
+      return blocked('논리 runId 가 허용된 형식이 아닙니다.', '소문자 안전 문자로 된 1~64자 runId 를 사용하세요.');
+    }
+    if (typeof purpose !== 'string' || !PURPOSE_PATTERN.test(purpose)) {
+      return blocked('워크트리 purpose 가 허용된 lane/evidence 용도가 아닙니다.', '정해진 lane/evidence purpose 를 사용하세요.');
+    }
+    if (!isFullObjectId(revision)) {
+      return blocked('revision 은 full lowercase commit ID 여야 합니다.', 'Git 이 반환한 전체 commit ID 를 사용하세요.');
+    }
+
+    // Derive once. The complete logical ID remains on the handle and this projection is used only
+    // for directory/registration identity.
+    let worktreeId;
+    try {
+      worktreeId = makeWorktreeId({ runId, purpose });
+    } catch (error) {
+      return blocked(String(error?.message ?? error), '안전한 runId 와 정해진 purpose 를 사용하세요.');
+    }
+
+    const [realProject, realStateRoot, realSourceRoot, realSourcePath] = await Promise.all([
+      canonical(sourceWorktree.projectPath),
+      canonical(stateRoot),
+      canonical(sourceWorktree.stateRoot),
+      canonical(sourceWorktree.path),
+    ]);
+    if ([realProject, realStateRoot, realSourceRoot, realSourcePath].some((value) => value === null)) {
+      return blocked('revision worktree 경로를 실체 경로로 확인하지 못했습니다.', '경로가 존재하고 읽을 수 있는지 확인하세요.');
+    }
+    if (!isSafeWorktree(realSourceRoot, realSourcePath)) {
+      return blocked('sourceWorktree 가 자신의 상태 루트 밖을 가리킵니다.', 'createWorktree 가 반환한 핸들을 그대로 사용하세요.');
+    }
+    const rel = relative(realProject, realStateRoot);
+    const firstSegment = rel.split(/[\\/]/)[0];
+    const isOutside = rel !== '' && (isAbsolute(rel) || firstSegment === '..');
+    if (!isOutside) {
+      return blocked(
+        `상태 루트가 대상 저장소 안에 있습니다: ${realStateRoot}`,
+        'BOM_ORCH_HOME 을 프로젝트 밖의 절대 경로로 지정하세요.',
+      );
+    }
+
+    const identity = await resolveRevisionIdentity({ run, cwd: realProject, revision, requireExact: true });
+    if (identity.blocked) return identity;
+
+    const baselineCommit = typeof sourceWorktree.baseline === 'string'
+      ? sourceWorktree.baseline
+      : sourceWorktree.baseline?.commit;
+    if (!isFullObjectId(baselineCommit)) {
+      return blocked('sourceWorktree 에 shared baseline commit 이 없습니다.', 'createWorktree 가 반환한 핸들을 사용하세요.');
+    }
+    const resolvedBaseline = await resolveRevisionIdentity({
+      run,
+      cwd: realProject,
+      revision: baselineCommit,
+      requireExact: true,
+    });
+    if (resolvedBaseline.blocked) return resolvedBaseline;
+    const declaredBaseline = sourceWorktree.baselineIdentity ??
+      (sourceWorktree.baseline && typeof sourceWorktree.baseline === 'object' ? sourceWorktree.baseline : null);
+    if (declaredBaseline !== null && (
+      declaredBaseline.commit !== resolvedBaseline.commit || declaredBaseline.tree !== resolvedBaseline.tree
+    )) {
+      return blocked('sourceWorktree baseline identity 가 Git object 와 일치하지 않습니다.', '오염되지 않은 worktree 핸들을 사용하세요.');
+    }
+
+    const requested = join(realStateRoot, 'worktrees', worktreeId);
+    if (!isSafeWorktree(realStateRoot, requested)) {
+      return blocked('revision worktree 경로가 상태 루트 밖을 가리킵니다.', '안전한 runId/purpose 를 사용하세요.');
+    }
+    const state = { owned: false };
+    try {
+      return await createBody({
+        run,
+        projectPath: realProject,
+        stateRoot: realStateRoot,
+        runId,
+        worktreeId,
+        purpose,
+        worktreePath: requested,
+        state,
+        revision: identity.commit,
+        transplantState: false,
+        carriedBaseline: resolvedBaseline.commit,
+        carriedBaselineIdentity: { commit: resolvedBaseline.commit, tree: resolvedBaseline.tree },
+      });
+    } catch (error) {
+      if (state.owned) {
+        await discard({
+          run,
+          projectPath: realProject,
+          stateRoot: realStateRoot,
+          worktreePath: state.path ?? requested,
+        });
+      }
+      return blocked(
+        `revision worktree 를 만드는 중에 예기치 못한 오류가 났습니다: ${String(error?.message ?? error)}`,
+        '상태 루트 권한과 디스크 공간을 확인하세요.',
+      );
+    }
+  });
+}
+
 /**
  * `createWorktree` 의 본문. 위에서 try/catch 로 감싸므로 여기서는 던져도 된다 —
  * 던지면 호출부가 `discard()` 를 태운 뒤 봉투로 강등한다.
  */
-async function createBody({ run, projectPath, stateRoot, runId, worktreePath: requested, state }) {
+async function createBody({
+  run,
+  projectPath,
+  stateRoot,
+  runId,
+  worktreeId,
+  purpose,
+  worktreePath: requested,
+  state,
+  revision = 'HEAD',
+  transplantState = true,
+  carriedBaseline = null,
+  carriedBaselineIdentity = null,
+}) {
   const scratch = join(stateRoot, 'scratch');
   await mkdir(join(stateRoot, 'worktrees'), { recursive: true });
   await mkdir(scratch, { recursive: true });
@@ -751,7 +1180,7 @@ async function createBody({ run, projectPath, stateRoot, runId, worktreePath: re
   //     이고, 반대로 `--detach` 만 있고 커밋 지정이 없으면 첫째 줄(새 브랜치 생성)이
   //     되살아난다.
   const created = await run({
-    args: ['worktree', 'add', '-q', '--detach', worktreePath, 'HEAD'],
+    args: ['worktree', 'add', '-q', '--detach', worktreePath, revision],
     cwd: projectPath,
     timeoutMs: WORKTREE_TIMEOUT_MS,
   });
@@ -785,6 +1214,29 @@ async function createBody({ run, projectPath, stateRoot, runId, worktreePath: re
   state.owned = true;
   state.path = worktreePath;
 
+  if (!transplantState) {
+    const identity = await resolveRevisionIdentity({ run, cwd: worktreePath, revision, requireExact: true });
+    if (identity.blocked) {
+      await discard({ run, projectPath, stateRoot, worktreePath });
+      return identity;
+    }
+    return {
+      ok: true,
+      path: worktreePath,
+      projectPath,
+      stateRoot,
+      runId,
+      worktreeId,
+      purpose,
+      baseline: carriedBaseline,
+      baselineIdentity: carriedBaselineIdentity,
+      lastSnapshot: identity.commit,
+      transplanted: false,
+      ignoredPaths: [],
+      sharedRules: await collectSharedRules({ run, cwd: worktreePath }),
+    };
+  }
+
   // ★ I-3. **이식 방향에도** 무시 신호를 붙인다. 이식은 무시 규칙을 존중하므로(그것이
   //   옳다 — `HARDENING_ARGS` 주석의 `core.excludesFile` 항목을 보라) 사용자의 무시된
   //   워킹트리 파일은 워크트리에 오지 않는다. 지금까지 그 사실에 신호가 하나도 없어서,
@@ -798,7 +1250,7 @@ async function createBody({ run, projectPath, stateRoot, runId, worktreePath: re
   const ignoredPaths = await collectIgnoredPaths({ run, cwd: projectPath });
   const sharedRules = await collectSharedRules({ run, cwd: worktreePath });
 
-  const transplanted = await transplant({ run, projectPath, worktreePath, scratch, runId });
+  const transplanted = await transplant({ run, projectPath, worktreePath, scratch, runId: worktreeId });
   if (transplanted.blocked) {
     await discard({ run, projectPath, stateRoot, worktreePath });
     return transplanted;
@@ -812,6 +1264,16 @@ async function createBody({ run, projectPath, stateRoot, runId, worktreePath: re
     await discard({ run, projectPath, stateRoot, worktreePath });
     return baseline;
   }
+  const baselineIdentity = await resolveRevisionIdentity({
+    run,
+    cwd: worktreePath,
+    revision: baseline.commit,
+    requireExact: true,
+  });
+  if (baselineIdentity.blocked) {
+    await discard({ run, projectPath, stateRoot, worktreePath });
+    return baselineIdentity;
+  }
 
   return {
     ok: true,
@@ -819,7 +1281,10 @@ async function createBody({ run, projectPath, stateRoot, runId, worktreePath: re
     projectPath,
     stateRoot,
     runId,
+    worktreeId,
+    purpose,
     baseline: baseline.commit,
+    baselineIdentity: { commit: baselineIdentity.commit, tree: baselineIdentity.tree },
     lastSnapshot: baseline.commit,
     transplanted: transplanted.applied,
     ignoredPaths,
@@ -1260,6 +1725,356 @@ export async function snapshotStep(wt, label, deps = {}) {
     diff: diff.bytes,
     files: names.stdout.split('\0').filter((entry) => entry !== ''),
   };
+}
+
+async function canonicalHandle(wt) {
+  const guard = checkHandle(wt);
+  if (guard) return guard;
+  const [stateRoot, path, projectPath] = await Promise.all([
+    canonical(wt.stateRoot),
+    canonical(wt.path),
+    canonical(wt.projectPath),
+  ]);
+  if (stateRoot === null || path === null || projectPath === null || !isSafeWorktree(stateRoot, path)) {
+    return blocked(
+      '워크트리 핸들의 경로를 안전한 실체 경로로 확인하지 못했습니다.',
+      'createWorktree/createRevisionWorktree 가 반환한 핸들을 그대로 사용하세요.',
+    );
+  }
+  return { ok: true, stateRoot, path, projectPath };
+}
+
+/** Resolve one full commit ID and its tree through hardened Git. */
+export async function revisionIdentity(wt, revision, deps = {}) {
+  const paths = await canonicalHandle(wt);
+  if (paths.blocked) return paths;
+  return resolveRevisionIdentity({
+    run: deps?.run ?? runGit,
+    cwd: paths.path,
+    revision,
+    requireExact: true,
+  });
+}
+
+/**
+ * Return NUL-authoritative, no-renames delta entries. Exact entry shape:
+ * `{ path, status, oldMode, newMode }` where status is added/modified/deleted.
+ */
+export async function listRevisionDelta(wt, spec, deps = {}) {
+  const paths = await canonicalHandle(wt);
+  if (paths.blocked) return paths;
+  const revisions = validateRevisionPair(spec);
+  if (!revisions.ok) return blocked(revisions.error, 'full revision 과 안전한 저장소 상대 경로를 사용하세요.');
+  const run = deps?.run ?? runGit;
+  const authenticated = await authenticateRevisionPair({ run, cwd: paths.path, revisions });
+  if (authenticated.blocked) return authenticated;
+  if (authenticated.paths !== null && authenticated.paths.length === 0) return { ok: true, entries: [] };
+  const result = await run({
+    args: revisionDiffArgs({ ...authenticated, raw: true }),
+    cwd: paths.path,
+    timeoutMs: WORKTREE_TIMEOUT_MS,
+  }).catch(() => null);
+  if (!result?.ok) {
+    return blocked(
+      `revision delta 목록을 뜨지 못했습니다: ${gitReason(result)}`,
+      'revision object 와 워크트리가 정상인지 확인하세요.',
+    );
+  }
+  const parsed = parseRawRevisionDelta(result.stdout);
+  if (!parsed.ok) return blocked(parsed.error, '경로 또는 mode 를 추측하지 않고 안전하게 중단했습니다.');
+  if (authenticated.paths !== null) {
+    const literals = new Set(authenticated.paths);
+    const unexpected = parsed.entries.find((entry) => !literals.has(entry.path));
+    if (unexpected !== undefined) {
+      return blocked(
+        `Git 이 literal allowlist 와 정확히 다른 경로를 반환했습니다: ${JSON.stringify(unexpected.path)}`,
+        '대소문자 별칭이 아닌 Git 이 반환한 정확한 저장소 경로를 사용하세요.',
+      );
+    }
+  }
+  return parsed;
+}
+
+/** Collect immutable binary patch bytes from a commit pair without touching the current index. */
+export async function collectPatchAtRevision(wt, spec, deps = {}) {
+  const paths = await canonicalHandle(wt);
+  if (paths.blocked) return paths;
+  const revisions = validateRevisionPair(spec);
+  if (!revisions.ok) return blocked(revisions.error, 'full revision 과 안전한 저장소 상대 경로를 사용하세요.');
+  const run = deps?.run ?? runGit;
+  const delta = await listRevisionDelta(wt, spec, { run });
+  if (delta.blocked) return delta;
+  if (revisions.paths !== null && revisions.paths.length === 0) {
+    const patch = Buffer.alloc(0);
+    return { ok: true, patch, files: [], sha256: createHash('sha256').update(patch).digest('hex'), empty: true };
+  }
+  const patch = await diffToBytes({
+    run,
+    args: revisionDiffArgs({ ...revisions, raw: false }),
+    cwd: paths.path,
+    stateRoot: paths.stateRoot,
+    tag: `revision-${revisions.to.slice(0, 12)}`,
+  });
+  if (patch.failure) {
+    return blocked(
+      `revision patch 를 뜨지 못했습니다: ${gitReason(patch.failure)}`,
+      'revision object 와 워크트리가 정상인지 확인하세요.',
+    );
+  }
+  if (patch.crashed) {
+    return blocked(
+      `revision patch bytes 를 읽지 못했습니다: ${String(patch.crashed?.message ?? patch.crashed)}`,
+      '상태 루트 권한과 디스크 공간을 확인하세요.',
+    );
+  }
+  const files = delta.entries.map((entry) => entry.path);
+  return {
+    ok: true,
+    patch: patch.bytes,
+    files,
+    sha256: createHash('sha256').update(patch.bytes).digest('hex'),
+    empty: patch.bytes.length === 0,
+  };
+}
+
+async function locateIndex({ run, cwd }) {
+  const [gitDirResult, indexResult] = await Promise.all([
+    run({ args: ['rev-parse', '--absolute-git-dir'], cwd, timeoutMs: WORKTREE_TIMEOUT_MS }).catch(() => null),
+    run({
+      args: ['rev-parse', '--path-format=absolute', '--git-path', 'index'],
+      cwd,
+      timeoutMs: WORKTREE_TIMEOUT_MS,
+    }).catch(() => null),
+  ]);
+  if (!gitDirResult?.ok || !indexResult?.ok) return null;
+  const [gitDir, indexPath] = await Promise.all([
+    canonical(gitDirResult.stdout.trim()),
+    canonical(indexResult.stdout.trim()),
+  ]);
+  if (gitDir === null || indexPath === null || !samePath(dirname(indexPath), gitDir)) return null;
+  const bytes = await readFile(indexPath).catch(() => null);
+  return bytes === null ? null : { gitDir, indexPath, bytes };
+}
+
+async function restoreAppliedWorktree({ run, cwd, original, savedIndex }) {
+  const reset = await run({
+    args: ['reset', '--hard', '-q', original.commit],
+    cwd,
+    timeoutMs: WORKTREE_TIMEOUT_MS,
+  }).catch(() => null);
+  const cleaned = await run({
+    args: ['clean', '-fdx', '-q'],
+    cwd,
+    timeoutMs: WORKTREE_TIMEOUT_MS,
+  }).catch(() => null);
+  if (!reset?.ok || !cleaned?.ok) return false;
+
+  // reset reconstructs a semantically equal index but can change stat-cache bytes. Restore the exact
+  // pristine index only after proving Git put HEAD/worktree back, and revalidate its canonical owner.
+  const currentIndex = await locateIndex({ run, cwd });
+  if (currentIndex === null || !samePath(currentIndex.gitDir, savedIndex.gitDir) || !samePath(currentIndex.indexPath, savedIndex.indexPath)) {
+    return false;
+  }
+  try {
+    await writeFile(currentIndex.indexPath, savedIndex.bytes);
+  } catch {
+    return false;
+  }
+  const [identity, status] = await Promise.all([
+    resolveRevisionIdentity({ run, cwd, revision: original.commit, requireExact: true }),
+    run({
+      args: ['status', '--porcelain', '-z', '--ignored=matching'],
+      cwd,
+      timeoutMs: WORKTREE_TIMEOUT_MS,
+    }).catch(() => null),
+  ]);
+  return identity.ok === true && identity.commit === original.commit && identity.tree === original.tree && status?.ok === true && status.stdout === '';
+}
+
+/** Verify and apply raw patch bytes only inside a pristine isolated revision worktree. */
+export async function applyPatchBytes(wt, spec, deps = {}) {
+  const options = spec ?? {};
+  const patch = options.patch;
+  const expectedSha = options.sha256;
+  if (!Buffer.isBuffer(patch)) {
+    return blocked('적용할 patch 는 raw Buffer 여야 합니다.', 'binary patch bytes 를 그대로 전달하세요.');
+  }
+  if (typeof expectedSha !== 'string' || !SHA256_PATTERN.test(expectedSha)) {
+    return blocked('patch sha256 은 full lowercase 64-hex 여야 합니다.', '수집 시 반환된 sha256 을 사용하세요.');
+  }
+  const actualSha = createHash('sha256').update(patch).digest('hex');
+  if (actualSha !== expectedSha) {
+    return blocked('patch SHA-256 이 전달된 값과 일치하지 않습니다.', 'patch bytes 와 sha256 을 같은 수집 결과에서 사용하세요.');
+  }
+
+  const paths = await canonicalHandle(wt);
+  if (paths.blocked) return paths;
+  const run = deps?.run ?? runGit;
+  const original = await resolveRevisionIdentity({ run, cwd: paths.path, revision: 'HEAD', requireExact: false });
+  if (original.blocked) return original;
+  const pristine = await run({
+    args: ['status', '--porcelain', '-z', '--ignored=matching'],
+    cwd: paths.path,
+    timeoutMs: WORKTREE_TIMEOUT_MS,
+  }).catch(() => null);
+  if (!pristine?.ok || pristine.stdout !== '') {
+    return blocked('patch 적용 대상 revision worktree 가 pristine 상태가 아닙니다.', '새 revision worktree 를 만들어 다시 시도하세요.');
+  }
+  const savedIndex = await locateIndex({ run, cwd: paths.path });
+  if (savedIndex === null) {
+    return blocked('워크트리 index 를 안전한 canonical 경로로 확인하지 못했습니다.', '워크트리를 새로 만든 뒤 다시 시도하세요.');
+  }
+  if (patch.length === 0) return original;
+
+  const scratchRequested = join(paths.stateRoot, 'scratch');
+  let scratch;
+  let operationPath;
+  let patchPath;
+  let indexPath;
+  let operationOwned = false;
+  let actualStarted = false;
+  let successfulIdentity = null;
+  try {
+    await mkdir(scratchRequested, { recursive: true });
+    scratch = await canonical(scratchRequested);
+    const scratchRel = scratch === null ? null : relative(paths.stateRoot, scratch);
+    if (scratch === null || scratchRel === '' || scratchRel.startsWith('..') || isAbsolute(scratchRel)) {
+      return blocked('scratch 경로의 실체가 상태 루트 밖을 가리킵니다.', '상태 루트의 scratch 링크를 제거하세요.');
+    }
+    // A private directory makes every child ours and makes the path unpredictable before mkdtemp
+    // succeeds. Never derive a shared `<pid>-<seq>.lock` name that a foreign file can pre-occupy.
+    operationPath = await mkdtemp(join(scratch, 'apply-'));
+    operationOwned = true;
+    const realOperation = await canonical(operationPath);
+    const operationRel = realOperation === null ? null : relative(scratch, realOperation);
+    if (realOperation === null || operationRel === '' || operationRel.startsWith('..') || isAbsolute(operationRel)) {
+      return blocked('apply 전용 scratch 경로의 실체를 증명하지 못했습니다.', '상태 루트의 scratch 링크를 제거하세요.');
+    }
+    operationPath = realOperation;
+    patchPath = join(operationPath, 'patch');
+    indexPath = join(operationPath, 'index');
+    await writeFile(patchPath, patch, { flag: 'wx' });
+    const tempEnv = { GIT_INDEX_FILE: indexPath };
+    const readTree = await run({
+      args: ['read-tree', original.commit],
+      cwd: paths.path,
+      env: tempEnv,
+      timeoutMs: WORKTREE_TIMEOUT_MS,
+    });
+    if (!readTree.ok) {
+      return blocked(`patch preflight index 를 만들지 못했습니다: ${gitReason(readTree)}`, '워크트리와 scratch 권한을 확인하세요.');
+    }
+    const preflightApply = await run({
+      args: ['apply', '--cached', '--whitespace=nowarn', patchPath],
+      cwd: paths.path,
+      env: tempEnv,
+      timeoutMs: WORKTREE_TIMEOUT_MS,
+    });
+    if (!preflightApply.ok) {
+      return blocked(`patch preflight 가 거부했습니다: ${gitReason(preflightApply)}`, 'revision 에 정확히 맞는 안전한 patch 를 사용하세요.');
+    }
+    const raw = await run({
+      args: ['diff', '--cached', '--no-patch', '--raw', '-z', '--no-abbrev', '--no-renames', original.commit],
+      cwd: paths.path,
+      env: tempEnv,
+      timeoutMs: WORKTREE_TIMEOUT_MS,
+    });
+    if (!raw.ok) {
+      return blocked(`patch 경로/mode preflight 를 읽지 못했습니다: ${gitReason(raw)}`, '워크트리가 정상인지 확인하세요.');
+    }
+    const delta = parseRawRevisionDelta(raw.stdout);
+    if (!delta.ok || delta.entries.length === 0) {
+      return blocked(delta.ok ? 'patch 가 파일 delta 를 만들지 않습니다.' : delta.error, '일반 파일만 든 non-empty patch 를 사용하세요.');
+    }
+    const materialization = validateMaterializationPaths(delta.entries.map((entry) => entry.path));
+    if (!materialization.ok) {
+      return blocked(materialization.error, '모든 플랫폼에서 한 파일로만 해석되는 일반 경로만 적용하세요.');
+    }
+    const expectedTreeResult = await run({
+      args: ['write-tree'],
+      cwd: paths.path,
+      env: tempEnv,
+      timeoutMs: WORKTREE_TIMEOUT_MS,
+    });
+    const expectedTree = expectedTreeResult?.ok && typeof expectedTreeResult.stdout === 'string'
+      ? expectedTreeResult.stdout.trim()
+      : '';
+    if (!isFullObjectId(expectedTree)) {
+      return blocked(`patch preflight tree 를 만들지 못했습니다: ${gitReason(expectedTreeResult)}`, '워크트리가 정상인지 확인하세요.');
+    }
+
+    actualStarted = true;
+    const applied = await run({
+      args: ['apply', '--index', '--whitespace=nowarn', patchPath],
+      cwd: paths.path,
+      timeoutMs: WORKTREE_TIMEOUT_MS,
+    });
+    if (!applied.ok) {
+      const restored = await restoreAppliedWorktree({ run, cwd: paths.path, original, savedIndex });
+      if (!restored) {
+        return blocked('patch 적용 실패 뒤 워크트리 복구를 증명하지 못했습니다.', '이 worktree 를 격리하고 새 revision worktree 를 만드세요.');
+      }
+      return blocked(`patch 를 적용하지 못했습니다: ${gitReason(applied)}`, 'revision 과 patch 가 정확히 일치하는지 확인하세요.');
+    }
+    const committed = await commitAll({ run, worktreePath: paths.path, label: `bom-orch apply ${actualSha.slice(0, 12)}` });
+    if (committed.blocked) {
+      const restored = await restoreAppliedWorktree({ run, cwd: paths.path, original, savedIndex });
+      if (!restored) {
+        return blocked('patch commit 실패 뒤 워크트리 복구를 증명하지 못했습니다.', '이 worktree 를 격리하고 새 revision worktree 를 만드세요.');
+      }
+      return committed;
+    }
+    const identity = await resolveRevisionIdentity({ run, cwd: paths.path, revision: committed.commit, requireExact: true });
+    if (identity.blocked) {
+      const restored = await restoreAppliedWorktree({ run, cwd: paths.path, original, savedIndex });
+      if (!restored) {
+        return blocked('적용 결과 identity 실패 뒤 워크트리 복구를 증명하지 못했습니다.', '이 worktree 를 격리하고 새 revision worktree 를 만드세요.');
+      }
+      return identity;
+    }
+    const clean = await run({
+      args: ['status', '--porcelain', '-z', '--ignored=matching'],
+      cwd: paths.path,
+      timeoutMs: WORKTREE_TIMEOUT_MS,
+    }).catch(() => null);
+    if (identity.tree !== expectedTree || !clean?.ok || clean.stdout !== '') {
+      const restored = await restoreAppliedWorktree({ run, cwd: paths.path, original, savedIndex });
+      if (!restored) {
+        return blocked('patch 결과 검증 실패 뒤 워크트리 복구를 증명하지 못했습니다.', '이 worktree 를 격리하고 새 revision worktree 를 만드세요.');
+      }
+      return blocked('patch commit 이 preflight tree 전체를 정확히 담지 못했습니다.', '저장소 filter/ignore 설정을 확인하세요.');
+    }
+    successfulIdentity = identity;
+    return identity;
+  } catch (error) {
+    if (actualStarted) {
+      const restored = await restoreAppliedWorktree({ run, cwd: paths.path, original, savedIndex }).catch(() => false);
+      if (!restored) {
+        return blocked('patch 처리 예외 뒤 워크트리 복구를 증명하지 못했습니다.', '이 worktree 를 격리하고 새 revision worktree 를 만드세요.');
+      }
+    }
+    return blocked(`patch bytes 를 처리하지 못했습니다: ${String(error?.message ?? error)}`, 'scratch 권한과 디스크 공간을 확인하세요.');
+  } finally {
+    if (operationOwned) await rm(operationPath, { recursive: true, force: true }).catch(() => {});
+    const operationRemoved = !operationOwned || await absenceProven(operationPath);
+    if (!operationRemoved) {
+      const restored = !actualStarted || await restoreAppliedWorktree({
+        run,
+        cwd: paths.path,
+        original,
+        savedIndex,
+      }).catch(() => false);
+      return blocked(
+        restored
+          ? 'patch scratch 정리에 실패해 적용 결과를 되돌렸습니다.'
+          : 'patch scratch 정리 실패 뒤 워크트리 복구를 증명하지 못했습니다.',
+        restored
+          ? '잠긴 scratch 파일을 정리한 뒤 새 revision worktree 에서 다시 시도하세요.'
+          : '이 worktree 를 격리하고 새 revision worktree 를 만드세요.',
+      );
+    }
+    if (successfulIdentity !== null) wt.lastSnapshot = successfulIdentity.commit;
+  }
 }
 
 // ── 최종 패치 ─────────────────────────────────────────────────────────────

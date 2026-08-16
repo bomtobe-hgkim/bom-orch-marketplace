@@ -17,14 +17,23 @@ description: 다른 벤더의 CLI 에 코딩 작업을 맡기고 교차검증까
 | `orch_run` | `isolation` | 아니오 | `worktree` | `worktree` |
 | `orch_run` | `budget` | 아니오 | `5` | 1~10 정수 |
 | `orch_run` | `wait_ms` | 아니오 | `1800000` | 0 이상 |
+| `orch_run` | `candidates` | 아니오 | `1` | `1`, `2` |
 | `orch_run` | `allow_single` | 아니오 | `false` | — |
 
 - `task` — 무엇을 할지. 구체적일수록 좋습니다.
 - `project` — **절대 경로**여야 하고 git 저장소여야 합니다. 이 서버의 작업 디렉터리는
   호스트가 물려준 값이라 고정돼 있지 않습니다 — 상대 경로를 주면 엉뚱한 저장소에
   워크트리가 생깁니다.
-- `budget` — 몇 스텝까지 다시 시도할지.
-- `wait_ms` — 최대 대기 시간(밀리초).
+- `budget` — 몇 스텝까지 다시 시도할지. **lane 하나마다** 세는 값입니다 — `candidates: 2`
+  에서는 두 lane이 각각 이만큼 씁니다. 시작한 writer 호출은 봉인 전에 끝나도 한 칸을
+  씁니다. 형식만 고치는 verifier 재요청은 읽기 전용이라 세지 않습니다.
+- `wait_ms` — 최대 대기 시간(밀리초). 이 값은 Run 전체가 나눠 쓰는 **공유 데드라인**
+  하나입니다 — lane마다 따로 주어지지 않습니다. 데드라인이 지나면 새 provider·테스트·
+  judge 호출이 시작되지 않고, 그 시점까지 만들어진 artifact만 회수 경로로 남습니다.
+- `candidates` — 독립 후보 수입니다. `2`이면 두 provider와 lane별 `budget`을 사용합니다.
+  `candidates: 2`와 `allow_single: true`는 함께 쓸 수 없습니다.
+  ⚠ `candidates: 2`는 provider·writer·테스트 비용을 대략 **두 배**로 늘립니다. 두 lane이
+  각자 작성하고 각자 교차검증하며, 회귀 증거도 lane마다 따로 실행하기 때문입니다.
 - `isolation` — 지금 고를 수 있는 값이 하나뿐입니다. 벤더 CLI 의 도구 권한 플래그는
   델리게이트의 셸을 제한하지 못한다는 것이 확인돼, 실제로 성립하는 격리가 일회용
   워크트리뿐입니다.
@@ -40,8 +49,9 @@ orch-learn 스킬을 보세요.
 
 ## 결과
 
-패치 **파일 경로**가 본문의 `patch.path` 로 돌아옵니다. 적용은 호출자가 `git apply` 로
-직접 합니다 — 무엇이 바뀌는지 보고 나서 적용하라는 뜻입니다.
+패치 **파일 경로**가 본문의 `patch.path` 로 돌아옵니다. **이 서버는 패치를 자동으로
+적용하지 않습니다** — 적용은 호출자가 `git apply` 로 직접 합니다. 무엇이 바뀌는지 보고
+나서 적용하라는 뜻입니다.
 
 - `scope.flagged` 가 참이면 패치가 예상 밖의 파일을 건드렸다는 뜻입니다. 적용 전에
   `scope.reasons` 를 읽으세요(아래 「본문은 줄어서 올 수 있습니다」도 함께 보세요).
@@ -50,6 +60,68 @@ orch-learn 스킬을 보세요.
 - `patch.empty` 가 참이면 워커가 아무것도 안 바꿨습니다.
 - 본문의 `runId` 가 이 실행의 식별자입니다. 자동 채점이 틀렸으면 그 값을 정정에 씁니다
   (orch-learn 스킬).
+
+### 본문의 최상위 필드
+
+| 필드 | 뜻 |
+| --- | --- |
+| `runId` | 이 실행의 식별자. `orch_reward` 가 받는 값입니다 |
+| `stopReason` | 실행이 끝난 이유. 선택된 후보의 종료 사유이거나 Run 차원의 중단 사유입니다 |
+| `stepCount` | 선택된 후보가 쓴 attempt 수 |
+| `patch` | 선택된 결과의 별칭 패치. 대표 패치가 없는 종료에는 아예 없습니다 |
+| `scope` | 패치가 예상 밖 파일을 건드렸는지 |
+| `worktree` | 일회용 워크트리의 정리 상태 |
+| `blockers` | 진행을 막은 lane과 그 사유 |
+| `learning` | 이 실행이 쓴 결정 축과 실제로 반영한 등급 |
+| `plan` | 계획 단계를 맡은 provider |
+| `steps` | 선택된 후보의 attempt 순서 |
+| `verdict` | 선택된 후보에 대한 verifier 의 구조화된 판정 |
+| `issues` | lane 별로 아직 열려 있는 blocking issue ID |
+| `candidates` | 후보마다의 종료 등급·패치·증명 상태 |
+| `attempts` | 불변 attempt 기록의 참조 |
+| `regressionProof` | 버그 수정 증명의 상태와 증거 참조 |
+| `selection` | 어느 후보가 왜 뽑혔는가 |
+| `artifacts` | 이 실행이 남긴 manifest·후보 패치 경로와 만료 시각 |
+| `omittedCounts` | 본문이 줄면서 빠진 항목 수 |
+
+`artifacts.manifestPath` 와 `artifacts.candidatePaths` 는 **절대 경로**이고,
+`artifacts.expiresAt` 이 지나면 리퍼가 지웁니다. `regressionProof.status` 는 버그 수정
+작업에서만 의미가 있습니다.
+
+### `selection.outcome` 다섯 가지
+
+| 값 | 뜻 |
+| --- | --- |
+| `winner` | 한 후보가 이겼습니다. `patch.path` 에 그 결과가 있습니다 |
+| `single_survivor` | 나머지 lane 이 탈락해 남은 하나가 뽑혔습니다 |
+| `equivalent` | 두 후보의 패치 바이트가 같아 판정 없이 앞 lane 을 씁니다 |
+| `tie` | 판정이 갈렸습니다 |
+| `none` | 뽑을 수 있는 후보가 없습니다 |
+
+⚠ **`tie` 에는 대표 패치가 없습니다.** `selection.selectedCandidateId` 가 `null` 이고
+`patch` 도 없습니다. 대신 두 후보의 패치가 `artifacts.candidatePaths` 에 그대로 남으니
+직접 읽고 고르세요. `none` 도 대표 패치를 만들지 않습니다.
+
+### 신뢰도는 machine 증거가 정합니다
+
+verifier 는 이제 **구조화된 JSON 판정**을 냅니다 — 산문 승인이 아니라 검사 항목과 이슈
+목록입니다. 그 판정만으로는 `verified` 가 되지 않습니다.
+
+⚠ 테스트를 못 찾았거나, 실행은 됐는데 어느 테스트가 어느 파일을 덮는지 **신뢰할 수 없는**
+러너였다면 봉투의 confidence 는 `unverified` 로 묶입니다. 그 상태의 결과도 쓸 수는 있지만
+「테스트가 통과했다」는 주장으로 읽으면 안 됩니다.
+
+### 경로가 너무 길면 실행 전에 막습니다
+
+⚠ 상태 루트가 너무 깊으면 artifact 절대 경로가 본문 상한을 넘습니다. 그때는 provider·
+워크트리·artifact 를 만들기 **전에** `blocked` 로 끝냅니다 — 반쯤 만든 실행을 남기지
+않기 위해서입니다. 더 **짧은** `BOM_ORCH_HOME` 을 지정하고 다시 부르세요.
+
+### 격리에 대한 정직한 한계
+
+⚠ 일회용 워크트리와 그 안의 테스트 실행은 **OS 샌드박스가 아닙니다.** 워커가 만든 코드와
+저장소의 테스트 스크립트는 당신의 사용자 권한으로 돕니다. 신뢰할 수 없는 저장소에는
+이 도구를 쓰지 마세요.
 
 ## ★ 본문은 줄어서 올 수 있습니다 — 위 필드가 늘 그대로 있지는 않습니다
 

@@ -37,7 +37,7 @@ export const CONFIDENCE = Object.freeze(['verified', 'unverified', 'disputed']);
 export const MAX_CONTENT_CHARS = 10_000;
 
 const GENERIC_RECOVERY = '오류 로그를 확인하거나 다시 시도하세요.';
-const TRUNCATION_NOTICE = `content 가 ${MAX_CONTENT_CHARS}자 상한을 넘어 잘렸습니다(truncated). 전체 내용이 필요하면 더 좁은 요청으로 나눠 다시 부르세요.`;
+const TRUNCATED_REPORT = '{"truncatedReport":true}';
 
 /** 어떤 값에서도(toString 이 던지는 값 포함) 사람이 읽을 문자열을 뽑는다. */
 function safeErrorText(error) {
@@ -52,6 +52,27 @@ function safeErrorText(error) {
 
 function normalizeConfidence(confidence) {
   return CONFIDENCE.includes(confidence) ? confidence : 'unverified';
+}
+
+function validWholeJson(value) {
+  if (typeof value !== 'string' || value.length > MAX_CONTENT_CHARS) return false;
+  try {
+    JSON.parse(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeRunContent(content, contentFallback) {
+  if (contentFallback === undefined) {
+    return typeof content === 'string' && content.length <= MAX_CONTENT_CHARS
+      ? { content, replaced: false }
+      : { content: TRUNCATED_REPORT, replaced: true };
+  }
+  if (validWholeJson(content)) return { content, replaced: false };
+  if (validWholeJson(contentFallback)) return { content: contentFallback, replaced: true };
+  return { content: TRUNCATED_REPORT, replaced: true };
 }
 
 /**
@@ -78,20 +99,19 @@ function normalizeConfidence(confidence) {
  *
  * status 만 보는 호출부를 위해 엔진은 `stopReason` 을 봉투 **최상위**에도 싣는다.
  */
-export function success({ content, confidence, notice, ...rest } = {}) {
+export function success({
+  content, contentFallback, confidence, notice, recovery, runId, stopReason,
+} = {}) {
   const finalConfidence = normalizeConfidence(confidence);
-  let finalContent = typeof content === 'string' ? content : '';
-  let finalNotice = typeof notice === 'string' && notice !== '' ? notice : undefined;
-
-  if (finalContent.length > MAX_CONTENT_CHARS) {
-    finalContent = finalContent.slice(0, MAX_CONTENT_CHARS);
-    // 기존 notice 를 덮지 않고 덧붙인다 — 둘 다 호출자에게 필요한 정보다.
-    finalNotice = finalNotice ? `${finalNotice} ${TRUNCATION_NOTICE}` : TRUNCATION_NOTICE;
-  }
+  const finalContent = normalizeRunContent(content, contentFallback).content;
+  const finalNotice = typeof notice === 'string' && notice !== '' ? notice : undefined;
 
   const status = finalConfidence === 'disputed' ? 'failed' : 'succeeded';
-  const env = { ...rest, status, content: finalContent, confidence: finalConfidence };
+  const env = { status, content: finalContent, confidence: finalConfidence };
+  if (typeof recovery === 'string' && recovery !== '') env.recovery = recovery;
   if (finalNotice !== undefined) env.notice = finalNotice;
+  if (typeof runId === 'string') env.runId = runId;
+  if (typeof stopReason === 'string') env.stopReason = stopReason;
 
   // disputed 로 강등됐다면 이건 실패 봉투이기도 하다 — recovery 가 있어야 한다.
   if (status !== 'succeeded' && (typeof env.recovery !== 'string' || env.recovery === '')) {
@@ -105,10 +125,23 @@ export function success({ content, confidence, notice, ...rest } = {}) {
  * status 는 고정 어휘([[STATUSES]])만 나간다 — 모르는 값은 조용히 흘려보내지 않고
  * `failed` 로 강등한다.
  */
-export function failure({ status, error, recovery, ...rest } = {}) {
+export function failure({
+  status, error, recovery, content, contentFallback, confidence, notice, runId, stopReason,
+} = {}) {
   const finalStatus = STATUSES.includes(status) && status !== 'succeeded' ? status : 'failed';
   const finalRecovery = typeof recovery === 'string' && recovery !== '' ? recovery : GENERIC_RECOVERY;
-  return { ...rest, status: finalStatus, error: safeErrorText(error), recovery: finalRecovery };
+  const normalized = content !== undefined || contentFallback !== undefined
+    ? { content: normalizeRunContent(content, contentFallback).content }
+    : {};
+  const envelope = { status: finalStatus };
+  if (CONFIDENCE.includes(confidence)) envelope.confidence = confidence;
+  Object.assign(envelope, normalized);
+  envelope.error = safeErrorText(error);
+  envelope.recovery = finalRecovery;
+  if (typeof notice === 'string' && notice !== '') envelope.notice = notice;
+  if (typeof runId === 'string') envelope.runId = runId;
+  if (typeof stopReason === 'string') envelope.stopReason = stopReason;
+  return envelope;
 }
 
 /** JSON.stringify 가 성공했을 때 결과가 실제 문자열인지 본다 (undefined 반환 등을 걸러낸다). */

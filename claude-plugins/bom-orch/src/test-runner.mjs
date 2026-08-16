@@ -1,11 +1,13 @@
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { readdir, readFile, stat } from 'node:fs/promises';
-import { dirname, isAbsolute, join } from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
+import { lstat, open, readdir, readFile, rm, stat } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { timeoutSignal } from './deadline.mjs';
 import { runGit } from './git.mjs';
 import { buildChildEnv } from './providers/child-env.mjs';
 import { resolveBinary } from './providers/resolve-binary.mjs';
+import { canonical } from './real-path.mjs';
 
 /**
  * 테스트를 **오케스트레이터가 직접 돌린다.**
@@ -113,7 +115,16 @@ export const PYTEST_BOOTSTRAP =
   'import sys,os; sys.path.append(os.getcwd()); import pytest; raise SystemExit(pytest.main(sys.argv[1:]))';
 
 /** 위 부트스트랩의 나머지 절반. allowlist 밖의 계산값이라 `extra` 로 넘긴다. */
-const PYTEST_ENV = Object.freeze({ PYTHONSAFEPATH: '1' });
+/**
+ * ★ `PYTHONDONTWRITEBYTECODE` 가 필요한 이유(실측): 플러그인은 복사되지 않고
+ *   `PYTHONPATH=<repo>/src/test-reporters` 로 **제자리에서** import 된다. 그러면 Python 이
+ *   그 옆에 `__pycache__/pytest_events.cpython-*.pyc` 를 쓴다 — 소스 트리에 빌드 산출물이
+ *   생기고, `src/**` 를 통째로 복사하는 마켓플레이스 exporter 가 **그 .pyc 를 두 호스트
+ *   플러그인 루트에 그대로 배포한다**(실측: 내보낸 파일 목록에 두 건이 나왔다).
+ *   테스트를 한 번 돌린 기계에서 릴리스를 만들면 특정 Python·pytest 버전에 묶인 바이트코드가
+ *   패키지에 섞인다.
+ */
+const PYTEST_ENV = Object.freeze({ PYTHONSAFEPATH: '1', PYTHONDONTWRITEBYTECODE: '1' });
 
 /**
  * 이 csproj 이 **테스트 프로젝트**라는 양성 증거.
@@ -1503,4 +1514,1151 @@ export async function runTests(spec) {
       '워크트리 경로와 deriveTestCommand 의 결과를 확인한 뒤 다시 시도하세요.',
     );
   }
+}
+
+// ── Policy v2: immutable plans and trusted test evidence ──────────────────
+
+const FROZEN_PLAN_RUNTIME = new WeakMap();
+const ADAPTER_EVIDENCE_POLICY = new WeakMap();
+const TEST_RECORD_WITNESS_AUTHORITY = new WeakMap();
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const MAX_ADAPTER_BYTES = 8 * 1024 * 1024;
+const MAX_ADAPTER_EVENTS = 20_000;
+const MAX_ADAPTER_LINE_CHARS = 16_384;
+const MAX_DIAGNOSTICS = 8;
+const MAX_DIAGNOSTIC_CHARS = 240;
+const TEST_MODES = new Set(['b0', 'br', 'c']);
+const ADAPTER_IDS = new Set(['node-events-v1', 'pytest-events-v1', 'dotnet-trx-v1']);
+const PLAN_KEYS = [
+  'schemaVersion',
+  'source',
+  'adapterId',
+  'executable',
+  'argv',
+  'cwdPolicy',
+  'pinnedDefinitions',
+  'planFingerprint',
+  'environmentFingerprint',
+  'regressionWitnessTrusted',
+];
+
+const TEST_ASSET_LAYOUT =
+  typeof __BOM_ORCH_TEST_ASSET_LAYOUT__ === 'string' ? __BOM_ORCH_TEST_ASSET_LAYOUT__ : 'source';
+
+export function resolveTestAssetUrl({ moduleUrl = import.meta.url, layout = TEST_ASSET_LAYOUT, asset } = {}) {
+  const names = layout === 'source'
+    ? { node: './test-reporters/node-events.mjs', pytest: './test-reporters/pytest_events.py' }
+    : layout === 'dist'
+      ? { node: './node-test-reporter.mjs', pytest: './pytest_events.py' }
+      : null;
+  if (names === null || !Object.hasOwn(names, asset)) {
+    throw new TypeError('unknown test asset layout or asset');
+  }
+  return new URL(names[asset], moduleUrl);
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function hashJson(value) {
+  return sha256(Buffer.from(JSON.stringify(value), 'utf8'));
+}
+
+function deepFreeze(value) {
+  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
+function currentNodeMajorMinor(version = process.versions.node) {
+  const match = /^(\d+)\.(\d+)/.exec(String(version ?? ''));
+  return match ? `${match[1]}.${match[2]}` : 'unknown';
+}
+
+function environmentFacts(adapterId, executable, launchers = [], deps = {}) {
+  return {
+    platform: deps.platform ?? process.platform,
+    arch: deps.arch ?? process.arch,
+    nodeMajorMinor: currentNodeMajorMinor(deps.nodeVersion ?? process.versions.node),
+    adapterId,
+    executable,
+    launchers,
+  };
+}
+
+function environmentFingerprint(adapterId, executable, launchers = [], deps = {}) {
+  return hashJson(environmentFacts(adapterId, executable, launchers, deps));
+}
+
+function normalizedDefinitionPin(entry) {
+  const value = entry?.value;
+  return {
+    kind: typeof entry?.kind === 'string' ? entry.kind : null,
+    file: typeof entry?.file === 'string' ? entry.file : null,
+    key: typeof entry?.key === 'string' ? entry.key : null,
+    script: typeof entry?.script === 'string' ? entry.script : null,
+    suffix: typeof entry?.suffix === 'string' ? entry.suffix : null,
+    tracked: typeof entry?.tracked === 'boolean' ? entry.tracked : null,
+    valueSha256: hashJson(value ?? null),
+  };
+}
+
+function publicDefinitionPins(definition) {
+  if (!definition || typeof definition !== 'object') return [];
+  const entries = [definition, ...(Array.isArray(definition.extras) ? definition.extras : [])];
+  const grouped = new Map();
+  for (const entry of entries) {
+    const path = typeof entry?.file === 'string' && entry.file !== '' && !isAbsolute(entry.file)
+      ? entry.file.replaceAll('\\', '/')
+      : null;
+    if (path === null || path.includes('\0') || path.split('/').some((part) => part === '..')) continue;
+    const current = grouped.get(path) ?? [];
+    current.push(normalizedDefinitionPin(entry));
+    grouped.set(path, current);
+  }
+  return [...grouped.entries()]
+    .sort(([a], [b]) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+    .map(([path, values]) => ({ path, sha256: hashJson(values) }));
+}
+
+function tokenizeLiteralNodeScript(script) {
+  if (typeof script !== 'string' || script === '' || script.length > 8_192 ||
+      /[\r\n\t'"\\$%!*?\[\]{}()~^;&|><`#]/.test(script)) return null;
+  const trimmed = script.trim();
+  if (trimmed === '') return null;
+  const tokens = trimmed.split(/ +/);
+  if (tokens.some((token) => token === '' || !/^[A-Za-z0-9._/@+=,:-]+$/.test(token))) return null;
+  if (tokens.length < 2 || !/^(?:node|node\.exe)$/i.test(tokens[0])) return null;
+  const args = tokens.slice(1);
+  if (args.filter((arg) => arg === '--test').length !== 1) return null;
+  if (args.some((arg) =>
+    arg.startsWith('--test-reporter') || arg.startsWith('--test-reporter-destination') ||
+    isAbsolute(arg) || /^[A-Za-z]:/.test(arg)
+  )) return null;
+  return args;
+}
+
+const DEFAULT_NODE_WITNESS_POLICY = deepFreeze({ kind: 'node', trusted: true, roots: ['test', 'tests'] });
+const DEFAULT_PYTEST_WITNESS_POLICY = deepFreeze({ kind: 'pytest', trusted: true, roots: ['test', 'tests'] });
+
+function validWitnessRoot(value) {
+  if (typeof value !== 'string' || value === '' || value.length > 512 || value.includes('\0') || value.includes('\\') ||
+      isAbsolute(value) || /^[A-Za-z]:/.test(value) || /[*?\[\]{}]/.test(value)) return null;
+  const normalized = value.replace(/^\.\//, '').replace(/\/$/, '').normalize('NFC');
+  const parts = normalized.split('/');
+  return parts.some((part) => part === '' || part === '.' || part === '..') ? null : parts.join('/');
+}
+
+function pytestWitnessPolicy(source, definitionValue) {
+  let text = String(definitionValue ?? '');
+  if (source === 'pytest.ini') {
+    const section = extractIniSection(text, '[pytest]');
+    if (section === null || /^\s*\[pytest\]\s*$/gm.test(text) === false ||
+        (text.match(/^\s*\[pytest\]\s*$/gm) ?? []).length !== 1) {
+      return deepFreeze({ kind: 'pytest', trusted: false, roots: [] });
+    }
+    text = section;
+  }
+  const matches = [...text.matchAll(/^\s*testpaths\s*=\s*(.*?)\s*$/gm)];
+  if (matches.length === 0) return DEFAULT_PYTEST_WITNESS_POLICY;
+  if (matches.length !== 1 || matches[0][1] === '') return deepFreeze({ kind: 'pytest', trusted: false, roots: [] });
+  let values;
+  if (source === 'pytest.ini') {
+    if (/['",#;]/.test(matches[0][1])) return deepFreeze({ kind: 'pytest', trusted: false, roots: [] });
+    values = matches[0][1].split(/\s+/);
+  } else {
+    const input = matches[0][1];
+    if (!/^\[(?:\s*"[^"\\\r\n]+"\s*(?:,\s*"[^"\\\r\n]+"\s*)*)?\]$/.test(input)) {
+      return deepFreeze({ kind: 'pytest', trusted: false, roots: [] });
+    }
+    try {
+      values = JSON.parse(input);
+    } catch {
+      return deepFreeze({ kind: 'pytest', trusted: false, roots: [] });
+    }
+  }
+  const roots = values.map(validWitnessRoot);
+  if (roots.length === 0 || roots.some((root) => root === null) || new Set(roots).size !== roots.length) {
+    return deepFreeze({ kind: 'pytest', trusted: false, roots: [] });
+  }
+  return deepFreeze({ kind: 'pytest', trusted: true, roots: roots.sort() });
+}
+
+function launcherToken(identity) {
+  return hashJson({ kind: 'controller-launcher-v1', executable: identity.public });
+}
+
+async function freezeControllerArgv(derived, deps = {}) {
+  const argv = [];
+  const launchers = [];
+  for (let index = 0; index < derived.args.length; index += 1) {
+    const arg = derived.args[index];
+    if (!isAbsolute(arg)) {
+      argv.push(arg);
+      continue;
+    }
+    const kind = derived.source === 'package.json' && derived.launcher === 'npm-cli.js' && index === 0
+      ? 'npm-cli.js'
+      : null;
+    const identity = kind === null ? null : await executableIdentity(arg, deps);
+    if (identity === null) {
+      argv.push(`<controller-launcher:${sha256(Buffer.from(`unavailable\0${basename(arg)}`, 'utf8'))}>`);
+      continue;
+    }
+    const token = launcherToken(identity);
+    const placeholder = `<controller-launcher:${token}>`;
+    argv.push(placeholder);
+    launchers.push({ index, kind, placeholder, token, path: identity.path, executable: identity.public });
+  }
+  return { argv, launchers };
+}
+
+async function adapterPlan(derived, deps = {}) {
+  if (derived === null) return { adapterId: null, argv: [], regressionWitnessTrusted: false, launchers: [], witnessPolicy: null };
+  if (derived.source === 'package.json') {
+    const args = tokenizeLiteralNodeScript(derived.definition?.value);
+    if (args !== null && derived.command === process.execPath) {
+      return {
+        adapterId: 'node-events-v1',
+        argv: args,
+        regressionWitnessTrusted: true,
+        launchers: [],
+        witnessPolicy: DEFAULT_NODE_WITNESS_POLICY,
+      };
+    }
+    const frozen = await freezeControllerArgv(derived, deps);
+    return {
+      adapterId: null,
+      argv: frozen.argv,
+      regressionWitnessTrusted: false,
+      launchers: frozen.launchers,
+      witnessPolicy: null,
+    };
+  }
+  if (derived.source === 'pytest.ini' || derived.source === 'pyproject.toml') {
+    const witnessPolicy = pytestWitnessPolicy(derived.source, derived.definition?.value);
+    return {
+      adapterId: 'pytest-events-v1',
+      argv: ['-c', PYTEST_BOOTSTRAP, '-p', 'pytest_events', '--bom-orch-events', '<controller-owned>'],
+      regressionWitnessTrusted: witnessPolicy.trusted,
+      launchers: [],
+      witnessPolicy,
+    };
+  }
+  if (derived.source === 'csproj') {
+    return {
+      adapterId: 'dotnet-trx-v1',
+      argv: [...derived.args, '--logger', 'trx;LogFileName=<controller-owned>'],
+      regressionWitnessTrusted: false,
+      launchers: [],
+      witnessPolicy: null,
+    };
+  }
+  return { adapterId: null, argv: [...derived.args], regressionWitnessTrusted: false, launchers: [], witnessPolicy: null };
+}
+
+function resolveExecutableAgain(path, deps = {}) {
+  const injected = deps.resolveExecutable;
+  if (typeof injected === 'function') return injected(basename(path));
+  if (path === process.execPath) return process.execPath;
+  const name = basename(path).replace(/\.(?:exe|com)$/i, '');
+  return defaultResolveTool(name);
+}
+
+async function executableIdentity(path, deps = {}) {
+  if (typeof path !== 'string' || !isAbsolute(path)) return null;
+  try {
+    const inspectLink = deps.lstatExecutable ?? lstat;
+    const inspectFile = deps.statExecutable ?? stat;
+    const link = await inspectLink(path);
+    if (link.isSymbolicLink() || !link.isFile()) return null;
+    const info = await inspectFile(path);
+    if (!info.isFile()) return null;
+    const real = await canonical(path);
+    if (real === null) return null;
+    return {
+      path: real,
+      public: { basename: basename(real), size: info.size, mtimeMs: info.mtimeMs },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function exactPlanWithoutFingerprint(input) {
+  return {
+    schemaVersion: 1,
+    source: input.source,
+    adapterId: input.adapterId,
+    executable: input.executable,
+    argv: input.argv,
+    cwdPolicy: 'evidence-worktree',
+    pinnedDefinitions: input.pinnedDefinitions,
+    environmentFingerprint: input.environmentFingerprint,
+    regressionWitnessTrusted: input.regressionWitnessTrusted,
+  };
+}
+
+/** Freeze the legacy-derived command as a whitelist-only, fingerprinted policy-v2 plan. */
+export async function deriveFrozenTestPlan(projectPath, deps = {}) {
+  const derived = await deriveTestCommand(projectPath, deps);
+  const recognized = await adapterPlan(derived, deps);
+  const identity = derived?.command ? await executableIdentity(derived.command, deps) : null;
+  const executable = identity?.public ?? null;
+  const launcherFacts = recognized.launchers.map(({ token, executable: launcher }) => ({ token, executable: launcher }));
+  const envHash = environmentFingerprint(recognized.adapterId, executable, launcherFacts, deps);
+  const core = exactPlanWithoutFingerprint({
+    source: derived?.source ?? null,
+    adapterId: recognized.adapterId,
+    executable,
+    argv: recognized.argv,
+    pinnedDefinitions: publicDefinitionPins(derived?.definition),
+    environmentFingerprint: envHash,
+    regressionWitnessTrusted: recognized.regressionWitnessTrusted,
+  });
+  const plan = deepFreeze({
+    schemaVersion: core.schemaVersion,
+    source: core.source,
+    adapterId: core.adapterId,
+    executable: core.executable,
+    argv: core.argv,
+    cwdPolicy: core.cwdPolicy,
+    pinnedDefinitions: core.pinnedDefinitions,
+    planFingerprint: hashJson(core),
+    environmentFingerprint: core.environmentFingerprint,
+    regressionWitnessTrusted: core.regressionWitnessTrusted,
+  });
+  FROZEN_PLAN_RUNTIME.set(plan, deepFreeze({
+    derived,
+    executablePath: identity?.path ?? null,
+    executable: identity?.public ?? null,
+    launchers: recognized.launchers,
+    witnessPolicy: recognized.witnessPolicy,
+  }));
+  return plan;
+}
+
+function exactKeys(value, keys) {
+  return value && typeof value === 'object' &&
+    Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function validFrozenPlan(plan) {
+  if (!exactKeys(plan, PLAN_KEYS) || !Object.isFrozen(plan) || plan.schemaVersion !== 1 ||
+      plan.cwdPolicy !== 'evidence-worktree' || !SHA256_PATTERN.test(plan.planFingerprint) ||
+      !SHA256_PATTERN.test(plan.environmentFingerprint) || !Array.isArray(plan.argv) ||
+      plan.argv.some((arg) => typeof arg !== 'string') || !Array.isArray(plan.pinnedDefinitions)) return false;
+  const core = exactPlanWithoutFingerprint(plan);
+  return hashJson(core) === plan.planFingerprint;
+}
+
+function safeRelativeSourcePath(value, worktreePath = null) {
+  if (typeof value !== 'string' || value === '' || value.length > 4_096 || /[\u0000-\u001f\u007f\uFFFD]/.test(value)) return null;
+  let path = value;
+  if (path.startsWith('file:')) {
+    try { path = fileURLToPath(path); } catch { return null; }
+  }
+  if (isAbsolute(path)) {
+    if (worktreePath === null) return null;
+    const rel = relative(worktreePath, path);
+    if (rel === '' || isAbsolute(rel) || rel.split(/[\\/]/).includes('..')) return null;
+    path = rel.replaceAll('\\', '/');
+  }
+  // ★★ 어댑터는 **상대** 경로를 OS 구분자로 낸다 — Windows 의 pytest 는
+  //   `tests\test_math.py` 를 보고한다. 아래 검사는 역슬래시가 하나라도 있으면 거부하므로,
+  //   그 플랫폼에서는 pytest 증거가 **통째로** 무효가 됐다(실측: 같은 스트림에서 구분자만
+  //   바꾸면 witness 1개·digest 있음 → witness 0개·digest null). 그러면 Python 저장소는
+  //   Windows 에서 영영 `verified` 에도 회귀 증명에도 닿지 못한다.
+  //
+  // ★ 정규화는 **win32 에서만** 한다. POSIX 에서 `\` 는 적법한 파일명 문자라, 거기서
+  //   바꿔치면 없던 경로 구획을 만들어 내고 witness ID 가 다른 파일을 가리키게 된다.
+  //   절대 경로 분기는 이미 같은 정규화를 하고 있었다 — 상대 경로만 빠져 있었다.
+  if (process.platform === 'win32') path = path.replaceAll('\\', '/');
+  if (/^[A-Za-z]:|^[/\\]|\\/.test(path)) return null;
+  const parts = path.normalize('NFC').split('/');
+  if (parts.some((part) => part === '' || part === '.' || part === '..')) return null;
+  return parts.join('/');
+}
+
+function parseJsonLines(bytes) {
+  if (typeof bytes !== 'string' || bytes === '' || bytes.length > MAX_ADAPTER_BYTES || !bytes.endsWith('\n')) return null;
+  const lines = bytes.slice(0, -1).split('\n');
+  if (lines.length === 0 || lines.length > MAX_ADAPTER_EVENTS || lines.some((line) => line === '' || line.length > MAX_ADAPTER_LINE_CHARS)) return null;
+  try {
+    return lines.map((line) => JSON.parse(line));
+  } catch {
+    return null;
+  }
+}
+
+function exactObject(value, keys) {
+  return value && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function normalizeFullTestName(value) {
+  if (typeof value !== 'string' || value === '' || value.length > 4_096 || /[\u0000-\u001f\u007f\uFFFD]/.test(value)) return null;
+  return value.normalize('NFC');
+}
+
+function witnessId(adapterId, path, fullName) {
+  return sha256(Buffer.from(`${adapterId}\0${path}\0${fullName}`, 'utf8'));
+}
+
+function invalidEvidence(kind = 'collection') {
+  return {
+    trusted: false,
+    complete: false,
+    witnessIds: [],
+    failureFingerprints: [],
+    failureKind: kind,
+    observedOutcome: 'unknown',
+    terminalExitCode: null,
+    witnessAuthority: [],
+  };
+}
+
+function pathUnderRoot(path, root) {
+  return path === root || path.startsWith(`${root}/`);
+}
+
+function pathAllowedByPolicy(adapterId, path, policy) {
+  if (policy?.trusted === false) return false;
+  const basenameValue = path.split('/').at(-1);
+  if (adapterId === 'node-events-v1') {
+    const roots = policy?.kind === 'node' ? policy.roots : DEFAULT_NODE_WITNESS_POLICY.roots;
+    return roots.some((root) => pathUnderRoot(path, root)) || /\.(?:test|spec)\.[^.]+$/i.test(basenameValue);
+  }
+  if (adapterId === 'pytest-events-v1') {
+    const roots = policy?.kind === 'pytest' ? policy.roots : DEFAULT_PYTEST_WITNESS_POLICY.roots;
+    return roots.some((root) => pathUnderRoot(path, root)) &&
+      (/^test_.+\.py$/i.test(basenameValue) || /^.+_test\.py$/i.test(basenameValue));
+  }
+  return false;
+}
+
+/** Classify one normalized path using only the private witness policy frozen with the original plan. */
+export function classifyFrozenTestPath(plan, path) {
+  const runtime = FROZEN_PLAN_RUNTIME.get(plan);
+  const normalized = safeRelativeSourcePath(path);
+  if (!validFrozenPlan(plan) || runtime === undefined || runtime.witnessPolicy?.trusted !== true ||
+      normalized === null || normalized !== path) return 'helper';
+  const roots = runtime.witnessPolicy.roots;
+  const underRoot = roots.some((root) => pathUnderRoot(normalized, root));
+  const name = normalized.split('/').at(-1);
+  if (plan.adapterId === 'node-events-v1') {
+    const ordinary = /\.(?:test|spec)\.[^.]+$/i.test(name) ||
+      underRoot && /\.(?:[cm]?js|jsx|ts|tsx)$/i.test(name);
+    return ordinary ? 'test' : underRoot ? 'helper' : 'outside';
+  }
+  if (plan.adapterId === 'pytest-events-v1') {
+    const ordinary = underRoot && (/^test_.+\.py$/i.test(name) || /^.+_test\.py$/i.test(name));
+    return ordinary ? 'test' : underRoot ? 'helper' : 'outside';
+  }
+  return 'helper';
+}
+
+function sameNodeRecord(entry, event, path, name) {
+  return entry.path === path && entry.name === name && entry.kind === event.kind && entry.line === event.line &&
+    entry.column === event.column && entry.nesting === event.nesting;
+}
+
+function parseNodeEvidence(bytes, worktreePath = null, witnessPolicy = DEFAULT_NODE_WITNESS_POLICY) {
+  const events = parseJsonLines(bytes);
+  if (events === null) return invalidEvidence();
+  const stack = [];
+  const witnesses = [];
+  const failureFingerprints = [];
+  const witnessAuthority = [];
+  let failureKind = 'unknown';
+  let terminal = null;
+  let completedCount = 0;
+  let failedCount = 0;
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    if (event?.type === 'terminal') {
+      if (terminal !== null || index !== events.length - 1 || !exactObject(event, ['type', 'count']) ||
+          !Number.isInteger(event.count) || event.count < 0) return invalidEvidence();
+      terminal = event;
+      continue;
+    }
+    const keys = ['type', 'kind', 'name', 'file', 'line', 'column', 'nesting', 'failureType'];
+    if (!exactObject(event, keys) || !['enqueue', 'pass', 'fail'].includes(event.type) ||
+        !['test', 'suite'].includes(event.kind) ||
+        typeof event.name !== 'string' || event.name === '' || event.name.length > 1_024 || event.name.includes(' > ') ||
+        !Number.isInteger(event.line) || event.line < 1 || !Number.isInteger(event.column) || event.column < 0 ||
+        !Number.isInteger(event.nesting) || event.nesting < 0 || event.nesting > 64 ||
+        (event.failureType !== null && typeof event.failureType !== 'string')) return invalidEvidence();
+    const path = safeRelativeSourcePath(event.file, worktreePath);
+    const name = normalizeFullTestName(event.name);
+    if (path === null || name === null) return invalidEvidence();
+    if (event.type === 'enqueue') {
+      if (event.failureType !== null || event.nesting !== stack.length ||
+          (stack.length > 0 && (stack.at(-1).path !== path || stack.at(-1).kind !== 'suite'))) return invalidEvidence();
+      for (const parent of stack) parent.hasChild = true;
+      const fullName = [...stack.map((entry) => entry.name), name].join(' > ');
+      if (normalizeFullTestName(fullName) === null) return invalidEvidence();
+      stack.push({
+        path,
+        kind: event.kind,
+        name,
+        fullName,
+        line: event.line,
+        column: event.column,
+        nesting: event.nesting,
+        hasChild: false,
+        descendantFailed: false,
+      });
+      continue;
+    }
+    const current = stack.at(-1);
+    if (!current || event.nesting !== stack.length - 1 || !sameNodeRecord(current, event, path, name)) return invalidEvidence();
+    stack.pop();
+    completedCount += 1;
+    if (current.kind === 'suite') {
+      if (current.descendantFailed) {
+        if (event.type !== 'fail' || event.failureType !== 'subtestsFailed') return invalidEvidence('infrastructure');
+        for (const parent of stack) parent.descendantFailed = true;
+      } else if (event.type === 'fail') {
+        failureKind = 'infrastructure';
+        failedCount += 1;
+        for (const parent of stack) parent.descendantFailed = true;
+      } else if (event.failureType !== null) {
+        return invalidEvidence('infrastructure');
+      }
+      continue;
+    }
+    if (current.hasChild) return invalidEvidence('infrastructure');
+    if (event.type === 'fail') {
+      if (event.failureType !== 'testCodeFailure') return invalidEvidence('infrastructure');
+      failureKind = 'assertion';
+      failedCount += 1;
+      for (const parent of stack) parent.descendantFailed = true;
+    } else if (event.failureType !== null) {
+      // ★★ `skip`/`todo` 는 **몸통이 안 돌았다**는 directive 이지 스트림이 깨졌다는 신호가
+      //   아니다. 이 자리에서 스트림 전체를 무효로 만들면 출력 digest 가 사라져
+      //   `trusted:false` 가 되고, 테스트 하나만 skip 해 둔 저장소는 `verified` 에도
+      //   회귀 증명에도 영영 닿지 못한다. 그 항목만 증인에서 빼면 충분하다 — 돌지 않은
+      //   테스트는 어떤 파일도 덮었다고 주장하지 않으므로 위조 위험이 늘지 않고,
+      //   설계 §9.4 의 「C 에서 대상 test 가 skip 되어 green 이 됨」도 그 증인이 **없는** 것
+      //   으로 그대로 걸린다. 그 밖의 모르는 directive 는 여전히 치명적이다.
+      if (event.failureType !== 'skip' && event.failureType !== 'todo') return invalidEvidence();
+      continue;
+    }
+    if (!pathAllowedByPolicy('node-events-v1', path, witnessPolicy)) continue;
+    const id = witnessId('node-events-v1', path, current.fullName);
+    if (witnesses.includes(id)) return invalidEvidence();
+    witnesses.push(id);
+    witnessAuthority.push({
+      adapterId: 'node-events-v1',
+      path,
+      fullName: current.fullName,
+      outcome: event.type === 'fail' ? 'fail' : 'pass',
+      witnessId: id,
+    });
+    if (event.type === 'fail') failureFingerprints.push(sha256(Buffer.from(`assertion\0${id}`, 'utf8')));
+  }
+  if (terminal === null || stack.length !== 0 || terminal.count !== completedCount) return invalidEvidence();
+  return {
+    trusted: true,
+    complete: true,
+    witnessIds: witnesses.sort(),
+    failureFingerprints: failureFingerprints.sort(),
+    failureKind,
+    observedOutcome: failedCount > 0 ? 'fail' : 'pass',
+    terminalExitCode: null,
+    witnessAuthority,
+  };
+}
+
+function parsePytestIdentity(event, worktreePath) {
+  const path = safeRelativeSourcePath(event.path, worktreePath);
+  if (path === null) return null;
+  const nodeid = normalizeFullTestName(event.nodeid.replaceAll('\\', '/'));
+  if (nodeid === null || !nodeid.startsWith(`${path}::`)) return null;
+  const fullName = normalizeFullTestName(nodeid.slice(path.length + 2));
+  return fullName === null ? null : { path, nodeid, fullName };
+}
+
+function parsePytestEvidence(bytes, worktreePath = null, witnessPolicy = DEFAULT_PYTEST_WITNESS_POLICY) {
+  const events = parseJsonLines(bytes);
+  if (events === null) return invalidEvidence();
+  const collected = new Map();
+  const phases = new Map();
+  const witnesses = [];
+  const failures = [];
+  const witnessAuthority = [];
+  let session = null;
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    const keys = ['type', 'nodeid', 'path', 'line', 'outcome', 'when', 'wasxfail'];
+    if (!exactObject(event, keys)) return invalidEvidence();
+    if (event.type === 'session') {
+      if (session !== null || index !== events.length - 1 || event.nodeid !== '' || event.path !== '' ||
+          event.line !== null || event.when !== 'session' || event.wasxfail !== false || !/^[0-9]+$/.test(event.outcome)) return invalidEvidence();
+      session = event;
+      continue;
+    }
+    if (typeof event.nodeid !== 'string' || event.nodeid === '' || event.nodeid.length > 4_096 ||
+        !Number.isInteger(event.line) || event.line < 1 || typeof event.outcome !== 'string' || typeof event.wasxfail !== 'boolean') return invalidEvidence();
+    const identity = parsePytestIdentity(event, worktreePath);
+    if (identity === null) return invalidEvidence();
+    const key = identity.nodeid;
+    if (event.type === 'collect') {
+      if (event.outcome !== 'collected' || event.when !== 'collection' || event.wasxfail || collected.has(key)) return invalidEvidence();
+      collected.set(key, { ...identity, line: event.line });
+    } else if (event.type === 'test') {
+      const source = collected.get(key);
+      if (!source || source.path !== identity.path || source.line !== event.line || !['setup', 'call', 'teardown'].includes(event.when) ||
+          !['passed', 'failed', 'skipped'].includes(event.outcome)) return invalidEvidence();
+      const current = phases.get(key) ?? new Map();
+      if (current.has(event.when)) return invalidEvidence();
+      current.set(event.when, event);
+      phases.set(key, current);
+    } else return invalidEvidence();
+  }
+  if (session === null || collected.size === 0 || phases.size !== collected.size) return invalidEvidence();
+  for (const [key, source] of collected) {
+    const current = phases.get(key);
+    if (!current || current.size !== 3 || !current.has('setup') || !current.has('call') || !current.has('teardown')) return invalidEvidence();
+    const setup = current.get('setup');
+    const call = current.get('call');
+    const teardown = current.get('teardown');
+    // ★★ Node 쪽과 같은 이유로, skip·xfail 은 그 항목만 증인에서 뺀다. 스트림 전체를
+    //   무효로 만들면 `@pytest.mark.skip` 하나가 저장소의 회귀 증명을 통째로 없앤다.
+    if ([setup, call, teardown].some((event) => event.wasxfail || event.outcome === 'skipped')) continue;
+    if (setup.outcome !== 'passed' || teardown.outcome !== 'passed' || !['passed', 'failed'].includes(call.outcome)) return invalidEvidence();
+    if (pathAllowedByPolicy('pytest-events-v1', source.path, witnessPolicy)) {
+      const id = witnessId('pytest-events-v1', source.path, source.fullName);
+      if (witnesses.includes(id)) return invalidEvidence();
+      witnesses.push(id);
+      witnessAuthority.push({
+        adapterId: 'pytest-events-v1',
+        path: source.path,
+        fullName: source.fullName,
+        outcome: call.outcome === 'failed' ? 'fail' : 'pass',
+        witnessId: id,
+      });
+      if (call.outcome === 'failed') failures.push(sha256(Buffer.from(`assertion\0${id}`, 'utf8')));
+    }
+  }
+  const exitCode = Number(session.outcome);
+  const failedCalls = [...phases.values()].filter((current) => current.get('call')?.outcome === 'failed').length;
+  if (![0, 1].includes(exitCode) || (exitCode === 0) !== (failedCalls === 0)) return invalidEvidence();
+  return {
+    trusted: true,
+    complete: true,
+    witnessIds: witnesses.sort(),
+    failureFingerprints: failures.sort(),
+    failureKind: failedCalls > 0 ? 'assertion' : 'unknown',
+    observedOutcome: failedCalls > 0 ? 'fail' : 'pass',
+    terminalExitCode: exitCode,
+    witnessAuthority,
+  };
+}
+
+function parseTrxEvidence(bytes) {
+  if (typeof bytes !== 'string' || bytes === '' || bytes.length > MAX_ADAPTER_BYTES || !/<TestRun\b/.test(bytes) || !/<\/TestRun>\s*$/.test(bytes)) return invalidEvidence();
+  const results = [...bytes.matchAll(/<UnitTestResult\b([^>]*)\/>/g)];
+  const summary = /<ResultSummary\b[^>]*\boutcome="([^"]+)"/.exec(bytes);
+  if (results.length === 0 || summary === null) return invalidEvidence();
+  const failed = [];
+  for (const match of results) {
+    const name = /\btestName="([^"]+)"/.exec(match[1])?.[1];
+    const outcome = /\boutcome="([^"]+)"/.exec(match[1])?.[1];
+    if (!name || name.length > 4_096 || !['Passed', 'Failed'].includes(outcome)) return invalidEvidence();
+    if (outcome === 'Failed') failed.push(sha256(Buffer.from(`dotnet-trx-v1\0${name}`, 'utf8')));
+  }
+  if ((summary[1] === 'Passed') !== (failed.length === 0) || !['Passed', 'Failed'].includes(summary[1])) return invalidEvidence();
+  return {
+    trusted: true,
+    complete: true,
+    witnessIds: [],
+    failureFingerprints: failed.sort(),
+    failureKind: failed.length > 0 ? 'assertion' : 'unknown',
+    observedOutcome: failed.length > 0 ? 'fail' : 'pass',
+    terminalExitCode: null,
+    witnessAuthority: [],
+  };
+}
+
+function parseAdapterEvidence(adapterEvidence) {
+  if (!adapterEvidence || typeof adapterEvidence !== 'object' || !ADAPTER_IDS.has(adapterEvidence.adapterId) ||
+      typeof adapterEvidence.bytes !== 'string') return invalidEvidence('unknown');
+  if (adapterEvidence.adapterId === 'node-events-v1') {
+    return parseNodeEvidence(
+      adapterEvidence.bytes,
+      adapterEvidence.worktreePath ?? null,
+      ADAPTER_EVIDENCE_POLICY.get(adapterEvidence) ?? DEFAULT_NODE_WITNESS_POLICY,
+    );
+  }
+  if (adapterEvidence.adapterId === 'pytest-events-v1') {
+    return parsePytestEvidence(
+      adapterEvidence.bytes,
+      adapterEvidence.worktreePath ?? null,
+      ADAPTER_EVIDENCE_POLICY.get(adapterEvidence) ?? DEFAULT_PYTEST_WITNESS_POLICY,
+    );
+  }
+  return parseTrxEvidence(adapterEvidence.bytes);
+}
+
+function observedOutputDigest(raw, execution, rawComplete, adapterAuthorityComplete) {
+  if (execution !== 'completed' || !rawComplete || !adapterAuthorityComplete || raw?.truncated !== false ||
+      typeof raw.output !== 'string' || raw.outputChars !== raw.output.length) return null;
+  // Legacy capture is head/tail-capped. A digest of it must never masquerade as a full-stream digest.
+  return sha256(Buffer.from(raw.output, 'utf8'));
+}
+
+function classifyWithRequiredAdapter(rawResult, adapterEvidence, requiredAdapterId) {
+  const raw = rawResult && typeof rawResult === 'object' ? rawResult : {};
+  const parsed = parseAdapterEvidence(adapterEvidence);
+  let execution;
+  if (raw.aborted === true) execution = 'aborted';
+  else if (raw.timedOut === true) execution = 'timeout';
+  else if (raw.hung === true) execution = 'hung';
+  else if (raw.lingering === true) execution = 'lingering';
+  else if (raw.spawnError) execution = 'spawn_error';
+  else if (raw.ran === true || typeof raw.exitCode === 'number' || typeof raw.passed === 'boolean') execution = 'completed';
+  else execution = 'not_run';
+
+  const rawComplete = (execution === 'completed' || execution === 'lingering') && raw.ran === true &&
+    typeof raw.passed === 'boolean' && Number.isInteger(raw.exitCode) && raw.exitCode >= 0 &&
+    raw.passed === (raw.exitCode === 0);
+  let outcome = rawComplete ? raw.passed ? 'pass' : 'fail' : 'unknown';
+  const adapterMismatch = rawComplete && parsed.complete && parsed.observedOutcome !== outcome ||
+    rawComplete && parsed.complete && parsed.terminalExitCode !== null && parsed.terminalExitCode !== raw.exitCode;
+  const adapterAuthorityComplete = requiredAdapterId === null ||
+    ADAPTER_IDS.has(requiredAdapterId) && adapterEvidence?.adapterId === requiredAdapterId &&
+      parsed.trusted && parsed.complete && !adapterMismatch;
+  if (adapterMismatch) outcome = 'unknown';
+  let failureKind = 'unknown';
+  if (['spawn_error', 'timeout', 'aborted', 'hung', 'lingering'].includes(execution)) failureKind = 'infrastructure';
+  else if (execution === 'completed' && (!rawComplete || adapterMismatch)) failureKind = 'infrastructure';
+  else if (execution === 'completed' && raw.failureKind === 'infrastructure') failureKind = 'infrastructure';
+  else if (execution === 'completed' && adapterEvidence && !parsed.complete) failureKind = parsed.failureKind;
+  else if (execution === 'completed' && outcome === 'fail') {
+    const output = String(raw.output ?? '');
+    if (adapterEvidence && parsed.failureKind === 'infrastructure') {
+      failureKind = 'infrastructure';
+    } else if (raw.failureKind === 'collection' || (adapterEvidence && parsed.failureKind === 'collection')) {
+      failureKind = 'collection';
+    } else if (raw.failureKind === 'compile' || /\b(?:SyntaxError|Compilation failed|Build FAILED)\b/i.test(output)) {
+      failureKind = 'compile';
+    } else if (raw.failureKind === 'dependency' || MISSING_DEP_SIGNS.some((sign) => output.includes(sign))) {
+      failureKind = 'dependency';
+    } else if (raw.failureKind === 'infrastructure') {
+      failureKind = 'infrastructure';
+    } else if (raw.failureKind === 'assertion' && parsed.trusted && parsed.complete && parsed.witnessIds.length > 0) {
+      failureKind = 'assertion';
+    } else if (parsed.failureKind === 'assertion' && parsed.trusted && parsed.complete) {
+      failureKind = 'assertion';
+    }
+  } else if (execution === 'not_run' && raw.failureKind === 'infrastructure') {
+    failureKind = 'infrastructure';
+  }
+
+  const acceptWitnesses = execution === 'completed' && rawComplete && !adapterMismatch && parsed.trusted && parsed.complete &&
+    (outcome === 'pass' && failureKind === 'unknown' || outcome === 'fail' && failureKind === 'assertion');
+  const witnessIds = acceptWitnesses ? parsed.witnessIds : [];
+  const failureFingerprints = acceptWitnesses ? parsed.failureFingerprints : [];
+  const reproduction = execution === 'completed' && outcome === 'fail' && failureKind === 'assertion' && witnessIds.length > 0;
+  const stability = 'unknown';
+  const classified = {
+    execution,
+    outcome,
+    failureKind,
+    stability,
+    reproduction,
+    witnessIds,
+    failureFingerprints,
+    outputSha256: observedOutputDigest(raw, execution, rawComplete, adapterAuthorityComplete),
+    outputChars: Number.isInteger(raw.outputChars) && raw.outputChars >= 0
+      ? raw.outputChars
+      : typeof raw.output === 'string' ? raw.output.length : 0,
+  };
+  const authority = acceptWitnesses && Array.isArray(parsed.witnessAuthority)
+    ? parsed.witnessAuthority.map((entry) => ({ ...entry }))
+    : [];
+  TEST_RECORD_WITNESS_AUTHORITY.set(classified, deepFreeze(authority));
+  return classified;
+}
+
+/** Classify one raw runner result without retaining raw output or process objects. */
+export function classifyTestExecution(rawResult, adapterEvidence = null) {
+  const requiredAdapterId = adapterEvidence === null ? null : adapterEvidence?.adapterId ?? 'invalid';
+  return classifyWithRequiredAdapter(rawResult, adapterEvidence, requiredAdapterId);
+}
+
+function sameStringList(a, b) {
+  return Array.isArray(a) && Array.isArray(b) && a.length === b.length &&
+    a.every((value, index) => value === b[index]);
+}
+
+function sortedShaList(values) {
+  if (!Array.isArray(values) || values.some((value) => typeof value !== 'string' || !SHA256_PATTERN.test(value))) {
+    return null;
+  }
+  const sorted = [...new Set(values)].sort();
+  return sorted.length === values.length ? sorted : null;
+}
+
+/** Select path-free witness authority for the exact regression-test delta from an original returned record. */
+export function selectTestDeltaWitnesses(record, deltaPaths) {
+  const authority = TEST_RECORD_WITNESS_AUTHORITY.get(record);
+  if (authority === undefined || !Array.isArray(deltaPaths)) return null;
+  const normalizedPaths = deltaPaths.map((path) => safeRelativeSourcePath(path));
+  if (normalizedPaths.some((path, index) => path === null || path !== deltaPaths[index]) ||
+      new Set(normalizedPaths).size !== normalizedPaths.length) return null;
+  const publicWitnesses = sortedShaList(record?.witnessIds);
+  const publicFailures = sortedShaList(record?.failureFingerprints);
+  if (publicWitnesses === null || publicFailures === null) return null;
+  const authorityWitnesses = authority.map((entry) => entry.witnessId).sort();
+  const authorityFailures = authority
+    .filter((entry) => entry.outcome === 'fail')
+    .map((entry) => sha256(Buffer.from(`assertion\0${entry.witnessId}`, 'utf8')))
+    .sort();
+  if (!sameStringList(publicWitnesses, authorityWitnesses) || !sameStringList(publicFailures, authorityFailures)) {
+    return null;
+  }
+  for (const entry of authority) {
+    if (!exactObject(entry, ['adapterId', 'path', 'fullName', 'outcome', 'witnessId']) ||
+        !ADAPTER_IDS.has(entry.adapterId) || !['pass', 'fail'].includes(entry.outcome) ||
+        safeRelativeSourcePath(entry.path) !== entry.path || normalizeFullTestName(entry.fullName) !== entry.fullName ||
+        witnessId(entry.adapterId, entry.path, entry.fullName) !== entry.witnessId) return null;
+  }
+  const selected = authority.filter((entry) => normalizedPaths.includes(entry.path));
+  return deepFreeze({
+    witnessIds: selected.map((entry) => entry.witnessId).sort(),
+    assertionWitnessIds: selected
+      .filter((entry) => entry.outcome === 'fail')
+      .map((entry) => entry.witnessId)
+      .sort(),
+  });
+}
+
+function boundedDiagnostics(values) {
+  return [...new Set(values)]
+    .filter((value) => typeof value === 'string' && value !== '')
+    .slice(0, MAX_DIAGNOSTICS)
+    .map((value) => value.slice(0, MAX_DIAGNOSTIC_CHARS));
+}
+
+function persistableRecord(plan, raw, evidence, diagnostics = []) {
+  const classified = classifyWithRequiredAdapter(raw, evidence, plan?.adapterId ?? null);
+  const record = {
+    ...classified,
+    // ★★ 설계 §5.8 S1. 이 레코드는 `runTests` 의 `notes` 를 **버린다** — 산문은 아티팩트에 못
+    //   들어간다. 그런데 그 `notes` 안에 `USER_PRIVILEGE_NOTE` 하나가 섞여 있었고, 그것이 이
+    //   제품이 S1(비밀 유출)에 대해 하는 **유일한** 대응이다. 그래서 산문 대신 그 신고가 딛고 선
+    //   사실 하나만 남긴다: 우리가 사용자 권한으로 자식을 **실제로 돌렸는가**.
+    //
+    // ★ `execution` 으로는 이걸 못 잰다. 스폰 전 중단과 스폰 후 중단이 둘 다 `'aborted'` 라서,
+    //   그 값으로 판단하면 한 줄도 안 돌린 실행을 "돌았다"고 신고하게 된다.
+    ranWithUserPrivilege: raw?.ran === true,
+    planFingerprint: plan?.planFingerprint && SHA256_PATTERN.test(plan.planFingerprint) ? plan.planFingerprint : sha256('invalid-plan'),
+    environmentFingerprint:
+      plan?.environmentFingerprint && SHA256_PATTERN.test(plan.environmentFingerprint)
+        ? plan.environmentFingerprint
+        : sha256('invalid-environment'),
+    truncated: raw?.truncated === true,
+    diagnostics: boundedDiagnostics(diagnostics),
+  };
+  TEST_RECORD_WITNESS_AUTHORITY.set(record, TEST_RECORD_WITNESS_AUTHORITY.get(classified) ?? deepFreeze([]));
+  return record;
+}
+
+function noRun(plan, code, { aborted = false } = {}) {
+  return persistableRecord(plan, noRunRaw({ aborted }), null, [code]);
+}
+
+function noRunRaw({ aborted = false } = {}) {
+  return {
+    ran: false,
+    exitCode: null,
+    aborted,
+    timedOut: false,
+    hung: false,
+    lingering: false,
+    spawnError: null,
+    output: '',
+    outputChars: 0,
+    truncated: false,
+    failureKind: aborted ? 'infrastructure' : 'infrastructure',
+  };
+}
+
+function sameExecutable(a, b) {
+  return a !== null && b !== null && a.basename === b.basename && a.size === b.size && a.mtimeMs === b.mtimeMs;
+}
+
+async function reconstructFrozenArgv(runtime, plan, executablePath, deps = {}) {
+  const argv = [...plan.argv];
+  const facts = [];
+  for (const launcher of runtime.launchers ?? []) {
+    if (launcher.kind !== 'npm-cli.js' || argv[launcher.index] !== launcher.placeholder) return null;
+    const resolved = await (deps.npmCliPath ?? findNpmCli)(executablePath);
+    const identity = await executableIdentity(resolved, deps);
+    if (identity === null || identity.path !== launcher.path || !sameExecutable(identity.public, launcher.executable) ||
+        launcherToken(identity) !== launcher.token) return null;
+    argv[launcher.index] = identity.path;
+    facts.push({ token: launcher.token, executable: identity.public });
+  }
+  if (plan.adapterId === null && (argv.length !== runtime.derived.args.length ||
+      argv.some((arg, index) => arg !== runtime.derived.args[index]))) return null;
+  return { argv, facts };
+}
+
+async function inspectFrozenTestPlanEnvironment(plan, deps = {}) {
+  const runtime = FROZEN_PLAN_RUNTIME.get(plan);
+  if (!validFrozenPlan(plan) || runtime === undefined) return { ok: false, reasonCode: 'invalid_frozen_plan' };
+  if (runtime.derived === null || runtime.executablePath === null || runtime.executable === null) {
+    return { ok: false, reasonCode: 'test_command_unavailable' };
+  }
+  try {
+    const resolved = await resolveExecutableAgain(runtime.executablePath, deps);
+    const identity = await executableIdentity(resolved, deps);
+    if (identity === null || identity.path !== runtime.executablePath ||
+        !sameExecutable(identity.public, runtime.executable)) {
+      return { ok: false, reasonCode: 'executable_identity_drift' };
+    }
+    const reconstructed = await reconstructFrozenArgv(runtime, plan, identity.path, deps);
+    if (reconstructed === null) return { ok: false, reasonCode: 'launcher_identity_drift' };
+    if (environmentFingerprint(plan.adapterId, identity.public, reconstructed.facts, deps) !== plan.environmentFingerprint) {
+      return { ok: false, reasonCode: 'environment_fingerprint_drift' };
+    }
+    return {
+      ok: true,
+      runtime,
+      executablePath: identity.path,
+      executable: identity.public,
+      argv: reconstructed.argv,
+    };
+  } catch {
+    return { ok: false, reasonCode: 'executable_identity_drift' };
+  }
+}
+
+/** Recheck a frozen plan's private executable/launcher authority without exposing resolved paths. */
+export async function checkFrozenTestPlanEnvironment(plan, deps = {}) {
+  const checked = await inspectFrozenTestPlanEnvironment(plan, deps);
+  if (checked.ok !== true) return { ok: false, reasonCode: checked.reasonCode };
+  return {
+    ok: true,
+    executable: checked.executable,
+    environmentFingerprint: plan.environmentFingerprint,
+  };
+}
+
+async function verifyWorktreeHandle(worktree, runId, mode) {
+  if (!worktree || worktree.ok !== true || typeof worktree.path !== 'string' || typeof worktree.stateRoot !== 'string' ||
+      typeof worktree.worktreeId !== 'string' || worktree.runId !== runId || !TEST_MODES.has(mode) ||
+      typeof worktree.purpose !== 'string' || !new RegExp(`-${mode}-[12]$`).test(worktree.purpose)) return null;
+  const [realPath, realState] = await Promise.all([canonical(worktree.path), canonical(worktree.stateRoot)]);
+  if (realPath === null || realState === null || basename(realPath) !== worktree.worktreeId) return null;
+  const root = join(realState, 'worktrees');
+  const rel = relative(root, realPath);
+  if (rel === '' || isAbsolute(rel) || rel.split(/[\\/]/).includes('..')) return null;
+  return { path: realPath, stateRoot: realState };
+}
+
+async function verifyDefinition(worktreePath, definition) {
+  if (!definition || typeof definition !== 'object' || typeof definition.value !== 'string') return false;
+  const current = await readDefinitionValue(worktreePath, definition);
+  if (current === null || current !== definition.value) return false;
+  const extras = await checkExtras(worktreePath, definition.extras);
+  return extras.error === undefined;
+}
+
+async function createOwnedEventFile(worktreePath, deps = {}) {
+  const suffix = typeof deps.randomSuffix === 'function' ? deps.randomSuffix() : randomBytes(12).toString('hex');
+  if (!/^[0-9a-f]{24}$/.test(suffix)) throw new Error('invalid event suffix');
+  const path = join(worktreePath, `.bom-orch-test-${suffix}.jsonl`);
+  const handle = await (deps.openEventFile ?? open)(path, 'wx', 0o600);
+  try {
+    await handle.close();
+    const info = await (deps.lstatCreatedEventFile ?? lstat)(path);
+    const real = await (deps.canonicalCreatedEventFile ?? canonical)(path);
+    if (!info.isFile() || info.isSymbolicLink() || real !== path) {
+      return { file: { path, identity: null }, error: 'event_file_creation_unproven' };
+    }
+    return { file: { path, identity: { dev: info.dev, ino: info.ino } }, error: null };
+  } catch {
+    return { file: { path, identity: null }, error: 'event_file_creation_unproven' };
+  }
+}
+
+async function eventFileUnchanged(file, deps = {}) {
+  try {
+    if (file.identity === null) return false;
+    const info = await (deps.lstatEventFile ?? lstat)(file.path);
+    const real = await (deps.canonicalEventFile ?? canonical)(file.path);
+    return info.isFile() && !info.isSymbolicLink() && real === file.path && info.dev === file.identity.dev && info.ino === file.identity.ino;
+  } catch {
+    return false;
+  }
+}
+
+async function readOwnedEvidence(file, deps = {}) {
+  if (!(await eventFileUnchanged(file, deps))) return null;
+  const info = await (deps.statEventFile ?? stat)(file.path);
+  if (!info.isFile() || info.size <= 0 || info.size > MAX_ADAPTER_BYTES) return null;
+  const bytes = await (deps.readEventFile ?? readFile)(file.path, 'utf8');
+  return bytes.length <= MAX_ADAPTER_BYTES ? bytes : null;
+}
+
+async function cleanupOwnedEvidence(file, deps = {}) {
+  if (!(await eventFileUnchanged(file, deps))) return false;
+  try {
+    await (deps.removeEventFile ?? rm)(file.path);
+    try {
+      await (deps.lstatEventFile ?? lstat)(file.path);
+      return false;
+    } catch (error) {
+      return error?.code === 'ENOENT';
+    }
+  } catch {
+    return false;
+  }
+}
+
+function insertNodeReporter(args, reporterPath, eventPath) {
+  const at = args.indexOf('--test');
+  if (at < 0) return null;
+  return [
+    ...args.slice(0, at + 1),
+    '--test-reporter',
+    reporterPath,
+    '--test-reporter-destination',
+    eventPath,
+    ...args.slice(at + 1),
+  ];
+}
+
+function executionSpec(runtime, plan, eventFile, runId, reconstructedArgv) {
+  const derived = runtime.derived;
+  if (plan.adapterId === 'node-events-v1') {
+    const reporter = resolveTestAssetUrl({ asset: 'node' }).href;
+    return {
+      ...derived,
+      command: runtime.executablePath,
+      args: insertNodeReporter(plan.argv, reporter, eventFile.path),
+      childEnvExtra: undefined,
+      runId,
+    };
+  }
+  if (plan.adapterId === 'pytest-events-v1') {
+    const plugin = fileURLToPath(resolveTestAssetUrl({ asset: 'pytest' }));
+    return {
+      ...derived,
+      command: runtime.executablePath,
+      args: ['-c', PYTEST_BOOTSTRAP, '-p', 'pytest_events', '--bom-orch-events', eventFile.path],
+      childEnvExtra: { ...PYTEST_ENV, PYTHONPATH: dirname(plugin) },
+      runId,
+    };
+  }
+  if (plan.adapterId === 'dotnet-trx-v1') {
+    return {
+      ...derived,
+      command: runtime.executablePath,
+      args: [...derived.args, '--logger', `trx;LogFileName=${eventFile.path}`],
+      childEnvExtra: undefined,
+      runId,
+    };
+  }
+  return { ...derived, command: runtime.executablePath, args: reconstructedArgv, runId };
+}
+
+/** Run one frozen plan and return an exact persistable record with no raw output/environment. */
+export async function runFrozenTests(input, deps = {}) {
+  const spec = input && typeof input === 'object' ? input : {};
+  const plan = spec.plan;
+  const runtime = FROZEN_PLAN_RUNTIME.get(plan);
+  if (!validFrozenPlan(plan) || runtime === undefined) return noRun(plan, 'invalid_frozen_plan');
+  if (spec.signal?.aborted) return noRun(plan, 'aborted_before_test', { aborted: true });
+  if (spec.signal !== undefined && spec.signal !== null && typeof spec.signal.addEventListener !== 'function') {
+    return noRun(plan, 'invalid_abort_signal');
+  }
+  if (deps.testQueue?.isPoisoned?.()) return noRun(plan, 'test_queue_poisoned');
+  const worktree = await verifyWorktreeHandle(spec.worktree, spec.runId, spec.mode);
+  if (worktree === null) return noRun(plan, 'invalid_evidence_worktree');
+  if (runtime.derived === null || runtime.executablePath === null || runtime.executable === null) return noRun(plan, 'test_command_unavailable');
+  if (!(await verifyDefinition(worktree.path, runtime.derived.definition))) return noRun(plan, 'pinned_definition_drift');
+  const initialEnvironment = await inspectFrozenTestPlanEnvironment(plan, deps);
+  if (initialEnvironment.ok !== true) return noRun(plan, initialEnvironment.reasonCode);
+
+  let eventFile = null;
+  let raw = null;
+  let evidenceBytes = null;
+  let preSpawnFailure = null;
+  let cleanupProven = true;
+  const diagnostics = [];
+  try {
+    if (plan.adapterId !== null) {
+      const created = await createOwnedEventFile(worktree.path, deps);
+      eventFile = created.file;
+      preSpawnFailure = created.error;
+    }
+    // Final identity and definition checks sit immediately before the one process-boundary call.
+    if (preSpawnFailure === null && !(await verifyDefinition(worktree.path, runtime.derived.definition))) {
+      preSpawnFailure = 'pinned_definition_drift';
+    }
+    let finalEnvironment = null;
+    if (preSpawnFailure === null) {
+      finalEnvironment = await inspectFrozenTestPlanEnvironment(plan, deps);
+      if (finalEnvironment.ok !== true) preSpawnFailure = finalEnvironment.reasonCode;
+    }
+    if (preSpawnFailure === null && eventFile !== null && !(await eventFileUnchanged(eventFile, deps))) {
+      preSpawnFailure = 'event_file_identity_drift';
+    }
+
+    if (preSpawnFailure !== null) {
+      raw = noRunRaw();
+      diagnostics.push(preSpawnFailure);
+    } else {
+      const call = deps.runTests ?? runTests;
+      raw = await call({
+        worktree: worktree.path,
+        ...executionSpec(runtime, plan, eventFile, spec.runId, finalEnvironment.argv),
+        signal: spec.signal,
+        onSpawn: spec.onSpawn,
+        timeoutMs: spec.timeoutMs,
+        env: deps.env ?? process.env,
+      });
+      if (typeof raw?.evidenceBytes === 'string') evidenceBytes = raw.evidenceBytes;
+      else if (eventFile !== null) evidenceBytes = await readOwnedEvidence(eventFile, deps);
+      if (eventFile !== null && evidenceBytes === null) diagnostics.push('adapter_evidence_incomplete');
+      if (raw?.lingering === true || raw?.hung === true) deps.testQueue?.poison?.('test_process_cleanup_unproven');
+    }
+  } catch {
+    raw = {
+      ran: false,
+      exitCode: null,
+      spawnError: new Error('frozen test execution failed'),
+      output: '',
+      outputChars: 0,
+      truncated: false,
+    };
+    diagnostics.push('frozen_test_execution_failed');
+  } finally {
+    if (eventFile !== null && !(await cleanupOwnedEvidence(eventFile, deps))) {
+      cleanupProven = false;
+      diagnostics.push('event_file_cleanup_unproven');
+    }
+  }
+  if (!cleanupProven) {
+    evidenceBytes = null;
+    raw = { ...raw, failureKind: 'infrastructure' };
+  }
+  const evidence = evidenceBytes === null || plan.adapterId === null
+    ? null
+    : {
+      adapterId: plan.adapterId,
+      bytes: evidenceBytes,
+      worktreePath: worktree.path,
+    };
+  if (evidence !== null && runtime.witnessPolicy !== null) {
+    ADAPTER_EVIDENCE_POLICY.set(evidence, runtime.witnessPolicy);
+  }
+  return persistableRecord(plan, raw, evidence, diagnostics);
 }

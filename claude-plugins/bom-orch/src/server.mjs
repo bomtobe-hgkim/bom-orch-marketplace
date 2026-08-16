@@ -104,20 +104,9 @@ const packageJson = JSON.parse(await readFile(packageJsonPath, 'utf8'));
 
 const stateRoot = resolveStateRoot();
 
-// 부팅은 핸드셰이크를 붙잡지 않되, 완료 뒤 첫 실제 도구 응답에는 보존 정책이 지운
-// patch 개수를 한 번만 싣는다. 반환값을 버리면 사용자가 회복 지점을 잃었다는 사실을
-// 전혀 알 수 없다.
-const startupSweep = sweepOrphans({ stateRoot });
-let startupPatchNoticeConsumed = false;
-async function takeStartupPatchNotice() {
-  const swept = await startupSweep;
-  if (startupPatchNoticeConsumed || swept.patches.removed <= 0) return null;
-  startupPatchNoticeConsumed = true;
-  return (
-    `부팅 스윕이 상태 루트의 patches 에서 30일이 지난 패치 ${swept.patches.removed}개를 지웠습니다 — ` +
-    '그 파일에는 델리게이트가 만든 소스가 평문으로 들어 있어 보존 정책으로 회수합니다.'
-  );
-}
+// 부팅 시점에는 보호할 run ID 를 아직 모른다. 따라서 scratch 와 child/worktree
+// 원장만 비동기로 정리하고 patch/run namespace 는 per-run collision 검사 뒤로 미룬다.
+sweepOrphans({ stateRoot, sweepPatches: false, sweepRuns: false });
 
 /**
  * ★ 중첩 실행 가드. 델리게이트를 스폰할 때 자식 env 에 `BOM_ORCH_RUN_ID` 를 찍는다
@@ -178,11 +167,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       sendNotification: extra?.sendNotification,
       progressToken: request.params?._meta?.progressToken,
     });
-    const startupNotice = await takeStartupPatchNotice();
     const envelope = await callTool(request.params.name, request.params.arguments, { stateRoot, onProgress });
-    if (startupNotice !== null) {
-      envelope.notice = typeof envelope.notice === 'string' && envelope.notice !== '' ? `${startupNotice} ${envelope.notice}` : startupNotice;
-    }
     return serializeToolResult(envelope);
   } catch (error) {
     return serializeToolResult(

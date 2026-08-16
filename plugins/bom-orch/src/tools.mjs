@@ -11,9 +11,10 @@ import { POINT_OF_USE_MAX_AGE_MS, readCatalog, shouldRefresh, writeCatalog } fro
 import { MAX_CONTENT_CHARS, failure, success, validateArgs } from './envelope.mjs';
 import { MAX_BUDGET, runOrchestration } from './engine.mjs';
 import { TIERS, VENDORS, readSettings, writeSettings } from './config.mjs';
-import { AXES, OBSERVATION_THRESHOLD, armAllowed, gradeToDeltas, observationsOf } from './learn/bandit.mjs';
+import { AXES, OBSERVATION_THRESHOLD, POLICY_V2_AXES, armAllowed, gradeToDeltas, observationsOf } from './learn/bandit.mjs';
 import { TASK_CLASSES } from './learn/classify.mjs';
 import { findRunUnlocked, readRunsUnlocked } from './learn/journal.mjs';
+import { inspectArtifactRefs } from './run-artifacts.mjs';
 import { join } from 'node:path';
 import { GENERATIONS_SNAPSHOT_FILE, SNAPSHOT_FILE, cellKeyOf, commitLearningMutationUnlocked, readPosteriors, readPosteriorsUnlocked, resetPosteriors } from './learn/posteriors.mjs';
 import { generationOf, readGenerationsUnlocked, withLearningLock } from './learn/learning.mjs';
@@ -95,10 +96,22 @@ export const TOOL_SPECS = Object.freeze([
       //   거부되고 `budget:NaN` 은 통과한다. 선언과 검증이 어긋나면 그 자체가 결함이다.
       budget: Object.freeze({ type: 'number', integer: true, min: 1, max: MAX_BUDGET, required: false, default: 5 }),
       wait_ms: Object.freeze({ type: 'number', min: 0, required: false, default: 1_800_000 }),
+      candidates: Object.freeze({
+        type: 'number',
+        integer: true,
+        enum: [1, 2],
+        default: 1,
+        description: '독립 후보 수입니다. 2는 두 provider와 lane별 budget을 사용합니다.',
+      }),
       // 설계 §9.2 는 "한 벤더만으로 조용히 돌려 '됐다'고 하면 요청을 배신한다" 고 못박는다.
       // 그래서 single 은 호출자가 **명시적으로** 허용해야만 밴딧이 뽑을 수 있고(계획 3 §7.2),
       // 기본값은 금지 쪽이다. 실제로 팔을 거르는 자리는 `src/learn/bandit.mjs` 의 `decide` 다.
-      allow_single: Object.freeze({ type: 'boolean', required: false, default: false }),
+      allow_single: Object.freeze({
+        type: 'boolean',
+        required: false,
+        default: false,
+        description: '한 provider만으로 실행하는 것을 명시적으로 허용합니다.',
+      }),
       // ⚠ 설계 §8.2 의 `files`(프로젝트 밖 참고 파일)는 **여기 없다.** 엔진에 소비자가 없어
       //   받아서 버리기만 했고, 선언까지 해 두면 호출자(모델)는 참고 파일을 줬다고 믿고 그
       //   전제 위에서 task 를 짧게 쓴다. 이 기능은 후속 계획으로 이월했다.
@@ -177,6 +190,7 @@ function toInputSchema(argsSpec) {
     if (typeof fieldSpec.min === 'number') property.minimum = fieldSpec.min;
     if (typeof fieldSpec.max === 'number') property.maximum = fieldSpec.max;
     if (Object.hasOwn(fieldSpec, 'default')) property.default = fieldSpec.default;
+    if (typeof fieldSpec.description === 'string') property.description = fieldSpec.description;
     properties[key] = property;
     if (fieldSpec.required) required.push(key);
   }
@@ -442,6 +456,12 @@ export const AXIS_NOTES = Object.freeze({
   mix: 'allow_single:true 로 부른 실행에서만 이 축의 팔이 둘이 됩니다(설계 §9.2) — 그 전에는 관측이 쌓여도 기본값으로 돕니다.',
   placement:
     'single 실행의 관측도 이 셀에 합산됩니다 — 「누가 먼저 하나」와 「혼자면 누구인가」가 한 셀에 쌓입니다(태스크 8 결정 ②).',
+  // ★ 이 파일의 불변식: 화면과 게이트가 같은 것을 세야 한다. 엔진은 티어 팔이 서로 다른 설정으로
+  //   풀릴 때만 이 축을 배운다(`tier_not_distinguishable`). 모델을 하나도 안 정해두면 두 팔이
+  //   같은 CLI 를 같은 effort 로 띄우므로 관측이 안 쌓이는데, 그 이유를 여기서 말해주지 않으면
+  //   사용자는 "왜 이 축만 안 늘지"를 알 길이 없다.
+  tier:
+    'orch_config 로 이 벤더의 strong/fast 를 서로 다르게 정해두기 전에는 두 팔이 같은 실행이라 관측이 쌓이지 않습니다 — 팔이 실제로 갈릴 때만 배웁니다.',
 });
 
 /**
@@ -536,6 +556,9 @@ const recentView = (run, generations, generationsKnown = true) => {
   appliedGrade: run.appliedGrade ?? null,
   appliedCurrent,
   appliedAxes,
+  // ★ `null` 은 "확인하지 않았다/할 수 없었다" 이고 `[]` 는 "이 실행에 artifact 가 없다" 다.
+  //   정책 v2 이전 줄에는 `artifactRefs` 자체가 없으므로 늘 `null` 이다.
+  artifacts: null,
 };
 };
 
@@ -855,9 +878,28 @@ async function runOrchStats(value, context) {
   let journal = 'skipped';
   if (value.runs > 0) {
     if (runs?.ok) {
-      recent = [...runs.runs]
-        .reverse()
+      const ordered = [...runs.runs].reverse();
+      recent = ordered
         .map((run) => recentView(run, generationState.ok ? generationState.generations : { global: 0, cells: {} }, generationState.ok));
+      // The probe reads and hashes files, so it deliberately runs after the
+      // coordinator callback above has released `learning.lock`.
+      let budget = MAX_INSPECTED_ARTIFACT_REFS;
+      let uninspectedRuns = 0;
+      for (let index = 0; index < ordered.length; index += 1) {
+        const refs = ordered[index].artifactRefs;
+        if (!Array.isArray(refs)) continue;
+        if (refs.length > budget) {
+          uninspectedRuns += 1;
+          continue;
+        }
+        budget -= refs.length;
+        const inspected = await inspectJournalArtifacts(stateRoot, refs, wired.artifactInspectionDeps);
+        recent[index].artifacts = inspected.artifacts;
+        if (inspected.failed) uninspectedRuns += 1;
+      }
+      if (uninspectedRuns > 0) {
+        notices.push(`artifact 상태를 확인하지 못한 실행이 ${uninspectedRuns}건 있습니다 — 한 번에 최대 ${MAX_INSPECTED_ARTIFACT_REFS}개 ref 만 엽니다.`);
+      }
       journal = 'ok';
     } else {
       recent = [];
@@ -884,9 +926,99 @@ async function runOrchStats(value, context) {
   });
 }
 
+/**
+ * 한 응답에서 실제로 열어 보는 artifact ref 수의 상한.
+ *
+ * ★ 상한이 필요한 이유: `inspectArtifactRefs` 는 파일을 열고 **해시까지** 다시 계산한다
+ *   (`expired` 가 "바이트가 여전히 그 ref 다" 를 포함하기 때문이다). 최근 목록은 최대 50건
+ *   이고 실행 하나가 최대 네 개(manifest·후보 둘·winner)를 남기므로, 상한이 없으면 통계
+ *   한 번이 패치 200개를 해시한다. 40 은 최근 10건 남짓을 덮는 값이다.
+ *
+ * ★ 넘치면 **조용히 자르지 않는다** — 확인하지 않은 실행 수를 notice 로 말한다.
+ */
+const MAX_INSPECTED_ARTIFACT_REFS = 40;
+
+/**
+ * 저장된 ref 는 그대로 두고 `exists`·`expired` 만 실측해 붙인다.
+ *
+ * ★ 학습 잠금 **밖**에서 부른다. 파일을 열고 해시하는 일을 coordinator 안에서 하면 그동안
+ *   모든 학습 writer 가 막히고, 잠금 본문이 `staleMs`(60초) 쪽으로 자란다.
+ *
+ * ★ 실패는 **진단일 뿐**이다. artifact 가 사라졌거나 확인에 실패했다고 해서 정정이 막히지
+ *   않는다 — 보상 권위는 동결된 choice map 이지 패치 내용이 아니다. reset 세대 만료와는
+ *   다른 사건이고, 그쪽만 정정을 거절한다.
+ */
+async function inspectJournalArtifacts(stateRoot, refs, dependencyInput) {
+  if (!Array.isArray(refs)) return { artifacts: null, omitted: 0, failed: false };
+  if (refs.length === 0) return { artifacts: [], omitted: 0, failed: false };
+  const take = refs.slice(0, MAX_INSPECTED_ARTIFACT_REFS);
+  let result = null;
+  try {
+    result = await inspectArtifactRefs(
+      { stateRoot, refs: take, nowMs: Date.now() },
+      dependencyInput !== null && typeof dependencyInput === 'object' ? dependencyInput : {},
+    );
+  } catch {
+    result = null;
+  }
+  if (result?.ok !== true) return { artifacts: null, omitted: refs.length, failed: true };
+  return {
+    artifacts: result.refs.map(({ ref, exists, expired }) => ({ ...ref, exists, expired })),
+    omitted: refs.length - take.length,
+    failed: false,
+  };
+}
+
 const ZERO_DELTA = Object.freeze({ alphaDelta: 0, betaDelta: 0 });
 
 const sameAxes = (a, b) => Array.isArray(a) && a.length === b.length && a.every((axis, i) => axis === b[i]);
+
+/** Two complete choice maps hold the same arms for the same axes. */
+const sameChoices = (a, b) => {
+  const left = Object.entries(a ?? {});
+  const right = Object.entries(b ?? {});
+  return left.length === right.length && left.every(([axis, arm]) => b[axis] === arm);
+};
+
+/**
+ * `axis → arm` 을 읽는다. **하나라도 이상하면 `null`** — 부분 수용이 없다.
+ *
+ * ★ 왜 모르는 축·팔에서 실패하는가: v1 은 모르는 축을 notice 로 건너뛰지만, 그쪽은
+ *   `decisions` 라는 넓은 기록에서 골라 쓰는 경로다. v2 의 map 은 엔진이 **이 Run 이
+ *   실제로 돌린 것만** 적은 좁은 기록이라, 거기 낯선 이름이 있으면 그 줄 자체를 믿을 수
+ *   없다. 절반만 정정하면 되돌릴 수 없는 반쪽 상태가 남는다.
+ */
+function normalizeChoiceMap(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const map = new Map();
+  for (const [axis, arm] of Object.entries(value)) {
+    if (!POLICY_V2_AXES.includes(axis)) return null;
+    if (typeof arm !== 'string' || !AXES[axis].arms.includes(arm)) return null;
+    map.set(axis, arm);
+  }
+  return map;
+}
+
+const sameAxisSet = (axes, map) => !Array.isArray(axes) ||
+  axes.length === map.size && axes.every((axis) => map.has(axis));
+
+/**
+ * 정책 v2 줄을 정정 권위로 읽는다. 실패는 `null` 이고 호출자가 실패 봉투를 낸다.
+ *
+ * 검사하는 것: 두 map 이 모두 온전한가, `appliedChoices ⊆ rewardableChoices` 이고 팔이
+ * 같은가, `appliedGrade` 와 `appliedChoices` 가 서로를 부정하지 않는가, 파생 배열
+ * (`appliedAxes`/`rewardableAxes`)이 있다면 map 의 축과 같은가.
+ */
+function readPolicyV2Authority(run) {
+  const applied = normalizeChoiceMap(run.appliedChoices);
+  const rewardable = normalizeChoiceMap(run.rewardableChoices);
+  if (applied === null || rewardable === null) return null;
+  for (const [axis, arm] of applied) if (rewardable.get(axis) !== arm) return null;
+  const appliedGrade = run.appliedGrade ?? null;
+  if ((appliedGrade === null) !== (applied.size === 0)) return null;
+  if (!sameAxisSet(run.appliedAxes, applied) || !sameAxisSet(run.rewardableAxes, rewardable)) return null;
+  return { applied, rewardable };
+}
 
 /**
  * `orch_reward` 핸들러. 멱등·교체(설계 §7.4).
@@ -918,16 +1050,39 @@ async function runOrchReward(value, context) {
   const wired = toEngineDeps(context);
   const stateRoot = typeof wired.stateRoot === 'string' && wired.stateRoot !== '' ? wired.stateRoot : resolveStateRoot();
 
-  const locked = await withLearningLock(stateRoot, async () => runOrchRewardUnlocked(value, stateRoot));
-  if (locked.ok) return locked.value;
-  return failure({
-    status: 'failed',
-    error: `학습 조정 잠금을 잡지 못했습니다: ${locked.reason}`,
-    recovery: '잠시 뒤 같은 run_id 로 다시 시도하세요. 보류 중인 학습 작업은 다음 읽기 또는 재시도에서 복구됩니다.',
+  // The corrected row's artifact refs travel out of the coordinator so the
+  // filesystem probe below runs with the lock released.
+  const captured = { artifactRefs: null };
+  const locked = await withLearningLock(stateRoot, async () => runOrchRewardUnlocked(value, stateRoot, captured));
+  if (!locked.ok) {
+    return failure({
+      status: 'failed',
+      error: `학습 조정 잠금을 잡지 못했습니다: ${locked.reason}`,
+      recovery: '잠시 뒤 같은 run_id 로 다시 시도하세요. 보류 중인 학습 작업은 다음 읽기 또는 재시도에서 복구됩니다.',
+    });
+  }
+  const envelope = locked.value;
+  if (envelope.status !== 'succeeded' || captured.artifactRefs === null) return envelope;
+  const inspected = await inspectJournalArtifacts(stateRoot, captured.artifactRefs, wired.artifactInspectionDeps);
+  const notices = [];
+  if (typeof envelope.notice === 'string' && envelope.notice !== '') notices.push(envelope.notice);
+  if (inspected.failed) notices.push('artifact 상태를 확인하지 못했습니다 — 정정 자체는 반영됐습니다.');
+  if (inspected.omitted > 0) notices.push(`artifact ref ${inspected.omitted}개는 확인하지 않았습니다(한 번에 최대 ${MAX_INSPECTED_ARTIFACT_REFS}개).`);
+  let body;
+  try {
+    body = JSON.parse(envelope.content);
+  } catch {
+    return envelope;
+  }
+  body.artifacts = inspected.artifacts;
+  return success({
+    content: JSON.stringify(body),
+    confidence: 'verified',
+    notice: notices.length > 0 ? notices.join(' / ') : undefined,
   });
 }
 
-async function runOrchRewardUnlocked(value, stateRoot) {
+async function runOrchRewardUnlocked(value, stateRoot, captured = { artifactRefs: null }) {
   // `findRun` 은 같은 coordinator 를 다시 잡으므로 여기서는 unlocked helper 만 쓴다.
   const run = await findRunUnlocked(stateRoot, value.run_id);
 
@@ -943,6 +1098,28 @@ async function runOrchRewardUnlocked(value, stateRoot) {
       status: 'failed',
       error: `실행 기록 "${safeErrorText(value.run_id)}" 에 taskClass 가 없어 어느 셀을 고칠지 알 수 없습니다.`,
       recovery: '이 실행은 학습 셀과 연결돼 있지 않습니다. 다른 run_id 를 고르세요.',
+    });
+  }
+
+  // ★★ 정책 버전이 **정정 권위를 정한다.** v2 줄은 동결된 choice map 만 읽고 `decisions`
+  //   는 절대 읽지 않는다 — 다중 후보에서 `decisions[axis]` 는 밴딧이 뽑았지만 아무 lane 도
+  //   돌리지 않은 팔일 수 있고, 그것을 보상하면 실행하지 않은 선택을 배운다(설계 §14.3).
+  //   그래서 map 이 망가지면 **v1 으로 내려가지 않고** 실패한다. 폴백은 조용한 오귀속이다.
+  const policyVersion = run.policyVersion ?? 1;
+  if (policyVersion !== 1 && policyVersion !== 2) {
+    return failure({
+      status: 'failed',
+      error: `모르는 학습 policyVersion(${safeErrorText(policyVersion)}) 이라 정정 권위를 정할 수 없습니다.`,
+      recovery: '이 줄을 쓴 버전의 도구로 정정하세요. 임의 버전으로 되돌리면 이중 계산이 됩니다.',
+    });
+  }
+  if (Array.isArray(run.artifactRefs)) captured.artifactRefs = run.artifactRefs;
+  const v2 = policyVersion === 2 ? readPolicyV2Authority(run) : null;
+  if (policyVersion === 2 && v2 === null) {
+    return failure({
+      status: 'failed',
+      error: 'policyVersion 2 실행 기록의 appliedChoices/rewardableChoices 가 온전하지 않아 정정하지 않았습니다.',
+      recovery: '이 줄은 손으로 고치지 말고 그대로 두세요. 새 orchestration 을 실행해 현재 형식의 run_id 를 만드세요.',
     });
   }
 
@@ -989,7 +1166,7 @@ async function runOrchRewardUnlocked(value, stateRoot) {
   }
   // ★ `?? []` 로 읽지 마라. 옛 줄은 `appliedGrade:'success'` 인데 `appliedAxes` 가 없다 —
   //   `[]` 로 읽으면 되돌릴 축이 0개가 되어 그 α 가 **영원히** 남고 새 등급이 그 위에 얹힌다.
-  if (undoDeltas !== null && !Array.isArray(run.appliedAxes)) {
+  if (v2 === null && undoDeltas !== null && !Array.isArray(run.appliedAxes)) {
     return failure({
       status: 'failed',
       error: '실행 기록에 appliedAxes 가 없습니다(옛 형식) — 어느 셀에 반영됐는지 몰라 되돌릴 수 없습니다.',
@@ -998,50 +1175,68 @@ async function runOrchRewardUnlocked(value, stateRoot) {
     });
   }
 
-  const undoAxes = undoDeltas === null ? [] : run.appliedAxes;
   const notes = [];
-  let redoAxes;
-  if (Array.isArray(run.rewardableAxes)) {
-    redoAxes = run.rewardableAxes;
-  } else if (undoDeltas !== null) {
-    redoAxes = undoAxes;
-    notes.push('실행 기록에 rewardableAxes 가 없어(옛 형식) 이미 반영돼 있던 축에만 새 등급을 적었습니다.');
-  } else {
-    redoAxes = [];
-    notes.push(
-      '실행 기록에 rewardableAxes 가 없고 사후분포에 반영된 기여도 없어(옛 형식) 새 등급을 적을 셀을 정할 수 없습니다.',
-    );
-  }
-
-  // ★ 모르는 축은 **조용히** 버리지 않는다. 형제 경로(팔이 없는 축)가 문장을 남기는데
-  //   여기만 침묵하면 `rewardableAxes:['oldaxis']` 같은 줄이 `axes:[]` · notice 없음으로
-  //   나가서, 사용자는 정정이 됐다고 믿는다 — 이 도구의 논거가 「조용한 무연산을 없앤다」다.
-  const named = [...new Set([...undoAxes, ...redoAxes])];
-  const axes = named.filter((axis) => Object.hasOwn(AXES, axis));
-  const unknown = named.filter((axis) => !Object.hasOwn(AXES, axis));
-  if (unknown.length > 0) {
-    notes.push(`지금 없는 축이라 건너뜁니다: ${unknown.map((axis) => safeErrorText(axis)).join(', ')}.`);
-  }
-
   const holding = [];
   const updates = [];
-  for (const axis of axes) {
-    const decisions = run.decisions !== null && typeof run.decisions === 'object' ? run.decisions : {};
-    const arm = Object.hasOwn(decisions, axis) ? decisions[axis] : null;
-    if (typeof arm !== 'string' || arm === '') {
-      notes.push(`${axis}: 이 실행이 쓴 팔이 저널에 없어 건너뜁니다.`);
-      continue;
+  if (v2 !== null) {
+    // 되돌릴 곳은 `appliedChoices`, 새로 적을 곳은 `rewardableChoices` — 둘 다 팔까지
+    // 동결돼 있으므로 이 자리에서 팔을 추측할 일이 없다. 축 순서는 `POLICY_V2_AXES` 다.
+    for (const axis of POLICY_V2_AXES) {
+      const arm = v2.rewardable.get(axis) ?? v2.applied.get(axis);
+      if (arm === undefined) continue;
+      const back = undoDeltas !== null && v2.applied.has(axis) ? undoDeltas : ZERO_DELTA;
+      const inRedo = v2.rewardable.has(axis);
+      const forward = inRedo ? redoDeltas : ZERO_DELTA;
+      const alphaDelta = forward.alphaDelta - back.alphaDelta;
+      const betaDelta = forward.betaDelta - back.betaDelta;
+      if (alphaDelta !== 0 || betaDelta !== 0) {
+        updates.push({ cellKey: cellKeyOf(run.taskClass, axis), arm, alphaDelta, betaDelta });
+      }
+      if (inRedo) holding.push(axis);
     }
-    const back = undoAxes.includes(axis) ? undoDeltas ?? ZERO_DELTA : ZERO_DELTA;
-    const inRedo = redoAxes.includes(axis);
-    const forward = inRedo ? redoDeltas : ZERO_DELTA;
-    const alphaDelta = forward.alphaDelta - back.alphaDelta;
-    const betaDelta = forward.betaDelta - back.betaDelta;
+  } else {
+    const undoAxes = undoDeltas === null ? [] : run.appliedAxes;
+    let redoAxes;
+    if (Array.isArray(run.rewardableAxes)) {
+      redoAxes = run.rewardableAxes;
+    } else if (undoDeltas !== null) {
+      redoAxes = undoAxes;
+      notes.push('실행 기록에 rewardableAxes 가 없어(옛 형식) 이미 반영돼 있던 축에만 새 등급을 적었습니다.');
+    } else {
+      redoAxes = [];
+      notes.push(
+        '실행 기록에 rewardableAxes 가 없고 사후분포에 반영된 기여도 없어(옛 형식) 새 등급을 적을 셀을 정할 수 없습니다.',
+      );
+    }
 
-    if (alphaDelta !== 0 || betaDelta !== 0) {
-      updates.push({ cellKey: cellKeyOf(run.taskClass, axis), arm, alphaDelta, betaDelta });
+    // ★ 모르는 축은 **조용히** 버리지 않는다. 형제 경로(팔이 없는 축)가 문장을 남기는데
+    //   여기만 침묵하면 `rewardableAxes:['oldaxis']` 같은 줄이 `axes:[]` · notice 없음으로
+    //   나가서, 사용자는 정정이 됐다고 믿는다 — 이 도구의 논거가 「조용한 무연산을 없앤다」다.
+    const named = [...new Set([...undoAxes, ...redoAxes])];
+    const axes = named.filter((axis) => Object.hasOwn(AXES, axis));
+    const unknown = named.filter((axis) => !Object.hasOwn(AXES, axis));
+    if (unknown.length > 0) {
+      notes.push(`지금 없는 축이라 건너뜁니다: ${unknown.map((axis) => safeErrorText(axis)).join(', ')}.`);
     }
-    if (inRedo) holding.push(axis);
+
+    for (const axis of axes) {
+      const decisions = run.decisions !== null && typeof run.decisions === 'object' ? run.decisions : {};
+      const arm = Object.hasOwn(decisions, axis) ? decisions[axis] : null;
+      if (typeof arm !== 'string' || arm === '') {
+        notes.push(`${axis}: 이 실행이 쓴 팔이 저널에 없어 건너뜁니다.`);
+        continue;
+      }
+      const back = undoAxes.includes(axis) ? undoDeltas ?? ZERO_DELTA : ZERO_DELTA;
+      const inRedo = redoAxes.includes(axis);
+      const forward = inRedo ? redoDeltas : ZERO_DELTA;
+      const alphaDelta = forward.alphaDelta - back.alphaDelta;
+      const betaDelta = forward.betaDelta - back.betaDelta;
+
+      if (alphaDelta !== 0 || betaDelta !== 0) {
+        updates.push({ cellKey: cellKeyOf(run.taskClass, axis), arm, alphaDelta, betaDelta });
+      }
+      if (inRedo) holding.push(axis);
+    }
   }
 
   // ★★ **한 번의 쓰기다.** 축마다 따로 쓰면 세 축을 고치고 네 번째에서 죽는 반쪽 상태가
@@ -1056,11 +1251,17 @@ async function runOrchRewardUnlocked(value, stateRoot) {
   if (note === null && typeof run.note === 'string' && run.note !== '') {
     notes.push(`note 를 주지 않아 이전 기록("${run.note}")을 지웠습니다. 남기려면 같은 문장을 다시 주세요.`);
   }
+  // v2 는 축 목록이 아니라 **완전한 choice map** 을 비교한다. 같은 축이라도 팔이 달라지면
+  // 그것은 다른 정정이므로 무연산이 아니다.
+  const nextAppliedChoices = v2 === null
+    ? null
+    : Object.fromEntries(holding.map((axis) => [axis, v2.rewardable.get(axis)]));
   // ★ 바뀔 것이 없으면 줄을 얹지 않는다 — 그것이 멱등이다. 사후분포도 저널도 그대로여야 한다.
   const unchanged =
     !wrote &&
     appliedGrade === nextApplied &&
     sameAxes(run.appliedAxes, holding) &&
+    (v2 === null || sameChoices(run.appliedChoices, nextAppliedChoices)) &&
     (run.rewardApplied ?? null) === 'user' &&
     (run.note ?? null) === note;
 
@@ -1074,6 +1275,7 @@ async function runOrchRewardUnlocked(value, stateRoot) {
       ...run,
       appliedGrade: nextApplied,
       appliedAxes: holding,
+      ...(v2 === null ? {} : { appliedChoices: nextAppliedChoices }),
       rewardApplied: 'user',
       note,
       },
@@ -1143,6 +1345,7 @@ export function toEngineOptions(value, context) {
     isolation: value.isolation,
     budget: value.budget,
     waitMs: value.wait_ms,
+    candidateCount: value.candidates,
     // ☞ 태스크 8 이 읽는다: `decide({ allowed: { single: options.allowSingle === true } })`.
     allowSingle: value.allow_single === true,
     onProgress: typeof context?.onProgress === 'function' ? context.onProgress : undefined,

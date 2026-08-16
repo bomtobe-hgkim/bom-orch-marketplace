@@ -24,6 +24,21 @@ export const AXES = Object.freeze({
 });
 
 /**
+ * 학습 정책 v2 가 **실제로 쓰는 축**. `AXES` 의 부분집합이다.
+ *
+ * ★ `AXES` 를 줄이지 않는 이유(설계 §14.2): `rewrite` 의 사후분포는 **정책 v1 역사**로
+ *   남는다. `orch_stats` 가 그 셀을 보여줘야 하고 옛 실행의 `orch_reward` 정정이 그 팔을
+ *   되돌릴 수 있어야 한다. 그래서 `decide` 도 그대로 rewrite 결정을 낸다 — 없애면 v1 줄의
+ *   팔을 식별하지 못한다.
+ *
+ * ★ 대신 **v2 실행이 무엇을 선택·저널·보상하는가**는 이 목록이 정한다. 엔진과
+ *   `learn/policy-v2.mjs` 가 같은 상수를 읽어야 화면·게이트·보상이 같은 축을 센다 —
+ *   `armAllowed`·`observationsOf` 를 내보내는 이유와 같다. 목록을 두 곳에 적으면
+ *   한쪽만 바뀐다.
+ */
+export const POLICY_V2_AXES = Object.freeze(['mix', 'placement', 'tier']);
+
+/**
  * 이 수의 관측이 쌓이기 전에는 밴딧을 안 태운다.
  *
  * 설계 §7.5 는 "밴딧이 증거를 공급한다" 고만 하고 증거가 없을 때를 안 적었다. 게이트가
@@ -346,6 +361,7 @@ export function decide(spec) {
   const decisions = {};
   const sources = {};
   const lines = [];
+  const evidenceLines = {};
 
   for (const [axis, axisSpec] of Object.entries(AXES)) {
     // ★ 축 하나가 던져도 나머지 축은 낸다. 이 `catch` 가 없으면 「절대 throw 하지 않는다」가
@@ -412,18 +428,44 @@ export function decide(spec) {
       decisions[axis] = best;
       sources[axis] = 'bandit';
       lines.push(line);
+      evidenceLines[axis] = line;
     } catch {
       decisions[axis] = axisSpec.default;
       sources[axis] = 'default';
     }
   }
 
-  const evidence =
-    lines.length > 0
-      ? `${EVIDENCE_HEADER}\n${lines.join('\n')}`
-      : `${EVIDENCE_HEADER}\n· 아직 판단할 만큼의 관측이 없어(축마다 ${OBSERVATION_THRESHOLD}건 필요) 기본값으로 진행합니다.`;
+  const evidence = renderEvidence(lines);
 
-  return { decisions, sources, evidence };
+  // ★★ `evidence` 는 **모든 축**을 담은 원본 렌더링이다. 이대로 모델에게 보내면 안 된다:
+  //   `rewrite` 는 엔진이 결정에서 버리는 축이고, 구분되지 않는 `tier` 는 팔 뒤에 아무것도
+  //   없다. 어느 축이 이 실행에서 **진짜 선택이었는지**는 조정자만 안다 —
+  //   `freezeEffectiveChoices` 의 주석이 그 이유를 적어뒀다. 그래서 축별 줄을 따로 내주고,
+  //   골라 합치는 일은 `evidenceParagraph` 로 조정자에게 맡긴다.
+  return { decisions, sources, evidence, evidenceLines: Object.freeze({ ...evidenceLines }) };
+}
+
+function renderEvidence(lines) {
+  return lines.length > 0
+    ? `${EVIDENCE_HEADER}\n${lines.join('\n')}`
+    : `${EVIDENCE_HEADER}\n· 아직 판단할 만큼의 관측이 없어(축마다 ${OBSERVATION_THRESHOLD}건 필요) 기본값으로 진행합니다.`;
+}
+
+/**
+ * 설계 §7.5 의 근거 문단을, **호출자가 고른 축만** 담아 렌더링한다.
+ *
+ * ★ 축 순서는 호출자가 준 순서가 아니라 `AXES` 순서로 고정한다 — 같은 실행이 같은 문단을
+ *   내야 프롬프트가 결정적이다.
+ * ★ 고른 축에 관측이 모자라면 그 축은 줄이 없다. 남는 줄이 하나도 없으면 "아직 모른다" 를
+ *   말한다 — 문단을 통째로 빼면 모델은 그 침묵을 아무렇게나 읽는다.
+ */
+export function evidenceParagraph(advice, axes) {
+  const wanted = new Set(Array.isArray(axes) ? axes : []);
+  const lines = Object.keys(AXES)
+    .filter((axis) => wanted.has(axis))
+    .map((axis) => advice?.evidenceLines?.[axis])
+    .filter((line) => typeof line === 'string' && line !== '');
+  return renderEvidence(lines);
 }
 
 /**
