@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 - 2026-08-16
+
+- Rewrite the marketplace and plugin READMEs to lead with the limits this release enforces
+  instead of filing them below the install instructions.
+- Derive the README release gate from package metadata, so it cannot keep demanding a version
+  the documentation has already moved past.
+- Stop the `claude-run` abort and timeout fixtures from racing stub startup under load.
+
 ## 0.2.0 - 2026-08-16
 
 - Decide every `orch_run` from a structured verifier verdict and revision-bound machine
