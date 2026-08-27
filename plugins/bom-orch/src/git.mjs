@@ -1,7 +1,10 @@
 import { spawn } from 'node:child_process';
 import { mkdir, stat } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
+import { gitFault, stderrTail } from './providers/error-catalog.mjs';
 import { resolveBinary } from './providers/resolve-binary.mjs';
+import { REASON } from './reason-codes.mjs';
+import { fail, renderReason } from './reason-text.mjs';
 import { resolveStateRoot } from './state-root.mjs';
 
 /**
@@ -171,8 +174,9 @@ function resolveGitPath() {
  *   그래도 실제로 만들어 둔다. 이유는 폴백 방지가 아니라, 다른 git 버전·플랫폼의 폴백
  *   동작에 의존하지 않기 위해서다. 비용은 프로세스당 mkdir 한 번이다.
  *
- * 지연 생성을 유지하는 것은 이제 안전하다. `runGit` 이 **호출자 값을 한 번도 건드리기
- * 전에** 이것을 await 하므로(아래 I2 주석), 검사와 spawn 사이에 await 가 없다.
+ * 지연 생성을 유지하는 것은 이제 안전하다. `runGit` 은 optional `input` getter를 읽고
+ * private Buffer를 동기 복사한 뒤에 이것을 await하며, 그 뒤 다른 caller 값을 읽는 I2 구간과
+ * 검사·spawn 사이에는 await 가 없다.
  */
 const EMPTY_HOOKS_DIR = join(STATE_ROOT, 'git-empty-hooks');
 
@@ -191,9 +195,9 @@ let hooksDirReady = null;
  *   내부 경로를 쓴다. 그래서 async IIFE + await 로 바꿨다.
  *
  *   ★ 오염이 **첫 호출보다 먼저** 서 있는 경우와 **호출 도중에** 심기는 경우는 서로
- *     다른 창이다. 후자는 `args[0]` 의 getter 로 심으므로 `runGit` 첫 줄의
- *     `await ensureEmptyHooksDir()` 을 이미 지난 뒤라 여기에 닿지 않는다. 여기서 다루는
- *     것은 전자다.
+ *     다른 창이다. 후자는 `args[0]` 의 getter 로 심으므로 optional-input 동기 capture와
+ *     hooks 준비/await를 이미 마친 뒤에만 일어나 `ensureEmptyHooksDir` 에 닿지 않는다.
+ *     여기서 다루는 것은 전자다.
  *
  *   같은 이유로 이 함수 자신은 **async 가 아니다**: async 함수가 promise 를 반환하면
  *   그 promise 를 thenable 로 보고 `then` 을 조회해 호출한다 — 오염이 그 자리에서 다시
@@ -425,7 +429,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
  * 잡으면 정말 죽고 있던 자식의 종료 코드를 버리게 되고, 길게 잡으면 그만큼 MCP 요청이
  * 매달린다.
  */
-const KILL_GRACE_MS = 2_000;
+export const KILL_GRACE_MS = 2_000;
 
 /**
  * 호출자 args 의 개수 상한.
@@ -581,6 +585,9 @@ function isGitRedirectVar(name) {
 /** 거부 사유에 실을 토큰의 최대 길이. 사유 문자열은 로그·응답을 타고 흐른다. */
 const MAX_REASON_TOKEN = 60;
 
+const INVALID_GIT_ARGUMENTS = 'its arguments are not a plain array of strings';
+const INVALID_GIT_INPUT = 'its stdin is not a finite bounded Buffer';
+
 /**
  * 진단용으로 토큰을 줄인다. 거부 사유는 그대로 로그·응답으로 흐르는 문자열이라,
  * 호출자가 넣은 것을 날것으로 되비추면 안 된다. 세 가지를 한다:
@@ -603,7 +610,10 @@ function summarizeToken(token) {
 }
 
 /**
- * 호출자 args 를 스폰 전에 검사한다. 통과하면 null, 아니면 거부 사유 문자열.
+ * 호출자 args 를 스폰 전에 검사한다. 통과하면 null, 아니면 `{ code, params? }`.
+ *
+ * ★ 문구가 아니라 **코드**를 낸다(WS2 Task 14). 사유 문장의 정본은 `src/reason-text.mjs`
+ *   하나이고, 여기서 문장을 지으면 같은 거부가 이 파일과 정본 두 곳에서 갈린다.
  *
  * 판정 규칙(fail-closed):
  *  1. **모든** 원소가 문자열이어야 한다. 선행 구간만 보면 안 된다 — Node 는 args 원소를
@@ -619,15 +629,13 @@ function summarizeToken(token) {
  */
 function screenArgs(tokens) {
   for (let i = 0; i < tokens.length; i += 1) {
-    if (typeof tokens[i] !== 'string') {
-      return `git 인자는 전부 문자열이어야 합니다 — ${i}번째 원소가 ${typeof tokens[i]} 라서 거부했습니다`;
-    }
+    if (typeof tokens[i] !== 'string') return { code: REASON.git_arguments_invalid, params: { detail: INVALID_GIT_ARGUMENTS } };
   }
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i];
     if (token[0] !== '-') break; // 서브커맨드 도달 — 선행 구간 끝
     if (!SAFE_LEADING_OPTIONS.has(token)) {
-      return `허용 목록에 없는 선행 전역 옵션이라 거부했습니다: ${summarizeToken(token)}`;
+      return { code: REASON.git_global_option_refused, params: { option: summarizeToken(token) } };
     }
   }
   return null;
@@ -662,9 +670,16 @@ function put(target, index, value) {
   defineProperty(target, index, { value, writable: true, enumerable: true, configurable: true });
 }
 
-/** 스폰 전에 걸러낸 호출의 봉투. 형태는 실행 실패(failed:true)와 같다. */
-function rejected(reason) {
-  return { ok: false, stdout: '', stderr: reason, exitCode: null, failed: true, timedOut: false };
+/**
+ * 스폰 전에 걸러낸 호출의 봉투. 형태는 실행 실패(failed:true)와 같다.
+ *
+ * ★ 사유는 **코드**로 받고 문장은 정본에서 렌더한다(WS2 Task 14). `stderr` 에 싣는 이유는 상위
+ *   (`inspectRepo`·`src/worktree.mjs`)가 이 봉투에서 "왜" 를 꺼내는 자리가 거기 하나뿐이라서다.
+ * ★ `stderrTail` 은 **null** 이다 — 우리 자신의 문장을 벤더 stderr 라벨로 얹으면 거짓말이 된다.
+ */
+function rejected(code, params = {}) {
+  const { error } = renderReason(code, params);
+  return { ok: false, stdout: '', stderr: error, exitCode: null, failed: true, timedOut: false, reasonCode: code, stderrTail: null };
 }
 
 /**
@@ -675,19 +690,35 @@ function rejected(reason) {
  * 구분한다. 뭉개면 상위(inspectRepo 등)가 "저장소가 없다"와 "git 을 찾을 수 없다"를
  * 구분하지 못하고 잘못된 판단을 내린다.
  *
- * stdio 는 `['ignore', 'pipe', 'pipe']` 다 — reaper 에서 배운 것: 읽지 않을 파이프는
- * 열지 않는다. 여기서는 stdout 뿐 아니라 stderr 도 **읽으므로**(사전 점검의 오류
- * 메시지가 거기 있다) 둘 다 pipe 로 연다. stdin 은 아무것도 보내지 않으므로 ignore.
+ * stdio 는 보통 `['ignore', 'pipe', 'pipe']` 다 — reaper 에서 배운 것: 읽지 않을 파이프는
+ * 열지 않는다. 단, `input` 이 Buffer 면 그 유한한 바이트만 stdin pipe 로 보낸다. 문자열·스트림을
+ * 받지 않는 것은 호출 뒤 바뀌는 두 번째 권위를 만들지 않기 위해서다.
  *
- * @param {{ args?: string[], cwd?: string, timeoutMs?: number, env?: Record<string,string> }} [options]
+ * @param {{ args?: string[], cwd?: string, timeoutMs?: number, env?: Record<string,string>, input?: Buffer }} [options]
  *   구조분해로 받지 않는다 — 아래 첫 줄의 이유를 보라. `cwd` 는 생략하거나 undefined
  *   일 때만 "서버 자신의 cwd" 를 뜻하고, 그 밖의 비문자열·빈 문자열은 거부한다.
  *   `env` 는 **이 호출에만** 얹는 추가 환경 변수다(부모 프로세스는 건드리지 않는다).
  *   여기에 명시하지 않은 GIT_* 리다이렉션 변수는 자식에서 제거된다
  *   (GIT_REDIRECT_VARS 주석 참조).
  */
-export async function runGit(options = {}) {
-  // ★ I2: 호출자가 넘긴 값을 **한 번도 건드리기 전에** 이것을 만들고 기다린다.
+export function runGit(options = {}) {
+  // RF1: exported 경계가 반환하기 전에 stdin 권위를 끊는다. 이 한 필드만 여기서 읽고, 나머지
+  // args/cwd/env 는 아래 async 본체가 hooks 준비 뒤의 기존 try 안에서 처음 읽는다.
+  let finalInput = null;
+  let inputRejection = null;
+  try {
+    const input = (options ?? {}).input;
+    if (input !== undefined && !Buffer.isBuffer(input)) inputRejection = rejected(REASON.git_arguments_invalid, { detail: INVALID_GIT_INPUT });
+    else if (input !== undefined) finalInput = Buffer.from(input);
+  } catch {
+    inputRejection = rejected(REASON.git_arguments_invalid, { detail: INVALID_GIT_INPUT });
+  }
+  const hooksReady = ensureEmptyHooksDir();
+  return runGitCaptured(options, hooksReady, finalInput, inputRejection);
+}
+
+async function runGitCaptured(options, hooksReady, finalInput, inputRejection) {
+  // ★ I2: input 이외의 호출자 값을 **한 번도 건드리기 전에** hooks promise를 기다린다.
   //
   //   무엇이 열려 있었나: 예전에는 args 를 복사·검사한 **뒤에** 여기를 await 했다.
   //   그 사이에 호출자 코드(`args[0]` 의 getter)가 이미 돈 상태라, 그 getter 하나로
@@ -697,20 +728,19 @@ export async function runGit(options = {}) {
   //   never-throw 계약이 지키려던 것("항상 봉투를 낸다")이 깨졌다 — 그 뒤의 모든 정상
   //   호출까지 같이 매달렸다(실측 재현: 첫 호출 settled=false, 두 번째 호출 PENDING).
   //
-  //   무엇이 닫혔나: 이 await 가 함수의 첫 줄이라 promise 생성·await 시점에 호출자
-  //   코드가 한 줄도 돈 적이 없다. 그래서 이 창이 사라졌고, **검사와 spawn 사이에
+  //   무엇이 닫혔나: exported 경계가 만든 promise를 args 읽기 전에 기다린다. 그래서
+  //   이 창이 사라졌고, **args 검사와 spawn 사이에
   //   await 가 하나도 남지 않았다**(그 사이에 마이크로태스크가 돌 틈 자체가 없다).
   //   매개변수를 구조분해로 받지 않는 것도 같은 이유다 — 구조분해는 함수 본문보다
   //   먼저 `options.args`/`options.cwd` 를 읽으므로 호출자 getter 가 여기보다 앞선다.
-  await ensureEmptyHooksDir();
+  await hooksReady;
+  if (inputRejection !== null) return inputRejection;
 
   // 이름이 아니라 절대 경로로 띄운다. 이름으로 띄우면 libuv 가 자식의 cwd(= 대상
   // 저장소)를 PATH 보다 먼저 뒤진다. 못 찾으면 fail-closed — 지금도 git 이 없으면
   // 실패하므로 동작 변화는 없고, 대신 "어디서 막혔는지"가 봉투에 남는다.
   const gitPath = resolveGitPath();
-  if (gitPath === null) {
-    return rejected('git 실행 파일을 PATH 에서 절대 경로로 찾지 못했습니다 — 안전하게 거부했습니다.');
-  }
+  if (gitPath === null) return rejected(REASON.git_cli_unavailable);
 
   let finalTimeout = DEFAULT_TIMEOUT_MS;
 
@@ -735,11 +765,7 @@ export async function runGit(options = {}) {
     //   `GIT_INDEX_FILE` 이 실제로 도달했다는 전제 위에 서 있고, 그게 조용히 빠지면
     //   임시 인덱스 대신 **사용자 인덱스**에 `read-tree`/`add -A` 를 하게 된다.
     //   생략·undefined·null 만 "추가 변수 없음" 으로 허용한다.
-    if (env !== undefined && env !== null && (typeof env !== 'object' || Array.isArray(env))) {
-      return rejected(
-        `git 환경 변수(env)는 평범한 객체여야 합니다 — ${Array.isArray(env) ? 'array' : typeof env} 를 받아 거부했습니다`,
-      );
-    }
+    if (env !== undefined && env !== null && (typeof env !== 'object' || Array.isArray(env))) return rejected(REASON.git_environment_invalid);
     // 부모 환경을 복사하되 GIT_* 리다이렉션 변수는 뺀다. 이 사본은 이 호출 전용이라
     // process.env 는 그대로다.
     const childEnv = {};
@@ -754,11 +780,7 @@ export async function runGit(options = {}) {
         // 비문자열은 Node 가 알아서 문자열로 강제한다 — `undefined` 가 문자열
         // "undefined" 로 자식에 도달하는 것이 가장 나쁘다(경로 자리에 들어가면 그
         // 이름의 파일을 실제로 만든다). 강제하지 말고 거부한다.
-        if (typeof value !== 'string') {
-          return rejected(
-            `git 환경 변수(env)의 값은 문자열이어야 합니다 — ${summarizeToken(key)} 가 ${value === null ? 'null' : typeof value} 라서 거부했습니다`,
-          );
-        }
+        if (typeof value !== 'string') return rejected(REASON.git_environment_value_invalid, { name: summarizeToken(key) });
         childEnv[key] = value;
       }
     }
@@ -770,11 +792,7 @@ export async function runGit(options = {}) {
     //   과 정확히 같은 부류다. 계획 2 는 이 인자로 `add -A`·`commit`·`clean -fdx` 를
     //   돌린다 — 잘못된 디렉터리에서 도는 `clean -fdx` 는 되돌릴 수 없다.
     //   생략·undefined 만 "서버 cwd 를 그대로 쓴다"로 허용하고 나머지는 거부한다.
-    if (cwd !== undefined && (typeof cwd !== 'string' || cwd === '')) {
-      return rejected(
-        `git 작업 디렉터리(cwd)는 비어 있지 않은 문자열이어야 합니다 — ${cwd === null ? 'null' : typeof cwd} 를 받아 거부했습니다`,
-      );
-    }
+    if (cwd !== undefined && (typeof cwd !== 'string' || cwd === '')) return rejected(REASON.git_working_directory_invalid);
     // ★ 문자열이라고 끝이 아니다. **상대 경로**는 위 비문자열들과 똑같이 서버 자신의
     //   cwd 로 떨어진다(실측, 서버 cwd = 이 저장소):
     //
@@ -785,29 +803,21 @@ export async function runGit(options = {}) {
     //   찍힌다. 상대 경로를 우리가 대신 풀어 주지 않는 이유: 무엇을 기준으로 풀지는
     //   호출자만 알고, 여기서 추측하면 틀렸을 때 되돌릴 수 없는 명령이 엉뚱한 곳에서
     //   돈다. 판단이 안 서는 입력은 거부가 이 모듈의 기본값이다.
-    if (cwd !== undefined && !isAbsolute(cwd)) {
-      return rejected('git 작업 디렉터리(cwd)는 절대 경로여야 합니다 — 상대 경로를 받아 거부했습니다');
-    }
+    if (cwd !== undefined && !isAbsolute(cwd)) return rejected(REASON.git_working_directory_invalid);
     finalCwd = cwd;
 
     // `Array.isArray(args) ? args : []` 는 fail-open 이었다: Set·유사배열·제너레이터를
     // 주면 인자가 조용히 사라지고 하드닝 플래그만 남은 git 이 떠서 usage 를 뱉는다 —
     // 호출자는 자기가 요청한 것과 전혀 다른 명령이 돈 줄 모른다. 생략·undefined 만
     // 빈 배열로 허용하고(`runGit({})` 를 쓰는 호출자가 있다) 나머지는 거부한다.
-    if (args !== undefined && !Array.isArray(args)) {
-      return rejected(`git 인자는 배열이어야 합니다 — ${args === null ? 'null' : typeof args} 를 받아 거부했습니다`);
-    }
+    if (args !== undefined && !Array.isArray(args)) return rejected(REASON.git_arguments_invalid, { detail: INVALID_GIT_ARGUMENTS });
     const finalArgs = args === undefined ? [] : args;
 
     // ★ length 는 여기서 **한 번만** 읽는다. 루프 조건에 두면 Proxy 의 length 트랩이
     //   매번 불리고, MAX_SAFE_INTEGER 를 내면 프로세스가 OOM 으로 abort 한다(MAX_ARGS 주석).
     const length = finalArgs.length;
-    if (!Number.isInteger(length) || length < 0) {
-      return rejected(`git 인자 배열의 length 가 정수가 아니라서 거부했습니다 (${typeof length})`);
-    }
-    if (length > MAX_ARGS) {
-      return rejected(`git 인자가 너무 많습니다 — 최대 ${MAX_ARGS}개인데 ${length}개를 받아 거부했습니다`);
-    }
+    if (!Number.isInteger(length) || length < 0) return rejected(REASON.git_arguments_invalid, { detail: INVALID_GIT_ARGUMENTS });
+    if (length > MAX_ARGS) return rejected(REASON.git_argument_count_exceeded, { limit: MAX_ARGS });
 
     // 평범한 배열로 한 번만 복사한다. 검사하는 값과 실제 argv 로 가는 값이 같은
     // 스냅샷이어야 하기 때문이다 — 원본을 두 번 읽으면 그 사이에 바뀔 수 있다.
@@ -817,7 +827,7 @@ export async function runGit(options = {}) {
     // 스폰하기 전에 거부한다 — 하드닝이 이미 무력화된 채로 프로세스를 띄우는 것보다,
     // 아예 안 띄우는 편이 안전하다. stderr 에 무엇이 왜 거부됐는지 남겨 진단 가능하게 한다.
     const rejection = screenArgs(tokens);
-    if (rejection) return rejected(rejection);
+    if (rejection) return rejected(rejection.code, rejection.params);
 
     // ★ 검사와 spawn 사이에 **await 가 없다.** 위에서 hooks 디렉터리를 함수 첫 줄에
     //   await 해 두었으므로, 여기서부터 spawn 까지는 통째로 동기 구간이다. 그래서
@@ -862,12 +872,12 @@ export async function runGit(options = {}) {
       env: childEnv,
       shell: false,
       windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [finalInput === null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
   } catch {
     // Windows 에서 잘못된 cwd 등은 동기 예외로 올 수 있다(실측: resolve-binary.mjs 의
     // .cmd EINVAL 과 같은 부류). 여기서 던지면 이 함수의 "절대 throw 안 함" 계약이 깨진다.
-    return rejected('git 인자를 검사하거나 프로세스를 띄우는 중에 예외가 났습니다 — 안전하게 거부했습니다.');
+    return rejected(REASON.git_invocation_failed);
   }
 
   // ★ `return await` 다. 그냥 `return <promise>` 로 두면 async 함수가 그 값을 thenable
@@ -896,7 +906,11 @@ export async function runGit(options = {}) {
     // 자식이 존재하지 않는 실행 파일(ENOENT)이거나 그 밖의 이유로 애초에 뜨지
     // 못했을 때 온다. 이건 "실행 자체가 안 됨" — exitCode 로는 절대 표현할 수 없다.
     child.on('error', () => {
-      settle({ ok: false, stdout, stderr, exitCode: null, failed: true, timedOut });
+      // ★ `reasonCode: null` 은 자리를 비워 두지 않겠다는 뜻이다(WS2 Task 14 수정 M7). 이 결과에
+      //   우리 코드가 없다는 사실과 필드를 실을 생각을 안 했다는 사실은 다르고, 키가 있다가
+      //   없다가 하면 읽는 쪽이 그 둘을 `in` 으로 갈라야 한다. 스폰 실패의 "왜" 는 `stderr` 와
+      //   `stderrTail` 이 나른다 — 코드는 우리가 **거부한** 자리(`rejected`)에만 붙는다.
+      settle({ ok: false, stdout, stderr, exitCode: null, failed: true, timedOut, reasonCode: null, stderrTail: stderrTail(stderr) });
     });
 
     child.stdout?.setEncoding('utf8');
@@ -907,6 +921,12 @@ export async function runGit(options = {}) {
     child.stderr?.on('data', (chunk) => {
       stderr += chunk;
     });
+    if (finalInput !== null) {
+      // EPIPE는 자식이 입력을 다 읽기 전에 자기 오류로 끝난 정상적인 실패 모양일 수 있다.
+      // stream error를 소비하고 판정 권위는 늘 child의 close/exit code에 둔다.
+      child.stdin?.on('error', () => {});
+      child.stdin?.end(finalInput);
+    }
 
     const timer = setTimeout(() => {
       timedOut = true;
@@ -931,13 +951,16 @@ export async function runGit(options = {}) {
       //   `failed: true` 인 이유: 이 봉투에는 쓸 수 있는 종료 코드가 없다. `failed:false`
       //   는 "실행됐고 exitCode 가 결과다"를 뜻하므로 여기에 쓰면 거짓말이 된다.
       hardTimer = setTimeout(() => {
+        const unkillable = `${stderr}\n${renderReason(REASON.git_process_unkillable).error}`;
         settle({
           ok: false,
           stdout,
-          stderr: `${stderr}\ngit 프로세스가 타임아웃 뒤 kill 에도 응답하지 않았습니다 — 자식이 아직 살아 있을 수 있습니다.`,
+          stderr: unkillable,
           exitCode: null,
           failed: true,
           timedOut: true,
+          reasonCode: REASON.git_process_unkillable,
+          stderrTail: stderrTail(unkillable),
         });
       }, KILL_GRACE_MS);
     }, finalTimeout);
@@ -954,6 +977,10 @@ export async function runGit(options = {}) {
         exitCode: code,
         failed: false,
         timedOut: timedOut && cutShort,
+        // 종료 코드가 0 이 아닌 것은 git 의 사실이지 우리 코드가 아니다 — 자리는 늘 있고 값이 없다.
+        reasonCode: null,
+        // ★ 발췌 재료는 **실패한 실행에만**(WS2 §3.4). 성공한 실행의 경고를 나르면 다음 실패에 붙는다.
+        stderrTail: code === 0 ? null : stderrTail(stderr),
       });
     });
   });
@@ -961,14 +988,30 @@ export async function runGit(options = {}) {
 
 // ── 저장소 사전 점검 ─────────────────────────────────────────────────────
 
-const MIN_GIT_VERSION = '2.45.1';
+export const MIN_GIT_VERSION = '2.45.1';
 const MIN_GIT_VERSION_TUPLE = [2, 45, 1];
-const GENERIC_RECOVERY = '오류 로그를 확인하거나 다시 시도하세요.';
 
-function blocked({ error, recovery, choices }) {
-  const env = { blocked: true, error, recovery: recovery && recovery !== '' ? recovery : GENERIC_RECOVERY };
-  if (Array.isArray(choices)) env.choices = choices;
-  return env;
+/** 프로브가 버전을 한 글자도 안 냈을 때 문장에 들어가는 토큰. 자리를 비울 수는 없다(정본이 던진다). */
+const UNREADABLE_VERSION = '<unknown>';
+
+/**
+ * 사전 점검이 내는 차단 봉투 하나. **문구를 받지 않는다** — 카탈로그 키가 reason code 를 정하고
+ * 그 코드가 `error`·`recovery`·`stopReason` 셋을 정한다(WS2 §3.2 · §7.2). `failure` 와
+ * `stderrTail` 은 **함께** 실린다: 발췌가 붙는 길은 `GIT_ERROR_CATALOG` 의 `excerpt: true`
+ * 하나뿐이고(EC3) 그 **재료**가 `stderrTail` 이다 — 하나만 실으면 발췌가 조용히 사라진다.
+ */
+function gitBlocked(catalogKey, params = {}, result = null) {
+  const fault = gitFault(catalogKey);
+  return fail(fault.reasonCode, params, {
+    failure: {
+      reasonCode: fault.reasonCode,
+      excerpt: fault.excerpt,
+      catalogKey: fault.catalogKey,
+      vendor: 'git',
+      exitCode: Number.isInteger(result?.exitCode) ? result.exitCode : null,
+    },
+    stderrTail: result?.stderrTail ?? null,
+  });
 }
 
 /** "git version 2.55.0.windows.3" 같은 자유형 문자열에서 major.minor.patch 를 뽑는다. */
@@ -1004,27 +1047,19 @@ function isVersionAtLeast(version, floor) {
  */
 async function checkGitVersion(overrideVersion) {
   let versionText = typeof overrideVersion === 'string' && overrideVersion !== '' ? overrideVersion : null;
+  let probe = null;
 
   if (versionText === null) {
-    const got = await runGit({ args: ['--version'] });
-    if (!got.ok) {
-      return blocked({
-        error: 'git 버전을 확인할 수 없습니다.',
-        recovery: 'git 이 PATH 에 설치되어 있고 실행 가능한지 확인하세요.',
-      });
-    }
-    versionText = got.stdout;
+    probe = await runGit({ args: ['--version'] });
+    if (!probe.ok) return gitBlocked('cli_unavailable', {}, probe);
+    versionText = probe.stdout;
   }
 
   const parsed = parseVersion(versionText);
   if (!parsed || !isVersionAtLeast(parsed, MIN_GIT_VERSION_TUPLE)) {
-    return blocked({
-      error:
-        `git 버전이 너무 낮습니다 (${versionText.trim() || '알 수 없음'}). ` +
-        `최소 git ${MIN_GIT_VERSION} 이상이 필요합니다 ` +
-        '(CVE-2024-32002: 대소문자를 구분하지 않는 파일시스템에서 심볼릭 링크 검사가 없습니다).',
-      recovery: `git 을 ${MIN_GIT_VERSION} 이상으로 업그레이드하세요.`,
-    });
+    // ★ 하한은 문장이 아니라 **인자**로 나간다 — 상수가 이 파일과 정본 두 곳에 적히면 갈린다.
+    //   버전을 못 읽었을 때는 프로브가 실제로 뱉은 것을 그대로 싣는다(추측하지 않는다).
+    return gitBlocked('version_below_floor', { version: versionText.trim() || UNREADABLE_VERSION, floor: MIN_GIT_VERSION }, probe);
   }
   return null;
 }
@@ -1036,8 +1071,8 @@ async function checkGitVersion(overrideVersion) {
  *
  * ★ 사전 점검이 조용히 제자리로 떨어지면 안 된다(§5.3). 커밋 0개 저장소에
  *   `git worktree add` 를 걸면 `fatal: invalid reference: HEAD` 로 죽는다(실측).
- *   그때 in-place 로 몰래 강등하면 사용자 파일을 직접 고치게 된다 — 그래서 이
- *   경우만은 무엇을 할지 호출자(모델)가 고르게 3지선다를 낸다.
+ *   그때 in-place 로 몰래 강등하면 사용자 파일을 직접 고치게 된다 — 그래서 이 경우만은
+ *   `git_head_unborn` 의 회복 문장이 호출자(모델)가 고를 두 길을 적는다.
  *
  * @param {string} projectPath
  * @param {{ gitVersion?: string }} [opts] gitVersion 은 테스트 주입용 — 생략하면
@@ -1045,31 +1080,21 @@ async function checkGitVersion(overrideVersion) {
  */
 export async function inspectRepo(projectPath, opts = {}) {
   if (typeof projectPath !== 'string' || projectPath === '') {
-    return blocked({
-      error: '프로젝트 경로가 비어 있습니다.',
-      recovery: '절대 경로를 지정하세요.',
-    });
+    // 경로가 아예 없으면 실을 값도 없다 — git 을 돌리지 않았으므로 카탈로그도 타지 않는다.
+    return fail(REASON.git_project_path_missing);
   }
 
   try {
     await stat(projectPath);
   } catch {
-    return blocked({
-      error: `경로를 찾을 수 없습니다: ${projectPath}`,
-      recovery: '프로젝트 경로가 올바른 절대 경로인지 확인하세요.',
-    });
+    return gitBlocked('project_path_unusable', { path: projectPath });
   }
 
   const versionBlocked = await checkGitVersion(opts?.gitVersion);
   if (versionBlocked) return versionBlocked;
 
   const gitDir = await runGit({ args: ['rev-parse', '--git-dir'], cwd: projectPath });
-  if (!gitDir.ok) {
-    return blocked({
-      error: `git 저장소가 아닙니다: ${projectPath}`,
-      recovery: '`git init` 으로 저장소를 만들거나 올바른 프로젝트 경로를 지정하세요.',
-    });
-  }
+  if (!gitDir.ok) return gitBlocked('repository_missing', { path: projectPath }, gitDir);
 
   // `--verify` 가 필수다: 빈 bare 저장소에서는 `rev-parse HEAD` 가 종료 코드 0 과
   // 함께 문자열 "HEAD" 를 그대로 출력한다(SHA 가 아니다 — 실측, git 2.55.0). `--verify`
@@ -1087,16 +1112,17 @@ export async function inspectRepo(projectPath, opts = {}) {
     //   라이브 실측으로 벤더 CLI 의 도구 권한 플래그가 델리게이트의 셸을 제한하지 못한다는
     //   것이 확인돼, 실제로 성립하는 격리가 일회용 워크트리뿐이 됐기 때문이다. 못 받는 것을
     //   권하면 호출자(모델)는 그것을 골라 한 번 더 거부당하는 막다른 길로 간다.
-    return blocked({
-      error:
-        'HEAD 가 가리키는 커밋이 없습니다 (빈 저장소이거나 unborn 브랜치입니다). 워크트리를 만들 수 없습니다.',
-      recovery: '아래 선택지 중 하나를 고르세요.',
-      choices: [
-        '커밋을 최소 1개 만든 뒤 다시 시도한다 (`git commit --allow-empty -m "init"` 도 된다)',
-        '이 저장소에서는 실행하지 않는다 — 커밋이 있는 다른 경로를 project 로 준다',
-      ],
-    });
+    // ★ 그 둘은 이제 `git_head_unborn` 의 **recovery 한 문장**이다(WS2 Task 14). 예전에는
+    //   사이트별 `choices` 배열로 얹었는데, 봉투를 만드는 어느 층도 그 필드를 나르지 않아
+    //   사용자에게는 한 번도 도달하지 않았다 — 소비자가 테스트뿐인 필드였다. 도달하는
+    //   자리(recovery)로 옮기는 것이 그 선택지를 실제로 보이게 하는 유일한 방법이다.
+    return gitBlocked('head_unborn', {}, head);
   }
 
-  return { ok: true };
+  // ★ 방금 `--verify` 로 검증한 그 SHA 를 **버리지 않는다**(WS4a 태스크 4). 프로젝트 설정은
+  //   커밋 오브젝트에서만 읽히는데(`src/project-config.mjs`), 계획을 동결하는 자리에서
+  //   알 수 있는 커밋은 이것 하나다 — 실행의 봉인 baseline 은 lane-a 워크트리가 생긴 뒤에야
+  //   존재한다. 같은 값을 부르는 쪽이 다시 물으면 그 사이에 HEAD 가 움직인 저장소에서 두
+  //   답이 갈리고, 갈린 것을 아무도 모른다.
+  return { ok: true, head: head.stdout.trim() };
 }

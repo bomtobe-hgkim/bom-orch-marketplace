@@ -1,5 +1,6 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { writeFileAtomic } from '../util/fs-atomic.mjs';
 
 const FILENAME = 'model-catalog.json';
 
@@ -68,23 +69,29 @@ async function writeOne(stateRoot, vendorId, models, now) {
   // try 는 함수 본문 전체를 덮어야 한다. 파일 접근만 감싸면 그 앞줄들이 새어나간다 —
   // new Date(NaN).toISOString() 은 RangeError 를, join(비문자열, …) 은 TypeError 를
   // 던진다. 둘 다 실제로 큐를 거부시켜 이후 모든 쓰기를 죽였다(실측).
-  let temp;
   try {
     const catalog = await readCatalog(stateRoot);
     catalog[vendorId] = { models, fetchedAt: new Date(now).toISOString() };
 
     const target = join(stateRoot, FILENAME);
     // pid 만으로는 같은 프로세스의 두 쓰기가 같은 임시 경로를 쓴다. 카운터를 붙인다.
-    temp = `${target}.${process.pid}.${tempCounter++}.tmp`;
+    // 이 이름 그대로 도우미에게 넘긴다 — 도우미는 임시 이름을 지어내지 않는다.
+    const temp = `${target}.${process.pid}.${tempCounter++}.tmp`;
 
     await mkdir(stateRoot, { recursive: true });
-    await writeFile(temp, JSON.stringify(catalog, null, 2), 'utf8');
-    await rename(temp, target);
-    return true;
+    // `fsync:false` 는 명시 옵트아웃이다: 「캐시는 최적화이지 정확성 요건이 아니다」(아래
+    // catch 와 readCatalog 가 같은 문장을 쓴다). 쓰기마다 +1.3ms 를 낼 이유가 없다.
+    // `exclusive:false` 도 오늘 동작 그대로다 — `<pid>.<카운터>` 이름은 죽은 프로세스가
+    // 남긴 고아와 겹칠 수 있고, 거기서 'wx' 로 막으면 사람이 그 파일을 지울 때까지 모델
+    // 목록 갱신이 조용히 멈춘다.
+    const written = await writeFileAtomic(target, Buffer.from(JSON.stringify(catalog, null, 2), 'utf8'), {
+      tempPath: temp, fsync: false, exclusive: false,
+    });
+    return written.ok;
   } catch {
     // 읽기와 같은 이유로 삼킨다: 캐시는 최적화이지 정확성 요건이 아니다. 여기서
     // 던지면 await 없이 부른 호출부에서 처리되지 않은 거부가 되어 프로세스가 죽는다.
-    if (temp !== undefined) await rm(temp, { force: true }).catch(() => {});
+    // (임시 파일 치우기는 도우미가 성공·실패 양쪽에서 스스로 한다.)
     return false;
   }
 }

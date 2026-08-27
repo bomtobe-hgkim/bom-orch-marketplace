@@ -1,5 +1,11 @@
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { runGit } from './git.mjs';
+import { confidenceOfScope } from './confidence.mjs';
+import { REASON } from './reason-codes.mjs';
+import { fail, renderNotice, renderReason } from './reason-text.mjs';
+import { TEST_RUNNER_CONFIG_NAMES, isTestCommandConfigPath } from './test-discovery.mjs';
+import { allowlistVerdict } from './scope-allowlist.mjs';
+import { clipPlain } from './util/strings.mjs';
 
 /**
  * 델리게이트가 돌려보내는 패치의 **범위**를 기계적으로 검사한다 (S3c · S4).
@@ -35,14 +41,24 @@ import { runGit } from './git.mjs';
  * 구현하지 않는다.
  *
  * **차단 목록은 열거이고 열거는 뒤처진다.** 못 막는 것을 아래 [[잔여 위험]] 에 적어 둔다.
+ *
+ * ★ 실측 폐포: **25개 모듈 / 10,236줄**(자기 자신 949 포함). WS5 T3 의 정본 수입(스펙 §0 D3)이 여섯
+ *   모듈 / 2,772줄을 더했다(그 전은 10개 모듈 / 4,801줄) — `test-discovery` 와 그것이 끄는
+ *   `deps-provision`·`deadline`·`providers/child-env`·`project-config`·`util/errors`. 그 값으로
+ *   산 것은 「테스트 명령 설정 파일 목록이 두 곳에 있지 않다」이고, 값이 비싸다고 판단되면 되돌리는
+ *   길은 그 목록을 **잎으로 빼는 것**이지 여기 베끼는 것이 아니다(베끼면 목록이 둘이 된다).
+ *   저장소 모듈도 `engine` 도 **0개**이고, 그것을 `test/guards/module-directions.test.mjs` 의
+ *   방향 표가 잰다. T3 재심 N1–N3 수정 파도(올림, 실측): 자기 자신 763 -> 785(+22 — `gradlew.bat`
+ *   표지 한 줄과 N1·N3 의 정정/기록 주석), `test-discovery` 도 25줄 늘어 폐포 총합은 7,688 ->
+ *   7,735(+47 = 22 + 25). WS5 T2(올림, 실측): 자기 자신 785 -> 905 이고 모듈 하나가 늘었다 —
+ *   `src/scope-allowlist.mjs`(169, 상대 import 0 인 잎). 폐포 7,735 -> **8,031**
+ *   (+296 = 120 + 169 + 7 — 끝 항은 `reason-text` 의 알림 둘이다. 이 줄은 T2 가 +289 라고 적어
+ *   위 표지 문장과 7 만큼 어긋나 있었고, T2 리뷰 M2 가 그것을 잡았다). T2 리뷰 C1 수정(올림,
+ *   실측): 그 잎이 169 -> 203 이다 — 세그먼트 안 매칭의 백트래킹 정규식을 `**` 층과 **같은**
+ *   선형 DP 로 바꿨다. 자기 자신도 905 -> 909(이 정정 문장 넉 줄)라 폐포는 8,031 -> 8,069 다.
+ *   그 잎이 **매칭만** 알고 표지 목록을 모르는 것이 이 수의 값이다: 매처가 표지를 알게 되면
+ *   등급 배분이 두 곳에서 정해지고, 그것이 T1·T3 이 두 번 막은 실패다.
  */
-
-const GENERIC_RECOVERY = '오류 로그를 확인하거나 다시 시도하세요.';
-
-/** 이 모듈의 실패 봉투. `src/git.mjs`·`src/worktree.mjs` 의 `blocked()` 와 같은 모양이다. */
-function blocked(error, recovery) {
-  return { blocked: true, error, recovery: recovery && recovery !== '' ? recovery : GENERIC_RECOVERY };
-}
 
 /** 인덱스 조회의 시간 상한. 큰 저장소의 `ls-files` 를 감안해 runGit 기본값보다 넉넉하다. */
 const GIT_TIMEOUT_MS = 120_000;
@@ -54,11 +70,182 @@ const GIT_TIMEOUT_MS = 120_000;
  */
 const MAX_REASONS = 100;
 
-/** recovery 에 이름을 그대로 적어 줄 경로의 개수. */
-const RECOVERY_SAMPLE = 5;
+/**
+ * 사유 하나가 들 수 있는 `rule` 의 **전부**. 이 모듈이 짓는 것이 정본이다.
+ *
+ * ★★ export 하는 이유는 봉투 쪽에 있다. `src/content-projection.mjs` 가 `rule` 을 **열거로
+ *   검증**한다(WS2 스펙 §4). 그 열거를 저쪽에 손으로 베껴 두면, 여기에 규칙 하나가 늘어난 날
+ *   봉투는 그 사유를 **조용히 통째로 버린다** — 붉어지는 자리 없이. 한 곳에서 태어나게 하고
+ *   `test/patch-scope.test.mjs` 가 이 목록과 소스의 `rule:` 리터럴을 대조한다.
+ */
+export const SCOPE_RULES = Object.freeze([
+  'package-baseline-missing',
+  'package-baseline-unreadable',
+  'package-scripts',
+  'package-unreadable',
+  'sensitive-path',
+  'short-name',
+  'symlink-escape',
+  'symlink-unreadable',
+]);
 
 /**
- * 경로 **세그먼트** 어디에 나타나도 걸리는 디렉터리 이름 (소문자 비교).
+ * 표지의 **등급** 둘. `SCOPE_RULES` 와 마찬가지로 이 모듈이 짓는 것이 정본이다 (WS5 스펙 §0 D1).
+ *
+ *   `hard`       적용 뒤 **명령이 도는** 자리와, **어떤 테스트 명령이 도는지를 정하는** 설정.
+ *                허용목록으로 지울 수 없는 등급이다 — 그 규칙의 정본은
+ *                `contract/project-config.schema.json` 의 `scope.allow` 설명이고, 그것을
+ *                실제로 강제하는 입구는 WS5 T2 가 짓는다.
+ *   `allowable`  lockfile 열. 위험이 없어서가 아니라(아래 lockfile 주석) 그 위험이 **다음
+ *                install 에서만** 발화하고 그 install 이 이 파이프라인에 없어서다 — 워커에게
+ *                Bash 가 없고 `src/test-runner.mjs` 는 의존성을 설치하지도 링크하지도 않는다
+ *                (둘 다 실측). 그래서 사람이 보고 판단할 수 있는 등급이다.
+ *
+ * ★★ 등급은 `rule` 을 **가르지 않는다.** `rule` 은 봉투가 열거로 검증하는 값이라(위 ★★)
+ *   `sensitive-path` 를 둘로 쪼개면 그 열거를 읽는 소비자가 전부 같은 날 바뀌어야 한다.
+ *   등급은 「무엇에 걸렸나」가 아니라 「사람이 지울 수 있나」라서 **직교하는 축**이고,
+ *   그래서 자기 필드(`tier`)로 낸다.
+ * ★ 등급은 여기서 **결과를 바꾸지 않는다.** 오늘은 두 등급 다 `flagged` 이고 `disputed` 다
+ *   (`confidenceOfScope` 는 `{flagged}` 하나만 받는 채로 둔다 — 스펙 §0 D2). 허용 등급이
+ *   실패를 면하는 컷은 상류 셋에서 T4 가 짓는다. 여기서 먼저 면제하면 릴리스 하나가
+ *   조용히 정책을 바꾼 것이 된다.
+ */
+export const SCOPE_TIERS = Object.freeze(['hard', 'allowable']);
+
+/**
+ * 하드 등급 **안**의 둘째 축: 프로젝트가 인수할 수 있는 표지 (WS5 스펙 §0 D1a).
+ *
+ * 여기 든 넷은 허용목록이 **경로를 명시했을 때만** 통과한다. 나머지 하드는 전부 **승격 불가
+ * 코어**이고 어떤 허용목록으로도 지워지지 않는다. 스펙의 전수 배치가 이 목록이다:
+ *
+ *   `.vscode` `.claude` `.devcontainer`   편집기·에이전트·컨테이너 설정 디렉터리
+ *   `.devcontainer.json`                   같은 류의 루트 파일형(그 셋과 한 부류다)
+ *
+ * ★ 왜 이 넷만인가: 위험이 **사용자 소유의 로컬 도구 실행**이다 — 그 도구를 켜는 사람과 이
+ *   프로젝트를 여는 사람이 같으므로 프로젝트가 「우리는 이 디렉터리를 편집한다」를 선언하면 그
+ *   판단은 그 사람의 것이다. 코어는 다르다: CI 다섯과 `.husky` 는 **다른 사람의 기계**(러너·
+ *   커밋하는 동료)에서 돌고, `.git` 은 저장소 내부이며, 셸 rc·`.npmrc` 계열·`.mcp.json`·빌드
+ *   설정·`.bom-orch.json`·테스트 명령 설정은 「무엇이 도는지」 자체를 정한다.
+ * ★ gap 13 의 소음(플래그 56 중 37이 `.claude`)을 줄이는 축이 이것뿐이다 — 그 열 개를 통째로
+ *   `allowable` 로 내리면 CI 도 같이 내려간다(등급은 부류가 아니라 한 값이다).
+ *
+ * ★★ 승격은 **표지의 축이지 경로의 허가증이 아니다.** 같은 표지에 걸린 경로라도 그 경로가
+ *   테스트 명령 설정 정본(D3)이면 승격이 **철회된다** — `.claude/Makefile` 이 그 모양이다.
+ *   그 자리가 `promotableAt` 이고, 그것이 T3 §5-(2)의 「매치 시점에도 술어를 걸어라」를 이행하는
+ *   자리다: 어떤 글롭이 그 경로를 덮더라도 승격이 없으면 지워지지 않는다.
+ */
+const PROMOTABLE_MARKERS = new Set(['.vscode', '.claude', '.devcontainer', '.devcontainer.json']);
+
+/**
+ * 이 표지에 이 경로가 걸렸을 때 승격 가능한가. 사유에 얹을 **조각**을 낸다(아니면 빈 객체).
+ *
+ * ★ 참일 때만 키를 싣는다. 집계 `hardViolation` 과 반대인 이유는 방향이다 — 부재가 여기서는
+ *   **닫는 쪽**이다(승격 안 됨 = 안 지워짐). 축을 아무도 말하지 않은 새 표지는 남는다.
+ */
+function promotableAt(marker, path) {
+  if (!PROMOTABLE_MARKERS.has(marker)) return {};
+  if (isTestCommandConfigPath(path)) return {};
+  return { promotable: true };
+}
+
+/**
+ * 허용목록(`scope.allow` ∪ 호출 인자)이 **이름 부를 수 없는** 항목을 고른다 — 테스트 명령 설정
+ * 파일이다(스펙 §0 D3, 종료 기준 EC-5). T2 의 허용목록 검증이 이 함수를 부른다.
+ *
+ * ★★ 목록은 여기서 짓지 않는다. 정본은 `src/test-discovery.mjs` 가 export 하고 이 파일은 그것을
+ *   **받는다**(D3). 유도의 입력(`Makefile` · pytest 설정 넷 · MSBuild 설정 · `node_modules/.bin` …)을
+ *   여기 베껴 두면 갈래가 하나 늘어난 날 조용히 낡는다 — `SCOPE_RULES` 가 위 ★★ 에서 적은 것과
+ *   같은 실패다.
+ * ★ 문구를 만들지 않고 **사실만** 낸다. 봉투 문장의 정본은 `src/reason-text.mjs` 이고(WS2 §7.2)
+ *   이 거부를 봉투에 싣는 자리는 허용목록 검증기(T2)다 — 여기서 문장을 지으면 같은 사실이 두
+ *   문장으로 갈린다.
+ * ★ 던지지 않는다. 목록이 아니거나 원소가 문자열이 아닌 것은 **모양**의 문제이고 그것은 스키마와
+ *   검증기가 이미 보는 축이다.
+ *
+ * ⚠ **이 관문이 보안 경계는 아니다.** 부분 와일드카드(`Make*` · `pytest.*`)는 여기서 안 걸리고,
+ *   Windows 에서는 `Make*` 가 `MAKEFI~1` 별칭까지 덮을 수 있다. 매처(T2)는 그 사실을 알지만 실제
+ *   패치 경로의 8.3 모양은 `short-name` 하드 등급이 막고, 정본과 겹치는 나머지 표지도 전부 `hard` 다.
+ *   그 맞물림은 `test/patch-scope.test.mjs` 의 EC-5 둘이 잰다. 이 함수가 얹는 것은 정직함 하나다 —
+ *   **이름으로 부른 것은 즉시 거부하고 그 사실을 말한다.**
+ *
+ * @param {unknown} allow 허용목록 항목들(POSIX 글롭 문자열)
+ * @returns {{entry: string, path: string}[]} 거부된 항목. 빈 배열이면 이 축에서 거부할 것이 없다.
+ */
+export function rejectTestCommandConfigAllow(allow) {
+  return refuseAllowEntries(allow, (path) => isTestCommandConfigPath(path));
+}
+
+/**
+ * 같은 관문의 **형제**: 항목이 승격 불가 하드 코어 표지를 이름 부르는가 (WS5 스펙 §0 D1a).
+ *
+ * T3 은 하드 코어의 **D3 조각**(테스트 명령 설정)만 냈고 CI 다섯 · `.husky` · `.git` · 셸 rc ·
+ * `.npmrc` 계열 · `.mcp.json` · 빌드 설정은 「허용목록이 이름 부를 수 있나」를 말하는 자리가
+ * 없었다(T3 §5-(3), C3). 이 함수가 그 자리다. 위 함수와 **한 모양**(`{entry, path}`)인 것이
+ * 요점이다 — 사용자에게는 한 가지 사실이기 때문이다: 「이 항목이 부른 것은 보안 하드 리스트라
+ * 무시된다」(`contract/project-config.schema.json` 의 `scope.allow` 설명 그대로).
+ *
+ * ⚠ 위 함수와 같은 한계다: 와일드카드가 든 세그먼트(`.git*` 로 시작하는 글롭)는 여기서 안 걸리고,
+ *   그래도 지워지지 않는 것은 등급이 막기 때문이다(`promotableAt` 이 승격을 안 준다).
+ */
+export function rejectHardCoreAllow(allow) {
+  return refuseAllowEntries(allow, hardCoreMarkerIn);
+}
+
+/**
+ * 허용목록이 이름 부를 수 없는 항목 **전부**(위 둘의 합집합, 항목 기준 중복 제거).
+ * 호출부(엔진)는 이것 하나만 부르고 문구는 `NOTICE_TEXT.scope_allow_hard_list_ignored` 가 짓는다.
+ */
+export function refusedScopeAllow(allow) {
+  // 순서는 **사용자가 준 순서**다. 두 술어의 결과를 이어 붙이면 같은 목록이 부류별로 재배열되고,
+  // 알림을 읽는 사람은 자기가 쓴 파일에서 그 항목을 찾을 수 없게 된다.
+  const seen = new Set();
+  const refused = [];
+  for (const one of refuseAllowEntries(allow, (path) => isTestCommandConfigPath(path) || hardCoreMarkerIn(path) !== null)) {
+    // 접은 철자로 센다 — `.npmrc` 와 `./.npmrc` 는 한 항목이고 문장에 두 번 실릴 이유가 없다.
+    if (seen.has(one.path)) continue;
+    seen.add(one.path);
+    refused.push(one);
+  }
+  return refused;
+}
+
+/** 위 셋이 공유하는 걸음 — 접기와 「던지지 않는다」가 한 자리에 있어야 두 관문이 안 갈린다. */
+function refuseAllowEntries(allow, refuses) {
+  if (!Array.isArray(allow)) return [];
+  const rejected = [];
+  for (const entry of allow) {
+    if (typeof entry !== 'string' || entry === '') continue;
+    // 앞의 `./` 와 뒤의 `/` 는 진단·중복 제거에서 같은 경로로 적는다. 실제 거절은 `refuses` 가 정한다.
+    const path = entry.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+    if (refuses(path)) rejected.push({ entry, path });
+  }
+  return rejected;
+}
+
+/**
+ * 이 경로가 승격 불가 하드 코어 표지에 걸리는가 — 걸리면 그 표지 이름, 아니면 null.
+ *
+ * `inspectPath` 와 **같은 규칙**으로 본다(모든 세그먼트에서 디렉터리 표지, 마지막 세그먼트에서
+ * 파일 표지, 대소문자 접기). 두 걸음이 갈리면 「플래그되는데 거부는 안 되는」 항목이 생긴다.
+ */
+function hardCoreMarkerIn(path) {
+  const segments = segmentsOf(path);
+  const core = (name) => !PROMOTABLE_MARKERS.has(name);
+  for (const segment of segments) {
+    const folded = segment.toLowerCase();
+    if (SENSITIVE_DIR_SEGMENTS.get(folded) === 'hard' && core(folded)) return folded;
+  }
+  const last = segments.length > 0 ? segments[segments.length - 1].toLowerCase() : '';
+  return SENSITIVE_FILE_NAMES.get(last) === 'hard' && core(last) ? last : null;
+}
+
+/**
+ * 경로 **세그먼트** 어디에 나타나도 걸리는 디렉터리 이름 -> 등급 (소문자 비교).
+ *
+ * **열 개 전부 `hard` 다**(스펙 §0 D1). 근거는 새로 짓지 않았다 — 아래 목록이 각각을
+ * "적용 뒤의 실행에서 명령이 도는 자리" 로 이미 분류해 두었고, 그 문장이 곧 하드의 정의다.
+ * 로드맵 §2 `:80` 의 「CI 설정 → 허용」은 스펙이 뒤집었다: `.github/workflows` 가 곧 CI
+ * 설정이라 그 문장은 자기모순이었다.
  *
  * 전부 "적용 뒤의 실행에서 명령이 도는" 자리다:
  *   `.github`      workflows·actions — 다음 CI 실행
@@ -80,41 +267,48 @@ const RECOVERY_SAMPLE = 5;
  *   결과를 받는 쪽이 바로 Claude Code 다. under-flag 는 구멍이고 over-flag 는 소음이라
  *   기본값은 안전한 쪽으로 둔다. 빈도를 줄이는 것은 배선 계층의 표시 방식이 정할 문제다.
  */
-const SENSITIVE_DIR_SEGMENTS = new Set([
-  '.github',
-  '.gitlab',
-  '.circleci',
-  '.husky',
-  '.devcontainer',
-  '.vscode',
-  '.git',
-  '.claude',
-  '.gitea',
-  '.forgejo',
+const SENSITIVE_DIR_SEGMENTS = new Map([
+  ['.github', 'hard'],
+  ['.gitlab', 'hard'],
+  ['.circleci', 'hard'],
+  ['.husky', 'hard'],
+  ['.devcontainer', 'hard'],
+  ['.vscode', 'hard'],
+  ['.git', 'hard'],
+  ['.claude', 'hard'],
+  ['.gitea', 'hard'],
+  ['.forgejo', 'hard'],
 ]);
 
 /**
- * 마지막 세그먼트(= 파일 이름)가 이것이면 걸린다 (소문자 비교). 중첩 경로에서도 본다 —
+ * 마지막 세그먼트(= 파일 이름)가 이것이면 걸린다 -> 등급 (소문자 비교). 중첩 경로에서도 본다 —
  * `packages/ui/.npmrc` 는 npm 이 실제로 읽는 자리이고 루트의 것과 위험이 같다.
+ *
+ * 등급은 부류마다 한 덩어리다(스펙 §0 D1). **`allowable` 은 lockfile 열뿐**이고 나머지 서른넷은
+ * 전부 `hard` 다 — 각 부류의 근거는 그 부류 위의 주석이 이미 적어 둔 문장 그대로다.
+ *
+ * ★ 이 열거가 표지의 **전부는 아니다.** 아래 `SENSITIVE_FILE_NAMES` 가 여기에 러너 설정
+ *   (정본이 계산해 준 이름들)을 더한다 — 그쪽은 이 파일이 짓지 않는다.
  */
-const SENSITIVE_FILE_NAMES = new Set([
-  // CI 정의
-  '.gitlab-ci.yml',
-  '.gitlab-ci.yaml',
-  'azure-pipelines.yml',
-  'azure-pipelines.yaml',
-  'jenkinsfile',
-  '.travis.yml',
-  'appveyor.yml',
-  '.appveyor.yml',
-  'bitbucket-pipelines.yml',
-  // 패키지 매니저 — install 시점에 스크립트·레지스트리·자격증명이 걸린다
-  '.npmrc',
-  '.yarnrc',
-  '.yarnrc.yml',
-  '.pnpmfile.cjs',
-  '.pypirc',
-  'nuget.config',
+const SENSITIVE_FILE_LITERALS = new Map([
+  // CI 정의 — 다음 CI 실행에서 명령이 돈다. 전부 하드다(로드맵 §2 `:80` 을 스펙이 뒤집었다).
+  ['.gitlab-ci.yml', 'hard'],
+  ['.gitlab-ci.yaml', 'hard'],
+  ['azure-pipelines.yml', 'hard'],
+  ['azure-pipelines.yaml', 'hard'],
+  ['jenkinsfile', 'hard'],
+  ['.travis.yml', 'hard'],
+  ['appveyor.yml', 'hard'],
+  ['.appveyor.yml', 'hard'],
+  ['bitbucket-pipelines.yml', 'hard'],
+  // 패키지 매니저 — install 시점에 스크립트·레지스트리·자격증명이 걸린다. 여기 적힌 것이
+  // **어떤 명령이 무엇을 받아 도는지**를 정하므로 하드다.
+  ['.npmrc', 'hard'],
+  ['.yarnrc', 'hard'],
+  ['.yarnrc.yml', 'hard'],
+  ['.pnpmfile.cjs', 'hard'],
+  ['.pypirc', 'hard'],
+  ['nuget.config', 'hard'],
   // lockfile — 설계 §5.8:387 이 차단 목록에 명시했는데 코드에서 빠져 있었다(실측:
   // `package-lock.json`·`yarn.lock`·`pnpm-lock.yaml`·`Cargo.lock` 넷 전부
   // flagged=false). 잠긴 URL·integrity 를 바꾸면 다음 install 이 공격자 tarball 을
@@ -129,43 +323,98 @@ const SENSITIVE_FILE_NAMES = new Set([
   //   암묵적 restore 를 돌리고, `RestorePackagesWithLockFile` 을 켠 프로젝트에서는 그
   //   restore 가 그 파일을 다시 쓴다 — 우리가 한 일로 사용자의 실행을 disputed 로
   //   강등하게 된다. 대신 아래 [[잔여 위험]] 에 적는다.
-  'package-lock.json',
-  'npm-shrinkwrap.json',
-  'yarn.lock',
-  'pnpm-lock.yaml',
-  'bun.lockb',
-  'cargo.lock',
-  'poetry.lock',
-  'gemfile.lock',
-  'composer.lock',
-  'go.sum',
-  // 셸 rc — 다음 대화형 셸에서 발화한다
-  '.bashrc',
-  '.bash_profile',
-  '.bash_login',
-  '.bash_logout',
-  '.profile',
-  '.zshrc',
-  '.zshenv',
-  '.zprofile',
-  '.zlogin',
-  '.kshrc',
-  '.cshrc',
-  '.envrc', // direnv — 디렉터리에 들어가는 것만으로 실행된다
-  // 빌드 시스템이 자동으로 읽는 설정
-  'directory.build.props',
-  'directory.build.targets',
-  'directory.build.rsp',
-  'directory.packages.props',
+  //
+  // ★★ **이 열이 `allowable` 등급의 전부다**(스펙 §0 D1). 위험이 작아서가 아니라 — 위 문단이
+  //   적은 대로 다음 install 이 공격자 tarball 을 가져온다 — 그 install 이 **이 파이프라인에
+  //   없기** 때문이다(바로 위 문단의 실측 둘). 즉 여기 걸린 변경은 「지금 명령이 돌게 되는
+  //   것」이 아니라 「나중에 사람이 install 을 할 때 돌게 되는 것」이라, 사람이 보고 판단할
+  //   자리가 남아 있다. 다른 표지에는 그 자리가 없다.
+  ['package-lock.json', 'allowable'],
+  ['npm-shrinkwrap.json', 'allowable'],
+  ['yarn.lock', 'allowable'],
+  ['pnpm-lock.yaml', 'allowable'],
+  ['bun.lockb', 'allowable'],
+  ['cargo.lock', 'allowable'],
+  ['poetry.lock', 'allowable'],
+  ['gemfile.lock', 'allowable'],
+  ['composer.lock', 'allowable'],
+  ['go.sum', 'allowable'],
+  // 셸 rc — 다음 대화형 셸에서 **명령이 돈다**. 하드다.
+  ['.bashrc', 'hard'],
+  ['.bash_profile', 'hard'],
+  ['.bash_login', 'hard'],
+  ['.bash_logout', 'hard'],
+  ['.profile', 'hard'],
+  ['.zshrc', 'hard'],
+  ['.zshenv', 'hard'],
+  ['.zprofile', 'hard'],
+  ['.zlogin', 'hard'],
+  ['.kshrc', 'hard'],
+  ['.cshrc', 'hard'],
+  ['.envrc', 'hard'], // direnv — 디렉터리에 들어가는 것만으로 실행된다
+  // 빌드 시스템이 자동으로 읽는 설정 — 다음 빌드에서 명령이 돈다. 하드다.
+  ['directory.build.props', 'hard'],
+  ['directory.build.targets', 'hard'],
+  ['directory.build.rsp', 'hard'],
+  ['directory.packages.props', 'hard'],
   // 이 서버의 호출자
-  '.mcp.json',
+  ['.mcp.json', 'hard'],
+  // ★ 이 서버의 **프로젝트 설정**(로드맵 §3.6 / WS0 §5). 여기에 적힌 `tests.command` 가
+  //   실행될 명령이 되고 `tests.reporter` 가 신뢰 증거 어댑터를 고른다 — 즉 이 파일을 고치는
+  //   것은 `scripts.test` 를 고치는 것과 **같은 힘**이다. 그래서 같은 취급을 한다.
+  //   `src/project-config.mjs` 는 이 파일을 커밋 오브젝트에서만 읽어 워커가 쓴 사본이
+  //   명령을 정할 수 없게 하고, 이 줄은 그 위에 「고친 흔적이 있으면 사람이 본다」를 얹는다.
+  //   ★ **허용목록으로 지울 수 없다** — 이 줄은 하드 코어(테스트 명령 설정, 스펙 §0 D1a)이고,
+  //     하드 코어는 어떤 허용목록으로도 통과하지 않는다. 그 경로 목록의 정본은 이 파일이 아니라
+  //     `src/test-discovery.mjs` 가 export 하고(D3) 위 `rejectTestCommandConfigAllow` 가 받는다.
+  //   ⚠ 예전 판은 그 근거를 「`inspectPatch` 에는 플래그를 지우는 입구가 없다」라고 적었다. 그
+  //     문장은 T2 가 그 입구를 뚫는 날 거짓이 되고, 그러면 이 줄의 근거가 통째로 사라진다 —
+  //     근거는 입구의 **부재**가 아니라 **등급**이다. 그래서 지금 다시 썼다.
+  ['.bom-orch.json', 'hard'],
   // Dev Containers 의 공식 설정 위치는 셋이다:
   //   .devcontainer/devcontainer.json · .devcontainer/<folder>/devcontainer.json · 루트 .devcontainer.json
   // 앞의 둘은 위 SENSITIVE_DIR_SEGMENTS 의 `.devcontainer` 가 잡지만, 루트 형태는 세그먼트가
   // `.devcontainer.json` 하나뿐이라 안 걸렸다. 실측: 델리게이트의 Write 한 번으로
   // `{"initializeCommand": …}` 를 심었더니 flagged=false 로 통과하고 git apply 가 exit 0 으로
   // 사용자 저장소 루트에 떨어뜨렸다. `initializeCommand` 는 컨테이너가 아니라 호스트에서 돈다.
-  '.devcontainer.json',
+  //
+  // ⚠ 메모 §A.1 은 이 목록을 **43** 으로 셌지만 같은 칸의 열거(9+6+10+12+4+3)는 44 다. 빠진
+  //   하나가 이 줄이고, 스펙 §0 D1 의 「허용 = lockfile 열뿐」이 그것을 하드로 닫는다.
+  ['.devcontainer.json', 'hard'],
+]);
+
+/**
+ * 파일 이름 표지의 **정본** = 위 열거 ∪ **러너 설정**(`jest.config.*` · `vitest/vite.config.*` ·
+ * `nextest.toml` · `build.gradle(.kts)` · `gradlew`·`gradlew.bat` · `pom.xml`).
+ *
+ * ★★ 뒤쪽 목록은 여기서 짓지 않는다 — `src/test-discovery.mjs` 가 **발견이 실제로 읽는 이름들에서
+ *   계산해** 내보내는 것(`TEST_RUNNER_CONFIG_NAMES`)을 받는다. 위 `rejectTestCommandConfigAllow`
+ *   가 정본을 받는 것과 같은 이유이고, 같은 사실의 두 면이라 **한 원천에서 와야 한다**: 표지가
+ *   플래그를 세우고 정본이 「허용목록이 그것을 지울 수 없다」를 세운다. 둘이 갈리면 허용목록이
+ *   지울 수 있는 러너 설정이 생기고, 그때 종료 기준 EC-5 는 거부 술어가 초록인 채로 거짓이 된다.
+ * ★ 전부 `hard` 다(D1/D1a). **`vite.config.*` 넷을 뺀 나머지**는 어떤 테스트 명령이 무엇을
+ *   실행하는지를 정하므로 `.bom-orch.json` 과 같은 힘이다 — 후보가 `jest.config.js` 의
+ *   `testMatch` 를 좁히면 자기 증명이 통과할 스위트를 자기가 고른 것이 된다.
+ * ⚠ **`vite.config.*` 는 그 문장이 거짓인 채로 하드다(T3 재심 N1, 조정자 채택 — KEEP, 비용은
+ *   기록).** 그것은 빌드 도구 설정이라 후보가 alias·plugin·build target·dev server 때문에
+ *   **정당하게 계속 고치는 파일**이고, vitest 가 그것을 읽는 것은 vitest.config 가 없을 때의
+ *   fallback 뿐이다. 그런데 패치 하나만 보는 이 검사는 그 프로젝트가 vitest 를 쓰는지 알 방법이
+ *   없다(context-free) — vitest 를 쓰는 프로젝트에서 열어 두면 관문이 그 파일로 우회되므로 안전한
+ *   쪽(하드)을 택했다. 비용은 순수 Vite 프로젝트의 평범한 편집이 지울 수 없는 disputed 가 되는
+ *   것 — `package.json` 이 이미 기록한 것과 같은 실패 모양이고(아래 `inspectPackageScripts` 의
+ *   WHY, 「거의 모든 JS 작업이 disputed」), 반경만 작다. 전체 논증은
+ *   `src/test-discovery.mjs` 의 `TEST_RUNNER_CONFIG_NAMES` WHY — 정본이 여기서 짓지 않는 것과
+ *   같은 이유로 이 논증도 저기서 짓는다.
+ *
+ * 허용 등급은 「나중에 사람이 install 할 때 발화한다」는 lockfile 열의 성질(위 ★★)로 정의되는데,
+ * 여기 걸린 변경은 **다음 실행에서 바로** 발화한다.
+ * ⚠ 겹치면 하드가 이긴다(뒤가 이기는 spread). 오늘 겹치는 이름은 **0** 이고, 겹치는 날 그 사실을
+ *   `test/patch-scope.test.mjs` 의 D1 표가 붉게 말한다 — 그때 배분을 다시 판단해야 하는 것은
+ *   등급이 아니라 「그 이름이 왜 두 목록에 다 있나」다.
+ */
+const SENSITIVE_FILE_NAMES = new Map([
+  ...SENSITIVE_FILE_LITERALS,
+  ...TEST_RUNNER_CONFIG_NAMES.map((name) => [name, 'hard']),
 ]);
 
 /**
@@ -230,19 +479,18 @@ function inspectPath(path) {
   for (const segment of segments) {
     const folded = segment.toLowerCase();
     if (SENSITIVE_DIR_SEGMENTS.has(folded)) {
-      found.push({ path, rule: 'sensitive-path', detail: `경로 세그먼트 '${segment}' 는 적용 뒤에 명령이 도는 자리입니다.` });
+      found.push({ path, rule: 'sensitive-path', tier: SENSITIVE_DIR_SEGMENTS.get(folded), ...promotableAt(folded, path), detail: renderNotice('scope_sensitive_segment', { segment }) });
     }
     if (looksLikeShortName(segment)) {
-      found.push({
-        path,
-        rule: 'short-name',
-        detail: `세그먼트 '${segment}' 가 Windows 8.3 단축 이름 모양입니다 — 적용하는 저장소에서 다른 긴 이름으로 풀릴 수 있습니다.`,
-      });
+      // ★ 8.3 별칭은 **어떤 긴 이름으로 풀릴지 여기서 알 수 없다**(위 `SHORT_NAME_BASE` 머리말).
+      //   `GITHUB~1` 이 `.github` 로 풀리는 것이 실측된 공격이므로 등급은 가장 무거운 쪽으로
+      //   둔다 — 모르는 것을 허용 등급으로 부르면 그 무지가 곧 우회로가 된다.
+      found.push({ path, rule: 'short-name', tier: 'hard', detail: renderNotice('scope_short_name_segment', { segment }) });
     }
   }
 
   if (SENSITIVE_FILE_NAMES.has(last)) {
-    found.push({ path, rule: 'sensitive-path', detail: `'${segments[segments.length - 1]}' 는 도구가 자동으로 읽는 설정 파일입니다.` });
+    found.push({ path, rule: 'sensitive-path', tier: SENSITIVE_FILE_NAMES.get(last), ...promotableAt(last, path), detail: renderNotice('scope_sensitive_file', { name: segments[segments.length - 1] }) });
   }
   return found;
 }
@@ -274,7 +522,7 @@ function inspectPath(path) {
  *   때문이지 그것만 낼 수 있어서가 아니다.
  *
  * ★ **`-z` 가 필수다.** `ls-files -s` 의 기본 출력은 비 ASCII 경로를 C-인용한다
- *   (`src/worktree.mjs` 의 `collectGitlinks` 가 같은 축을 기록해 뒀다). 인용된 문자열은
+ *   (`src/worktree-patch.mjs` 의 `collectGitlinks` 가 같은 축을 기록해 뒀다). 인용된 문자열은
  *   `files` 의 원시 경로와 절대 일치하지 않아 대조가 통째로 no-op 이 된다.
  */
 async function listIndexEntries({ run, worktree }) {
@@ -336,6 +584,31 @@ function changedScriptKeys(before, after) {
   return changed.sort();
 }
 
+/** baseline의 package.json 하나를 「없음」과 「못 읽음」으로 갈라 읽는다. */
+async function readBaselinePackage({ run, worktree, baseline, path }) {
+  // `cat-file <tree>:<path>` 비0만 보면 경로 부재와 tree/blob 손상을 구별할 수 없다. 먼저
+  // tree 항목을 이름으로 찾고, 존재한다면 그 OID를 따로 읽는다. 두 Git 호출 사이에 객체가
+  // 회수돼도 둘째 실패가 unreadable로 닫힌다. literal pathspec은 파일명이 pathspec 문법처럼
+  // 생겨도 다른 항목을 대신 읽지 않게 한다.
+  const listed = await run({
+    args: ['ls-tree', '-z', '--full-tree', baseline, '--', `:(literal)${path}`],
+    cwd: worktree,
+    timeoutMs: GIT_TIMEOUT_MS,
+  });
+  if (!listed.ok || typeof listed.stdout !== 'string') return { ok: false };
+  const records = listed.stdout.split('\0').filter((record) => record !== '');
+  if (records.length === 0) return { ok: true, text: null };
+  if (records.length !== 1) return { ok: false };
+  const tab = records[0].indexOf('\t');
+  const [mode, type, oid] = tab === -1 ? [] : records[0].slice(0, tab).split(' ');
+  const named = tab === -1 ? '' : records[0].slice(tab + 1);
+  if (!/^\d{6}$/.test(mode ?? '') || type !== 'blob' || !/^[0-9a-f]{40,64}$/.test(oid ?? '') || named !== path) {
+    return { ok: false };
+  }
+  const read = await run({ args: ['cat-file', 'blob', oid], cwd: worktree, timeoutMs: GIT_TIMEOUT_MS });
+  return read.ok && typeof read.stdout === 'string' ? { ok: true, text: read.stdout } : { ok: false };
+}
+
 /**
  * `package.json` 의 `scripts` 블록만 베이스라인과 대조한다 (계획 2 이월 3).
  *
@@ -367,7 +640,8 @@ async function inspectPackageScripts({ run, worktree, baseline, files, entries }
     return [...wanted].map((path) => ({
       path,
       rule: 'package-baseline-missing',
-      detail: '베이스라인이 없어 package.json 의 scripts 변경 여부를 확인할 수 없습니다.',
+      tier: 'hard',
+      detail: renderNotice('scope_package_baseline_missing', {}),
     }));
   }
 
@@ -381,20 +655,25 @@ async function inspectPackageScripts({ run, worktree, baseline, files, entries }
       reasons.push({
         path,
         rule: 'package-unreadable',
-        detail: 'JSON 으로 읽지 못해 scripts 블록이 그대로인지 확인할 수 없습니다.',
+        tier: 'hard',
+        detail: renderNotice('scope_package_unreadable', {}),
       });
       continue;
     }
 
     let beforeText = null;
     if (commitBaseline) {
-      // 베이스라인에 파일이 없으면 git 은 비0을 낸다. 그것은 새 파일이므로 {}와 대조한다.
-      const before = await run({
-        args: ['cat-file', 'blob', `${baseline}:${path}`],
-        cwd: worktree,
-        timeoutMs: GIT_TIMEOUT_MS,
-      });
-      beforeText = before.ok && typeof before.stdout === 'string' ? before.stdout : null;
+      const before = await readBaselinePackage({ run, worktree, baseline, path });
+      if (!before.ok) {
+        reasons.push({
+          path,
+          rule: 'package-baseline-unreadable',
+          tier: 'hard',
+          detail: renderNotice('scope_package_baseline_unreadable', {}),
+        });
+        continue;
+      }
+      beforeText = before.text;
     } else if (Object.hasOwn(baseline, path)) {
       beforeText = baseline[path];
     }
@@ -403,7 +682,8 @@ async function inspectPackageScripts({ run, worktree, baseline, files, entries }
       reasons.push({
         path,
         rule: 'package-unreadable',
-        detail: '베이스라인의 package.json 을 JSON 으로 읽지 못해 scripts 블록을 대조할 수 없습니다.',
+        tier: 'hard',
+        detail: renderNotice('scope_package_baseline_unreadable', {}),
       });
       continue;
     }
@@ -413,9 +693,8 @@ async function inspectPackageScripts({ run, worktree, baseline, files, entries }
       reasons.push({
         path,
         rule: 'package-scripts',
-        detail:
-          `scripts 블록이 달라졌습니다: ${changed.join(', ')}. ` +
-          '이 자리의 명령은 적용하는 순간이 아니라 그 뒤의 install/실행에서 돕니다.',
+        tier: 'hard',
+        detail: renderNotice('scope_package_scripts_changed', { keys: changed.join(', ') }),
       });
     }
   }
@@ -438,19 +717,19 @@ async function inspectPackageScripts({ run, worktree, baseline, files, entries }
  *   적용되지 않는다. 고치지 않고 사실만 적는다.
  */
 function describeTargetEscape(worktree, linkPath, target) {
-  if (target === '') return '타깃이 비어 있습니다.';
+  if (target === '') return renderNotice('scope_symlink_target_empty', {});
   // 절대 경로는 워크트리 안을 가리켜도 걸린다 — 워크트리는 일회용이라 그 경로를 사용자
   // 저장소에 심으면 곧 존재하지 않는 곳을 가리키는 링크가 남는다. (`isAbsolute` 는
   // 플랫폼 것이라 Windows 에서는 `C:\…` 와 UNC 도 여기서 걸린다.)
-  if (isAbsolute(target)) return `타깃이 절대 경로입니다: ${target}`;
+  if (isAbsolute(target)) return renderNotice('scope_symlink_target_absolute', { target });
 
   const resolved = resolve(dirname(join(worktree, linkPath)), target);
   const rel = relative(worktree, resolved);
-  if (rel === '') return `타깃이 워크트리 루트 자신입니다: ${target}`;
+  if (rel === '') return renderNotice('scope_symlink_target_worktree_root', { target });
   const segments = rel.split(/[\\/]/);
-  if (isAbsolute(rel) || segments[0] === '..') return `타깃이 워크트리 밖을 가리킵니다: ${target}`;
+  if (isAbsolute(rel) || segments[0] === '..') return renderNotice('scope_symlink_target_outside', { target });
   if (segments.some((segment) => segment.toLowerCase() === '.git')) {
-    return `타깃이 저장소 내부(.git)를 가리킵니다: ${target}`;
+    return renderNotice('scope_symlink_target_git_internals', { target });
   }
   return null;
 }
@@ -458,18 +737,35 @@ function describeTargetEscape(worktree, linkPath, target) {
 /**
  * 패치 범위를 검사한다. **절대 throw 하지 않는다.**
  *
- * @param {{ files: string[], worktree: string, baseline?: string|Record<string,string> }} spec
+ * @param {{ files: string[], worktree: string, baseline?: string|Record<string,string>,
+ *           allow?: {entry: string, path: string}[] }} spec
  *   `files` 는 `collectPatch().files` 를 그대로, `worktree` 는 그 워크트리 경로
  *   (`wt.path`)를 준다. 구조분해로 받지 않는 것은 `spec` 이 객체가 아닐 때도 봉투를
  *   내야 하기 때문이다.
  *   `baseline` 은 선택이고 `wt.baseline`(이식 직후 커밋) 또는 경로 -> 원문 map 이다.
  *   주면 `package.json` 의 `scripts` 블록을 대조한다(`inspectPackageScripts`). 안 주면
  *   package.json 이 files 에 있다는 사실만으로 보수적으로 플래그한다.
+ *   `allow` 는 허용목록의 합집합(`unionScopeAllow().entries`, WS5 T2)이다. 없거나 모양이
+ *   이상하면 **아무것도 지워지지 않는다** — 이 축의 실패는 언제나 닫는 쪽이다.
  * @param {{ run?: Function }} [deps]
- * @returns `{ ok: true, flagged, reasons, omitted, confidence?, recovery? }` 또는 blocked 봉투.
- *   `confidence`/`recovery` 는 **플래그가 섰을 때만** 실린다 — 이 모듈은 신뢰도를
- *   낮추기만 하고 올리지 않는다. 호출자는 `success({ confidence, recovery })` 에 그대로
- *   넘기면 된다.
+ * @returns `{ ok: true, flagged, hardViolation, allowlisted, reasons, omitted, confidence?, recovery? }` 또는
+ *   `fail()` 봉투. `reasons` 는 `{path, rule, tier, promotable?, allowlisted, detail}` 객체이고 `detail` 은
+ *   `src/reason-text.mjs` 의 정본에서 렌더된 영어 한 문장이다. `tier`·`promotable`·사유별 `allowlisted` 는
+ *   **프로세스 안에서만** 산다(T4 의 판정 술어가 소비) —
+ *   봉투로는 안 나간다. `content-projection.mjs` 의 `projectScopeReasons` 가 `scope.reasons` 를
+ *   `{path, rule, detail}` 로 다시 지으며 셋을 뺀다 — 봉투가 싣는 것은 집계 둘
+ *   (`hardViolation`·`allowlisted`)뿐이다. `confidence`/`recovery` 는
+ *   **플래그가 섰고 그중 미승인이 남았을 때만** 실린다(T4 의 컷) — 이 모듈은 신뢰도를 낮추기만 하고 올리지 않는다. 호출자는 `success({ confidence, recovery })` 에 그대로 넘기면 된다.
+ *
+ *   ★★ `hardViolation` 은 **항상** 실린다(플래그가 없으면 `false`). 있을 때만 실으면 「없다」와
+ *     「생산자가 말하지 않았다」가 같은 바이트가 되고, 그것을 읽는 컷(T4)은 두 경우에 다르게
+ *     굴어야 한다. 이 자리가 D2 가 고른 자리다 — `confidenceOfScope` 의 둘째 인자를 되살리지
+ *     않는다(WS2 Task 7 M4 가 「채우는 생산자가 하나도 없다」는 이유로 지운 인자다. 이제
+ *     생산자는 있지만, 신뢰도 함수의 뜻은 「이 축이 신뢰도를 낮추는가」 하나로 남는 편이
+ *     변경 표면이 작다 — 스펙 §0 D2).
+ *   ★★ 집계 `allowlisted` 도 **항상** 실린다. 뜻은 본문의 ★★ 가 적는다: 「플래그된 사유
+ *     전부가 개별로 승인됐나」(스펙 §0 D12). 컷은 `flagged && !allowlisted` 이고 그 술어를
+ *     이 파일과 레인·엔진·선정이 **같은 두 불린으로** 읽는다.
  */
 export async function inspectPatch(spec, deps = {}) {
   try {
@@ -478,39 +774,28 @@ export async function inspectPatch(spec, deps = {}) {
     const worktree = options.worktree;
     const run = deps?.run ?? runGit;
 
-    if (!Array.isArray(files)) {
-      return blocked(
-        `변경된 파일 목록이 배열이 아닙니다: ${files === null ? 'null' : typeof files}`,
-        'collectPatch() 가 낸 `files` 를 그대로 넘기세요. 목록 없이는 변경 범위를 검증할 수 없습니다.',
-      );
-    }
-    for (const entry of files) {
-      if (typeof entry !== 'string') {
-        return blocked(
-          `변경된 파일 목록에 문자열이 아닌 항목이 있습니다: ${typeof entry}`,
-          'collectPatch() 가 낸 `files` 를 가공하지 말고 그대로 넘기세요.',
-        );
-      }
+    // 문구는 넘기지 않는다 — 코드 하나가 `error`·`recovery`·`stopReason` 셋을 정한다(WS2 §7.2).
+    // 목록이 배열이 아닌 것과 원소 하나가 문자열이 아닌 것은 **같은 사실**이다: "바뀐 파일
+    // 목록을 받지 못했다". 둘을 가르던 것은 문구였고, 문구는 이제 코드가 정한다.
+    if (!Array.isArray(files) || files.some((entry) => typeof entry !== 'string')) {
+      return fail(REASON.scope_files_input_invalid);
     }
     // 워크트리를 모르면 심링크 축을 아예 잴 수 없다. 그 경우 경로 검사 결과만 내면
     // 호출자는 검사가 다 돌았다고 믿는다 — 조용히 절반만 도는 쪽보다 거부가 낫다.
-    if (typeof worktree !== 'string' || worktree === '') {
-      return blocked(
-        '워크트리 경로가 비어 있습니다.',
-        '`createWorktree()` 가 낸 핸들의 `path` 를 넘기세요. 그 경로 없이는 심링크 항목을 확인할 수 없습니다.',
-      );
-    }
+    if (typeof worktree !== 'string' || worktree === '') return fail(REASON.scope_worktree_path_missing);
 
     const reasons = [];
     for (const path of files) reasons.push(...inspectPath(path));
 
     const listed = await listIndexEntries({ run, worktree });
+    // 확인하지 못한 것을 "심링크 없음" 으로 기록하지 않는다 — 조용한 절반보다 거부가 낫다.
+    //
+    // ★★ 문구는 코드 하나가 정하지만(WS2 §7.2), git 이 말한 것까지 버리지는 않는다. 예전에는
+    //   `listed.failure.stderr` 가 **모든 채널에서** 사라졌고, 그러면 왜 인덱스를 못 읽었는지를
+    //   사후에 알 길이 없다. `detail` 은 봉투 문장이 아니라 **평면 필드**다 — 호출부(엔진)가
+    //   실행 로그에 적고, 그 채널은 세척기를 지난다(`src/diag.mjs`). 200자에서 자른다.
     if (listed.failure) {
-      const stderr = typeof listed.failure?.stderr === 'string' ? listed.failure.stderr.trim() : '';
-      return blocked(
-        `워크트리 인덱스를 읽지 못해 심링크를 확인할 수 없습니다: ${stderr !== '' ? stderr : '알 수 없는 오류'}`,
-        '워크트리가 정상 상태인지 확인한 뒤 다시 시도하세요. 확인하지 못한 것을 "심링크 없음" 으로 기록하지 않습니다.',
-      );
+      return fail(REASON.scope_index_unreadable, {}, { detail: clipPlain(listed.failure.stderr ?? '', 200) });
     }
 
     const touched = new Set(files);
@@ -525,59 +810,78 @@ export async function inspectPatch(spec, deps = {}) {
         reasons.push({
           path: entry.path,
           rule: 'symlink-unreadable',
-          detail: '심볼릭 링크인데 타깃을 읽지 못했습니다 — 어디를 가리키는지 확인할 수 없습니다.',
+          tier: 'hard',
+          detail: renderNotice('scope_symlink_unreadable', {}),
         });
         continue;
       }
       // 심링크 타깃 blob 에는 개행이 없다. 파이프라인이 붙인 꼬리 개행만 걷어낸다.
       const escape = describeTargetEscape(worktree, entry.path, target.replace(/[\r\n]+$/, ''));
-      if (escape !== null) reasons.push({ path: entry.path, rule: 'symlink-escape', detail: escape });
+      if (escape !== null) reasons.push({ path: entry.path, rule: 'symlink-escape', tier: 'hard', detail: escape });
     }
 
     reasons.push(
       ...(await inspectPackageScripts({ run, worktree, baseline: options.baseline, files, entries: listed.entries })),
     );
 
+    // ★ 사유마다 허용목록 판정을 얹는다(WS5 T2). 판정 자체는 순수 잎이 하고(`scope-allowlist`)
+    //   이 파일은 등급·승격 축을 사유에 실어 그 판정의 입력을 만든다 — 즉 정책은 여기, 매칭은 저기다.
+    for (const reason of reasons) reason.allowlisted = allowlistVerdict(reason, options.allow);
+
     const flagged = reasons.length > 0;
+    // ★★ 등급 판정은 **자르기 전의** 목록을 본다. `kept` 로 재면 허용 등급 백 건 뒤에 선 하드
+    //   한 건이 `MAX_REASONS` 에 밀려 사라지고, 결과는 "하드 없음" 이라고 거짓말을 한다 —
+    //   그것을 읽는 컷(T4)에게는 정확히 그 거짓말이 우회로가 된다.
+    const hardViolation = reasons.some((reason) => reason.tier === 'hard');
+    // ★★ 집계 `allowlisted` 가 답하는 질문은 **하나**다: 「플래그된 사유 **전부**가 개별로
+    //   승인됐나」(스펙 §0 D12). 그래서 이 값은 T4 컷의 정확한 여집합이다 — 컷은
+    //   `flagged && !allowlisted` 이고, 그 두 불린이 봉투의 바닥 단까지 함께 산다.
+    //   세 성질이 의도된 것이다:
+    //   (1) **모든** 사유가 투표한다 — 허용 등급(lockfile 열)도 예외가 아니다. lockfile 은 기본
+    //       허용 **후보**이지 기본 통과가 아니고, 허용목록 항목이 그 경로를 덮을 때만 승인된다.
+    //       ⚠ T2 는 이 집계를 하드 축으로 지었다(「하드가 있고 그 하드 전부가 이름 불렸나」).
+    //       그 정의로는 항목 없는 lockfile bump 가 컷을 **그냥** 통과했고, 그것은 종료 기준
+    //       EC-1 의 문언(「허용목록으로 succeeded」)과 어긋난다 — D12 가 그 어긋남을 닫았다.
+    //   (2) 플래그가 하나도 없으면 **거짓**이다. 「지울 것이 없다」와 「전부 지웠다」는 다른
+    //       사실이고, `flagged` 와 함께 읽으면 둘이 갈린다(공허한 참을 만들지 않는다).
+    //   (3) `hardViolation` 과 **같은 목록**(자르기 전)에서 잰다. `kept` 로 재면 승인된 백 건
+    //       뒤에 선 미승인 하나가 사라지고 집계가 "전부 승인됐다"고 거짓말한다 —
+    //       그것을 읽는 컷에게는 정확히 그 거짓말이 우회로가 된다.
+    const allowlisted = flagged && reasons.every((reason) => reason.allowlisted === true);
     const kept = reasons.slice(0, MAX_REASONS);
     const omitted = reasons.length - kept.length;
-    const result = { ok: true, flagged, reasons: kept, omitted };
-    if (flagged) {
-      result.confidence = 'disputed';
-      result.recovery = buildRecovery(kept, omitted);
+    const result = { ok: true, flagged, hardViolation, allowlisted, reasons: kept, omitted };
+    // ★★ **컷 (1)/셋** (WS5 T4, 스펙 §0 D12·D2). 플래그가 섰고 그중 **미승인이 하나라도**
+    //   남았을 때만 두 필드를 얹는다 — `flagged` 항을 남기는 것은 기본 모양 가드다(집계는
+    //   플래그가 없으면 거짓이므로 `!allowlisted` 만 읽으면 깨끗한 패치가 컷에 걸린다).
+    //   승인된 집합에는 `confidence` 도 `recovery` 도 붙지 않고, `flagged` 와 `reasons` 는
+    //   **그대로 실린다**: 통과는 「안 걸렸다」가 아니라 「걸렸고 프로젝트가 미리 승인했다」이다.
+    //   `disputed` 를 여기서 고르지 않고 `confidenceOfScope` 에 묻는 이유는 `src/confidence.mjs`
+    //   헤더에 있다(WS0 §2.2) — D2 대로 그 함수의 2인자는 되살리지 않는다.
+    if (flagged && !allowlisted) {
+      Object.assign(result, { confidence: confidenceOfScope({ flagged }), recovery: buildRecovery(omitted) });
     }
     return result;
-  } catch (error) {
-    return blocked(
-      `패치 범위를 검사하는 중에 예기치 못한 오류가 났습니다: ${String(error?.message ?? error)}`,
-      '워크트리 경로와 파일 목록을 확인한 뒤 다시 시도하세요.',
-    );
+  } catch {
+    // ★ 예전에는 `String(error?.message ?? error)` 로 던진 값을 문장으로 만들었고, 그 모양은
+    //   `throw undefined` 에서 리터럴 'undefined' 를 봉투에 실었다(계약 `contract/envelope.json`
+    //   의 error 행이 그 열두 자리를 열거한다). 던진 값은 사유가 아니므로 코드 하나로 닫는다.
+    return fail(REASON.scope_inspection_failed);
   }
 }
 
 /**
  * 사람이 무엇을 확인해야 하는지. 플래그가 섰을 때 반드시 채운다.
  *
- * 경로 이름만 적지 않고 **그 경로가 걸린 사유(`reason.detail`)** 를 함께 적는다. 사유는
- * 이미 계산해 둔 값인데 버리면 "이 파일을 확인하세요" 가 왜 확인해야 하는지 모르는 안내가
- * 된다 — 경로마다 위험이 다르다(8.3 모양 · 자동 실행 설정 · 심링크 타깃 탈출).
+ * ★ 예전에는 이 문장이 경로 다섯과 그 사유를 **되풀이해** 적었다. 그래야 했던 이유는
+ *   `reasons` 가 봉투까지 못 갔기 때문이다 — 엔진이 `scope.reasons: []` 로 버렸다. WS2
+ *   Task 11 이 그 배선을 이었으므로 사유는 본문이 나르고, 회복은 다음에 할 한 문장만 말한다.
+ *   문구 정본은 `src/reason-text.mjs` 다: 같은 조언이 두 문장으로 갈리면 골든이 두 줄이 된다.
  */
-function buildRecovery(reasons, omitted) {
-  const firstByPath = new Map();
-  for (const reason of reasons) {
-    if (!firstByPath.has(reason.path)) firstByPath.set(reason.path, reason.detail);
-  }
-  const paths = [...firstByPath.keys()];
-  const sample = paths
-    .slice(0, RECOVERY_SAMPLE)
-    .map((path) => `${path} — ${firstByPath.get(path)}`)
-    .join(' / ');
-  const rest = paths.length > RECOVERY_SAMPLE ? ` 외 ${paths.length - RECOVERY_SAMPLE}개 경로` : '';
-  const cut = omitted > 0 ? ` 지면 관계로 ${omitted}건의 사유를 생략했습니다.` : '';
-  return (
-    `패치를 적용하기 전에 사람이 다음을 직접 확인하세요: ${sample}${rest}.${cut} ` +
-    '이런 파일은 적용하는 순간이 아니라 그 뒤의 실행에서 발화합니다.'
-  );
+function buildRecovery(omitted) {
+  const advice = renderReason(REASON.scope_policy_failure).recovery;
+  // 잘린 개수는 사실이므로 남긴다 — 목록이 전부가 아니라는 것을 읽는 쪽이 알아야 한다.
+  return omitted > 0 ? `${advice}; ${renderNotice('scope_reasons_omitted', { omitted })}` : advice;
 }
 
 /**
@@ -589,8 +893,24 @@ function buildRecovery(reasons, omitted) {
  *     파일 존재만으로 보수적으로 플래그한다(계획 2 이월 3). `src/engine.mjs` 의 두
  *     호출부는 커밋-ish 를 준다. 그리고 대조하는 것은 `scripts` 블록뿐이라, `npm` 이 실행하는 다른 자리
  *     (`config`·`workspaces`·`packageManager`)는 여전히 안 본다.
- *   - `setup.py`·`conftest.py`·`Makefile`·`build.gradle` 등 빌드/테스트가 실행하는 코드.
- *     소스 코드와 구분할 방법이 없다.
+ *   - `setup.py`·`conftest.py`·`Makefile` 등 빌드/테스트가 실행하는 코드. 소스 코드와 구분할
+ *     방법이 없다. ★ 이 줄은 예전에 `build.gradle` 도 이름으로 적었는데 그것은 이제 표지다 —
+ *     WS5 T3 의 수정 파도가 **발견이 읽는** 러너 설정(jest·vitest/vite·nextest·gradle·maven)을
+ *     정본과 표지에 함께 넣었다(위 `SENSITIVE_FILE_NAMES`). 경계는 「발견이 그 이름을 생태계의
+ *     증거로 읽는가」이고, 그 판정은 열거가 아니라 계산이라 여기 다시 적히지 않는다.
+ *   - `go.mod`·`Cargo.toml`. 발견이 읽지만 **일부러** 표지가 아니다: 의존성 매니페스트이고 짝이
+ *     되는 lockfile(`go.sum`·`cargo.lock`)이 `allowable` 이라, 하드로 두면 의존성 bump 한 번이
+ *     허용목록으로도 못 지우는 플래그가 된다(그 판단의 정본은 `src/test-discovery.mjs` 의
+ *     `RUNNER_COMMAND_CONFIGS` 머리말이고, 그 제외를 소스 스크레이프가 지킨다). ⚠ `Cargo.toml` 은
+ *     `[[test]]`·`harness = false` 로 무엇이 도는지를 실제로 정하지만(T3 재심 N3) 제외는 그
+ *     사실과 무관하다 — 서는 것은 lockfile-짝 이유 하나뿐이다.
+ *   - **반대 방향의 잔여 위험(과다 차단, T3 재심 N1)**: `vite.config.*` 넷은 하드 표지인데 그
+ *     등급의 근거(「고칠 정당한 이유는 무엇이 도는지를 바꾼다 뿐」)가 그 넷에는 거짓이다 —
+ *     vite.config 는 빌드 도구 설정이라 vitest 를 안 쓰는 프로젝트에서도 정당하게 계속 고쳐진다.
+ *     그래도 하드로 둔 이유(패치 하나만 보는 이 검사는 프로젝트가 vitest 를 쓰는지 알 방법이
+ *     없다)와 그 비용(순수 Vite 프로젝트의 평범한 편집이 지울 수 없는 disputed 가 된다,
+ *     `package.json` 과 같은 실패 모양·작은 반경)은 `SENSITIVE_FILE_NAMES` 머리말에 적었다 —
+ *     이 줄은 그 반대쪽 실패가 어디 적혀 있는지를 가리킬 뿐이다.
  *   - `.gitattributes`(filter 드라이버)·`.gitmodules`(서브모듈 URL). 둘 다 별도 설정이
  *     있어야 발화해서 넣지 않았다.
  *   - `packages.lock.json`(NuGet). 다른 lockfile 은 위 목록에 있지만 이것만 뺐다 —

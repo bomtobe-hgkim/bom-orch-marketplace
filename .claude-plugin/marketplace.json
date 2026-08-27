@@ -1,14 +1,14 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "bom-orch-marketplace",
-  "description": "Claude와 GPT CLI 워커를 교차검증하는 Bom Orchestration 플러그인 마켓플레이스",
+  "description": "The Bom Orchestration plugin marketplace: Claude and GPT CLI workers, cross-checked against each other",
   "owner": {
     "name": "hyeongi-home"
   },
   "plugins": [
     {
       "name": "bom-orch",
-      "description": "Claude와 GPT 두 CLI 워커를 교차검증으로 오케스트레이션하고 무엇이 통했는지 학습하는 MCP 서버",
+      "description": "An MCP server that orchestrates two CLI workers, Claude and GPT, cross-checks their results, and learns what worked",
       "author": {
         "name": "hyeongi-home"
       },

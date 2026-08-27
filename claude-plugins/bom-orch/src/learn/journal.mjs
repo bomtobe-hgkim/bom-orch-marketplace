@@ -2,6 +2,10 @@
 import { open, readFile, stat } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { hasPendingLearningOperation, recoverLearning, withLearningLock } from './learning.mjs';
+import { REASON } from '../reason-codes.mjs';
+import { fail, renderNotice } from '../reason-text.mjs';
+import { errorText } from '../util/errors.mjs';
+import { clipWhole } from '../util/strings.mjs';
 
 /**
  * 실행 저널 — `<stateRoot>/journal.jsonl`.
@@ -17,11 +21,11 @@ import { hasPendingLearningOperation, recoverLearning, withLearningLock } from '
  *   기록하자 첫 번째가 `{ok:true}` 를 받고도 `findRun` 에서 영영 나오지 않았다. 그래서
  *   이어붙이기 전에 파일 끝 바이트를 보고 개행이 없으면 줄 앞에 붙인다(`endsWithNewline`).
  * - 잠금을 잡았는데 본문이 죽으면 부분 쓰기가 남을 수 있다. `withLock` 이 그 경우를
- *   `본문이 …` 사유로 구분해 돌려준다.
+ *   `REASON.state_lock_work_failed` 로 구분해 돌려준다(예전에는 문장 앞머리로 갈랐다).
  *
  * ★ 깨진 줄은 건너뛴다. 한 줄이 손상됐다고 학습 전체를 잃으면 안 된다.
  *
- * 절대 throw 하지 않는다 — 실패는 `{ok:false, reason}` 이다. 태스크 8 은 실행이 다 끝난
+ * 절대 throw 하지 않는다 — 실패는 `fail(REASON.x, params)` 봉투다. 태스크 8 은 실행이 다 끝난
  * 뒤 `try` 로 감싸지 않고 이 모듈을 부른다(반환값 자체는 `.ok` 로 확인해 실패를 notice 로
  * 남긴다 — `docs/superpowers/plans/2026-08-09-plan-3-learning-layer.md` 의 태스크 8 코드는
  * `if (!journaled.ok) addNotice(...)` 다). 여기서 던지면 그 notice 대신 예외가 그대로
@@ -47,7 +51,7 @@ import { hasPendingLearningOperation, recoverLearning, withLearningLock } from '
  *
  * 멈춘 coordinator의 실패 모드 — 실측: 0바이트 `learning.lock` 이 남으면 `withLock` 의
  * `staleMs`(60초)가 지날 때까지 모든 학습 writer와 pending을 복구해야 하는 reader가 5초를 기다렸다가
- * `{ok:false, reason:'잠금을 제한 시간 안에 …(마지막 오류: EEXIST)'}` 로 끝난다. 그 창에서
+ * `fail(REASON.state_lock_timeout, {code:'EEXIST'})` 로 끝난다. 그 창에서
  * 난 실행 기록은 남지 않는다. 잠금은 그래도 유지한다 — POSIX 에서 이식 가능한 배타 수단이
  * 이것뿐이다(Windows 의 `appendFile` 은 잠금 없이도 195KB 줄까지 원자적이었지만 그것은
  * 이 플랫폼의 성질이지 계약이 아니다).
@@ -97,12 +101,79 @@ const DEFAULT_LIMIT = 500;
  *     저널에 들어오지 않는다. artifact 는 30일 뒤 만료되지만 그것이 정정을 막지 않는다 —
  *     보상 권위는 동결된 choice map 이지 패치 내용이 아니다.
  */
+/**
+ * ★ WS3 태스크 2(스펙 §0-D1)가 더한 **종료 기록** 여덟. 앞의 스물둘은 하나도 지우지 않는다.
+ *
+ *   봉투는 디스크에 남지 않는다 — `src/envelope.mjs` 는 fs 를 수입하지도 않고, 실행 디렉터리는
+ *   리퍼가 강제하는 닫힌 집합이라 파일 하나만 더 있어도 그 실행이 영영 회수되지 않는다. 그래서
+ *   실행이 **어떻게 끝났는가**의 유일한 영구 기록이 이 여섯이다(그 짝은 종료 diag-log 한 줄).
+ *
+ *   · `project` · `taskPreview` — 인자 없는 `orch_status` 가 최근 목록에 실을 두 값(RM §3.5).
+ *     `taskPreview` 는 세척기를 지난 **뒤** 120에서 자른다(`runTerminalKeys`).
+ *   · `startedAt` · `finishedAt` — 실행이 시작한 순간과 봉투가 정해진 순간(epoch ms).
+ *     ★★ `startedAt` 은 **`at` 으로 대신할 수 없다**(최종 리뷰 I8). `at` 은 이 줄이 **쓰인** 시각
+ *     이고(`appendRun` 이 호출자 값이 없으면 그때의 시계로 찍는다), 종료 행은 `finishedAt` 을
+ *     찍은 **몇 문장 뒤에** 쓰인다 — 그래서 디스크의 불변식이 `at >= finishedAt` 이고,
+ *     `orch_status` 가 `at` 을 시작 시각으로 읽으면 모든 실행이 0 ms 또는 음수 동안 돈 것으로
+ *     보인다(실측: 50분 돈 실행이 -2 ms). 「얼마나 돌다 잘렸나」는 `run_deadline_exceeded`·
+ *     `run_cancelled` 행에 대한 첫 질문이라 두 시각이 이 행에 함께 있는 것이다. `at` 은 최근순
+ *     정렬 키이기도 해서 용도를 겹쳐 쓸 수 없다.
+ *   · `resumedFrom` — `resume_run_id` 로 이어 온 원본 실행의 이름, 아니면 `null`. 재개 사실이
+ *     남는 다른 영구 채널은 로그의 `info` 한 줄뿐인데 `orch_status` 의 꼬리는 warn·error 만
+ *     싣는다(§0-D3) — 그래서 재구성 본문이 「서수가 왜 3 부터인가」를 말할 자리가 없었다.
+ *   · `status` · `stopReason` · `reasonCode` — 봉투가 실제로 낸 삼중값. ★ **문장은 절대
+ *     저장하지 않는다**: 코드만 남기고 읽을 때 `REASON_TEXT` 로 다시 렌더한다(옛 철자는
+ *     `normalizeLegacyReasonCode` 로 올려 읽는다). 문장을 저장하면 어휘가 갈라져 다음 편집에서
+ *     불변식 7·10 이 깨진다 — 디스크의 문장은 레지스트리가 못 고친다.
+ *
+ *   ★ 옛 행에는 이 여덟이 **없다**. 소비자는 `?? ''` 가 아니라 키 유무로 갈라라 — 「모른다」를
+ *     「빈 값이다」로 읽으면 0.2.2 실행이 프로젝트 없는 실행으로 보인다(불변식 9,
+ *     `test/fixtures/journal/v022-row.json` 가 양방향을 못박는다).
+ */
 export const RUN_ENTRY_KEYS = Object.freeze([
   'runId', 'at', 'updatedAt', 'taskClass', 'decisions', 'outcome',
   'appliedGrade', 'appliedAxes', 'rewardableAxes', 'appliedGenerations', 'rewardableGenerations', 'operationId', 'rewardApplied', 'note',
   'policyVersion', 'candidateCount', 'attemptRefs', 'artifactRefs', 'selection',
   'effectiveChoices', 'appliedChoices', 'rewardableChoices',
+  'project', 'taskPreview', 'startedAt', 'finishedAt', 'status', 'stopReason', 'reasonCode', 'resumedFrom',
 ]);
+
+/** `taskPreview` 의 상한 — RM §3.5 가 "task 앞 120자" 로 정한 값. */
+export const TASK_PREVIEW_CHARS = 120;
+
+/**
+ * 종료 기록 여덟 키를 만든다. 쓰는 자리가 **둘**이라(학습 WAL 의 행과 엔진 종료 sink 의 행) 그
+ * 둘이 같은 바이트를 내야 한다 — 값을 짓는 자리는 여기 하나다.
+ *
+ * ★ `taskPreview` 는 **세척 먼저, 자르기 나중**(`src/diag.mjs` 와 같은 규칙). 먼저 자르면 비밀이
+ *   반으로 잘려 남고 그 조각은 어느 규칙에도 안 걸린 채 나간다. 게다가 저널에는 **보존 정책이
+ *   없다**(위 ★) — 로그와 달리 그 줄은 지워지지 않는다.
+ * ★ 자르는 함수가 `clipWhole` 인 이유: 상한이 서로게이트 쌍 한가운데 떨어지면 반쪽이 남고,
+ *   그 반쪽은 UTF-8 왕복에서 U+FFFD 가 되어 디스크의 바이트가 손상된다. 말줄임 한 글자를
+ *   붙이므로 상한은 `-1` 로 준다 — 「120자를 넘지 않는다」가 한 글자 어긋나지 않게.
+ * ★★ **`project` 는 세척기를 지나지 않는다** — 실측: 지나면 값이 리터럴 `'<project>'` 가 된다.
+ *   세척기는 프로젝트 루트를 통째로 그 자리표시자로 접으므로(`src/redact.mjs` 의 `TOKEN`),
+ *   프로젝트 경로 **자체**를 넣으면 남는 정보가 0 이고 실행 백 건이 모두 같은 문자열이 된다 —
+ *   이 키가 존재하는 이유(인자 없는 `orch_status` 가 "어느 프로젝트였나" 를 말한다, RM §3.5)가
+ *   그 자리에서 사라진다. 자리표시자는 **남의 산문 안에 섞인** 경로를 접으라고 있는 것이지 그
+ *   경로를 이름으로 부르는 필드에 쓰라고 있는 것이 아니다(봉투의 `log.path` 도 같은 이유로
+ *   절대 경로를 그대로 싣는다 — 계약 `topLevel.log`). 대신 값은 엔진이 정준화한 절대 경로다.
+ * ★ 문자열이 아닌 입력은 `null` 이다. `''` 로 뭉개면 「모른다」가 「빈 값이다」가 된다.
+ */
+export function runTerminalKeys({ projectPath, task, startedAt, finishedAt, resumedFrom, outcome, redact }) {
+  const preview = typeof task === 'string' ? (typeof redact === 'function' ? redact(task) : task) : null;
+  const pick = (key) => (outcome !== null && typeof outcome === 'object' && typeof outcome[key] === 'string' ? outcome[key] : null);
+  return {
+    project: typeof projectPath === 'string' ? projectPath : null,
+    taskPreview: preview === null || preview.length <= TASK_PREVIEW_CHARS ? preview : clipWhole(preview, TASK_PREVIEW_CHARS - 1),
+    startedAt: Number.isSafeInteger(startedAt) ? startedAt : null,
+    finishedAt: Number.isSafeInteger(finishedAt) ? finishedAt : null,
+    status: pick('status'),
+    stopReason: pick('stopReason'),
+    reasonCode: pick('reasonCode'),
+    resumedFrom: typeof resumedFrom === 'string' && resumedFrom !== '' ? resumedFrom : null,
+  };
+}
 
 const pathsFor = (stateRoot) =>
   typeof stateRoot === 'string' && stateRoot !== '' && isAbsolute(stateRoot)
@@ -132,18 +203,21 @@ export async function journalBytes(stateRoot) {
   }
 }
 
-export async function appendRun(stateRoot, entry) {
-  const paths = pathsFor(stateRoot);
-  if (paths === null) return { ok: false, reason: '상태 루트가 절대 경로가 아닙니다.' };
-
-  let line;
+/**
+ * ★ `options.now` 는 **테스트가 시각을 못박기 위한 이음새**다(기본값은 진짜 시계라 옵션을
+ *   안 주면 파일에 찍히는 바이트가 그대로다). 이것이 없으면 `at`·`updatedAt` 을 「기록 전후
+ *   사이에 있다」는 창으로만 잴 수 있고, 두 줄의 선후는 `sleep(5)` 로 진짜 시간을 흘려
+ *   보내야 만들어진다 — Windows 의 `Date.now()` 해상도가 1-16ms 라 그 sleep 은 언제든
+ *   같은 ms 두 줄을 낼 수 있다. 함수가 아닌 값은 무시하고 진짜 시계로 되돌린다.
+ */
+function runLine(entry, options) {
   try {
     // 이 블록 전체가 try 안에 있어야 한다. `entry.runId` 는 던지는 getter 일 수 있고,
     // 전개와 `JSON.stringify` 는 순환 참조·BigInt·던지는 `toJSON` 에서 던진다.
     if (entry === null || typeof entry !== 'object' || typeof entry.runId !== 'string' || entry.runId === '') {
-      return { ok: false, reason: 'runId 가 있는 객체여야 합니다.' };
+      return fail(REASON.learning_journal_record_invalid);
     }
-    const now = Date.now();
+    const now = typeof options?.now === 'function' ? options.now() : Date.now();
     // `at` 은 호출자가 실어 보낸 유한한 값을 물려받는다 — 태스크 10 은 `findRun` 이 돌려준
     // 기록을 통째로 전개해서(`{...run, appliedGrade, …}`) 얹으므로 원래 실행 시각이 따라온다.
     //
@@ -156,34 +230,82 @@ export async function appendRun(stateRoot, entry) {
     const at = Number.isFinite(entry.at) ? entry.at : now;
     // 전개 뒤에 둔다: `at` 은 위에서 이미 호출자 값을 반영했고, `updatedAt` 은 호출자가
     // 덮어쓰면 안 된다.
-    line = `${JSON.stringify({ ...entry, at, updatedAt: now })}\n`;
+    return { ok: true, line: `${JSON.stringify({ ...entry, at, updatedAt: now })}\n` };
   } catch (error) {
-    return { ok: false, reason: `기록을 JSON 으로 만들지 못했습니다: ${describe(error)}` };
+    return fail(REASON.learning_journal_record_unserializable, { detail: errorText(error) });
   }
+}
+
+/** 호출자가 `learning.lock` 을 쥔 동안 이미 직렬화한 한 행을 덧붙인다. */
+async function appendLineUnlocked(paths, line) {
+  const prefix = (await endsWithNewline(paths.file)) ? '' : '\n';
+  const handle = await open(paths.file, 'a');
+  try {
+    await handle.writeFile(`${prefix}${line}`, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  return { ok: true };
+}
+
+/** 드문 잠금 해제 경고를 버리지 않고 저널 쓰기 결과를 풀어낸다. */
+function settleJournalWrite(got) {
+  if (!got.ok) return got;
+  if (got.value?.ok === false) return got.value;
+  return got.released === false
+    ? { ok: true, notice: renderNotice('journal_lock_left_behind', { reason: got.releaseReason }) }
+    : { ok: true };
+}
+
+export async function appendRun(stateRoot, entry, options) {
+  const paths = pathsFor(stateRoot);
+  if (paths === null) return fail(REASON.state_root_not_absolute);
+
+  const prepared = runLine(entry, options);
+  if (!prepared.ok) return prepared;
 
   // 끝 바이트 확인과 이어붙이기 사이가 갈라지면 안 된다 — 둘 다 잠금 안에서 한다.
-  const got = await withLearningLock(stateRoot, async () => {
-    const prefix = (await endsWithNewline(paths.file)) ? '' : '\n';
-    const handle = await open(paths.file, 'a');
-    try {
-      await handle.writeFile(`${prefix}${line}`, 'utf8');
-      await handle.sync();
-    } finally {
-      await handle.close().catch(() => {});
-    }
-  });
-  if (!got.ok) return { ok: false, reason: got.reason };
+  const got = await withLearningLock(stateRoot, async () => appendLineUnlocked(paths, prepared.line));
   // `released:false` 는 본문(위 콜백)이 잘 끝났어도 잠금 파일이 남았다는 뜻이다 —
   // `src/lockfile.mjs:22-24` 는 호출자가 그것을 로그할 수 있어야 한다고 명시하는데
   // 지금까지는 여기서 버려졌다. 방아쇠는 희박하다: 본문이 `staleMs`(기본 60초)를
   // 넘겨야 남이 잠금을 훔쳐 갈 수 있다(`src/lockfile.mjs:31-35`). `notice` 는 새 필드라
   // `.ok` 만 보는 기존 소비자(태스크 8)와 호환된다.
-  return got.released === false ? { ok: true, notice: `저널 잠금이 남았습니다: ${got.releaseReason}` } : { ok: true };
+  return settleJournalWrite(got);
+}
+
+/**
+ * 학습 사실은 바꾸지 않고 최신 이벤트 행에 조언용 note를 붙인다.
+ *
+ * 읽기와 교체 append는 한 coordinator lock을 공유한다. 먼저 읽고 `appendRun`을 부르면 그 사이
+ * 잠금이 풀리고 여기서 재귀 획득하므로, 동시에 들어온 reward 정정을 이 함수가 본 낡은 행으로
+ * 덮을 수 있다. JSONL의 이전 행은 그대로 남는다. note는 최신 이벤트 주석이므로, 뒤이은 동일
+ * reward 정정이 note 차이 때문에 posterior 갱신 없는 교체 행 하나를 더 만들 수 있다.
+ */
+export async function recordRunNote(stateRoot, runId, note, options) {
+  const paths = pathsFor(stateRoot);
+  if (paths === null) return fail(REASON.state_root_not_absolute);
+  if (typeof runId !== 'string' || runId === '' || typeof note !== 'string' || note === '') {
+    return fail(REASON.learning_journal_record_invalid);
+  }
+
+  const got = await withLearningLock(stateRoot, async () => {
+    const read = await readRunsAtPaths(paths, { limit: Number.MAX_SAFE_INTEGER });
+    if (!read.ok) return read;
+    const current = read.runs.find((run) => run.runId === runId);
+    if (current === undefined) return fail(REASON.learning_run_not_found, { runId });
+
+    const prepared = runLine({ ...current, note }, options);
+    if (!prepared.ok) return prepared;
+    return appendLineUnlocked(paths, prepared.line);
+  });
+  return settleJournalWrite(got);
 }
 
 export async function readRuns(stateRoot, options) {
   const paths = pathsFor(stateRoot);
-  if (paths === null) return { ok: false, reason: '상태 루트가 절대 경로가 아닙니다.' };
+  if (paths === null) return fail(REASON.state_root_not_absolute);
   if (await hasPendingLearningOperation(stateRoot)) {
     const recovered = await recoverLearning(stateRoot);
     if (!recovered.ok) return recovered;
@@ -194,7 +316,7 @@ export async function readRuns(stateRoot, options) {
 /** Read without taking `learning.lock`; only coordinator callbacks may use it. */
 export async function readRunsUnlocked(stateRoot, options) {
   const paths = pathsFor(stateRoot);
-  if (paths === null) return { ok: false, reason: '상태 루트가 절대 경로가 아닙니다.' };
+  if (paths === null) return fail(REASON.state_root_not_absolute);
   return readRunsAtPaths(paths, options);
 }
 
@@ -212,7 +334,9 @@ async function readRunsAtPaths(paths, options) {
     text = await readFile(paths.file, 'utf8');
   } catch (error) {
     if (error?.code === 'ENOENT') return { ok: true, runs: [] };
-    return { ok: false, reason: `저널을 읽지 못했습니다: ${String(error?.message ?? error)}` };
+    // WS1 C2 — `String(error?.message ?? error)` 는 message 가 빈 오류에서 `[object Object]` 를
+    // 냈다. 사다리는 저장소에 하나뿐이다(`errorText`).
+    return fail(REASON.learning_journal_read_failed, { detail: errorText(error) });
   }
 
   const found = collect(text);
@@ -297,15 +421,3 @@ async function endsWithNewline(file) {
   }
 }
 
-/** 던져진 것에서 사람이 읽을 사유를 만든다. 사유를 만들다 또 던지면 계약이 깨진다. */
-function describe(error) {
-  if (error === undefined) return '사유 없이 undefined 가 던져졌습니다.';
-  if (error === null) return '사유 없이 null 이 던져졌습니다.';
-  try {
-    const message = error?.message;
-    if (typeof message === 'string' && message !== '') return message;
-    return String(error);
-  } catch {
-    return '사유를 읽지 못했습니다.';
-  }
-}

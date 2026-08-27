@@ -1,4 +1,7 @@
 import { AXES, POLICY_V2_AXES } from './bandit.mjs';
+import { REASON, normalizeLegacyReasonCode } from '../reason-codes.mjs';
+import { ownDataValue } from '../util/objects.mjs';
+import { deepFreeze } from '../util/freeze.mjs';
 
 /**
  * Learning policy v2 — one grade and at most one arm per axis for one Run.
@@ -9,8 +12,8 @@ import { AXES, POLICY_V2_AXES } from './bandit.mjs';
  * from a journal row long after the worktrees are gone, so anything it cannot
  * see in its input must not influence a grade.
  *
- * ★ Why the engine, not this module, authors `effectiveChoices`.  Whether an
- *   axis was a *real* choice depends on facts that never reach a terminal
+ * ★ Why `effective-choices.mjs`, not this module, authors `effectiveChoices`.
+ *   Whether an axis was a *real* choice depends on facts that never reach a terminal
  *   candidate summary — a caller's role pin, the registry order the placement
  *   arm mapped onto, whether `allow_single` made `single` a candidate arm at
  *   all, and whether enough providers existed for the arm to mean anything.
@@ -58,31 +61,57 @@ const TERMINAL_CLASSES = new Set(['verified', 'usable_unverified', 'rejected', '
 /**
  * Run-level stops that outrank a lane's own terminal reason.
  *
- * A deadline or a failed winner alias means the Run did not deliver what its
- * selection claims, so the sample is not honest evidence about the arms.  These
- * two strings are the engine's, and the engine is the only writer of
- * `stopReason`; the success rule below independently requires the stop reason
- * to be the selected candidate's own, so this set only has to catch the
+ * A deadline, a host cancellation or a failed winner alias means the Run did not
+ * deliver what its selection claims, so the sample is not honest evidence about
+ * the arms.  These three strings are the engine's, and the engine is the only
+ * writer of `stopReason`; the success rule below independently requires the stop
+ * reason to be the selected candidate's own, so this set only has to catch the
  * all-rejected shape that no selected candidate would mask.
+ *
+ * ★ `run_cancelled` joined in WS3 with its producer.  A cancelled Run says
+ *   nothing about the arm that was running when the host pressed stop — grading
+ *   it would punish whichever vendor happened to hold the writer call, which is
+ *   an artefact of the user's timing and not of the vendor's work.
  */
-const NEUTRALIZING_STOP_REASONS = new Set(['deadline_exceeded', 'winner_alias_failed']);
+const NEUTRALIZING_STOP_REASONS = new Set([
+  REASON.run_deadline_exceeded, REASON.artifact_winner_alias_failed, REASON.run_cancelled,
+]);
 
-/** Read an own data property without letting a throwing getter escape. */
+/**
+ * Read an own data property without letting a throwing getter escape.
+ *
+ * ★ 공유 `ownDataValue` 로 옮기면서 **accessor 를 더는 호출하지 않는다**. 이전 사본은
+ *   `value[key]` 로 읽어 getter 를 실행했다 — 학습은 조언만 하지만(invariant 6) 그 읽기
+ *   하나가 적대적 객체에 코드 실행을 내주고 있었다. 비열거 own 속성도 이제 안 보인다.
+ */
 function own(value, key) {
-  try {
-    if (value === null || typeof value !== 'object' || !Object.hasOwn(value, key)) return undefined;
-    return value[key];
-  } catch {
-    return undefined;
-  }
+  return ownDataValue(value, key).value;
 }
 
-function deepFreeze(value) {
-  Object.freeze(value);
-  for (const child of Object.values(value)) {
-    if (child !== null && typeof child === 'object' && !Object.isFrozen(child)) deepFreeze(child);
-  }
-  return value;
+/**
+ * A `stopReason` read from a journal row, in this module's vocabulary.
+ *
+ * ★★ This reduction is replayed from rows written long before the codes were
+ *   renamed (`orch_reward` re-grades them by hand).  Those rows still say
+ *   `verified`, `machine_failed`, `policy_failure`.  Comparing them to
+ *   `REASON.x` by spelling alone silently folds every one of them to
+ *   `grade: null` — the sample is not refused, it is *lost*, and nothing says
+ *   so.  So the alias table runs first; a spelling it does not know is kept as
+ *   it is, because inventing a code here would grade a row we cannot read.
+ *   This is a reasonCode-position value, which is the only position that table
+ *   may be applied to (WS2 §2.4).
+ */
+function stopReasonCode(value) {
+  if (typeof value !== 'string') return value;
+  // ★ `deadline_exceeded` only is kept off the alias table: that spelling is a
+  //   coarse `stopReason`, not a fine code, and the table lifts it to the
+  //   judge-only `judge_deadline`.  Relabelling a run-level deadline as a judge
+  //   failure would take it out of NEUTRALIZING_STOP_REASONS and grade a Run
+  //   that never finished.  `src/run-faults.mjs laneStopCode` carries the same
+  //   exception for the same reason; the two must agree or a replayed row and a
+  //   live Run grade differently.
+  if (value === 'deadline_exceeded') return REASON.run_deadline_exceeded;
+  return normalizeLegacyReasonCode(value) ?? value;
 }
 
 const neutral = () => deepFreeze({ grade: null, appliedChoices: {}, rewardableChoices: {} });
@@ -127,7 +156,7 @@ function normalizeCandidates(value, candidateCount) {
   for (const raw of value) {
     const candidateId = own(raw, 'candidateId');
     const terminalClass = own(raw, 'terminalClass');
-    const stopReason = own(raw, 'stopReason');
+    const stopReason = stopReasonCode(own(raw, 'stopReason'));
     if (!LANE_IDS.has(candidateId) || seen.has(candidateId)) return null;
     if (!TERMINAL_CLASSES.has(terminalClass)) return null;
     if (typeof stopReason !== 'string' || stopReason === '') return null;
@@ -157,14 +186,15 @@ function normalizeCandidates(value, candidateCount) {
  */
 function trustedRejection(candidate) {
   if (candidate.terminalClass !== 'rejected') return false;
-  if (candidate.stopReason === 'policy_failure') return candidate.flagged === true;
-  if (candidate.stopReason !== 'machine_failed') return false;
+  if (candidate.stopReason === REASON.scope_policy_failure) return candidate.flagged === true;
+  if (candidate.stopReason !== REASON.test_machine_failed) return false;
   const tests = candidate.tests;
   return tests.execution === 'completed' && tests.outcome === 'fail' &&
     tests.stability === 'stable' && tests.trusted === true && tests.complete === true;
 }
-
-function deriveGrade({ stopReason, selected, candidates }) {
+function deriveGrade({ taskClass, stopReason, selected, candidates }) {
+  // 기계 증거가 없는 클래스는 자동 성공으로 학습하지 않고, 식별된 팔만 사람 보상용으로 남긴다.
+  if (taskClass === 'code:no-tests') return null;
   if (NEUTRALIZING_STOP_REASONS.has(stopReason)) return null;
   if (selected !== null) {
     // Success is the selected candidate's own terminal claim, not the Run's
@@ -220,7 +250,7 @@ function reduce(input) {
   if (own(input, 'policyVersion') !== 2) return neutral();
   const candidateCount = own(input, 'candidateCount');
   if (candidateCount !== 1 && candidateCount !== 2) return neutral();
-  const stopReason = own(input, 'stopReason');
+  const stopReason = stopReasonCode(own(input, 'stopReason'));
   if (typeof stopReason !== 'string' || stopReason === '') return neutral();
   const selection = normalizeSelection(own(input, 'selection'));
   if (selection === null) return neutral();
@@ -228,7 +258,6 @@ function reduce(input) {
   if (candidates === null) return neutral();
   const choices = own(input, 'effectiveChoices');
   if (choices === null || typeof choices !== 'object' || Array.isArray(choices)) return neutral();
-
   const selected = selection.selectedCandidateId === null
     ? null
     : candidates.find((candidate) => candidate.candidateId === selection.selectedCandidateId) ?? null;
@@ -236,7 +265,7 @@ function reduce(input) {
   // any arm; refuse the whole reduction rather than grade half of it.
   if (selection.selectedCandidateId !== null && selected === null) return neutral();
 
-  const grade = deriveGrade({ stopReason, selected, candidates });
+  const grade = deriveGrade({ taskClass: own(input, 'taskClass'), stopReason, selected, candidates });
   const rewardableChoices = identifiableChoices(choices, { candidateCount, selection, candidates });
   return deepFreeze({
     grade,
@@ -248,7 +277,7 @@ function reduce(input) {
 /**
  * Reduce one Run's frozen terminal facts to its learning outcome.
  *
- * @param input `{ policyVersion: 2, candidateCount, stopReason, selection,
+ * @param input `{ policyVersion: 2, taskClass, candidateCount, stopReason, selection,
  *   candidates, effectiveChoices }` — `effectiveChoices` is
  *   `axis -> { arm, identifiable, reason }` authored by the engine.
  * @returns deep-frozen `{ grade, appliedChoices, rewardableChoices }` where the

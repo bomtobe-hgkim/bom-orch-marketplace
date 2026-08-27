@@ -1,6 +1,6 @@
 // src/learn/posteriors.mjs
 import { randomUUID } from 'node:crypto';
-import { open, readFile, rename, rm } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import {
   commitLearningOperationUnlocked,
@@ -11,6 +11,12 @@ import {
   recoverLearning,
   withLearningLock,
 } from './learning.mjs';
+import { REASON } from '../reason-codes.mjs';
+import { fail, renderNotice } from '../reason-text.mjs';
+import { errorText } from '../util/errors.mjs';
+import { renameWithRetry, writeFileAtomic } from '../util/fs-atomic.mjs';
+import { parseStrictJson } from '../util/strict-json.mjs';
+import { classifyPosteriorsSchema, posteriorCellsOf, versionedPosteriors } from './posterior-schema.mjs';
 
 /**
  * Beta 사후분포 — `<stateRoot>/posteriors.json`.
@@ -23,7 +29,7 @@ import {
  *   팔만** (1,1) 로 되돌린다. 같은 셀의 멀쩡한 팔은 건드리지 않는다.
  *
  * ★ **"안 읽힌다" 와 "비었다" 는 다른 답이다.** 파일이 없으면 `{ok:true, cells:{}}` 이고,
- *   있는데 JSON 이 아니거나 셀 객체가 아니면 `{ok:false, reason}` 이다. 둘을 같은 답으로
+ *   있는데 JSON 이 아니거나 셀 객체가 아니면 `fail(REASON.x, params)` 봉투다. 둘을 같은 답으로
  *   내면 그 위에 `updatePosterior` 가 쓰는 순간 그동안의 학습이 통째로 사라진다. 소비자는
  *   이미 `ok` 를 갈라 보고 있다(태스크 8·10 의 `got.ok ? got.cells : {}`) — 밴딧은 그때
  *   기본값으로 돌고 실행은 계속된다.
@@ -51,7 +57,7 @@ import {
  * - `readPosteriors` 는 **잠금을 잡지 않는다.** 잡으면 `updatePosterior` 가 제 잠금 안에서
  *   자기를 부르는 꼴이라 `open(...,'wx')` 가 EEXIST 로 제 자신을 기다린다. 실측: 잠금을
  *   잡는 읽기를 만들어 잠금 안에서 부르자 5010ms(=timeoutMs 5초)를 다 쓰고
- *   `잠금을 제한 시간 안에 잡지 못했습니다. (마지막 오류: EEXIST)` 로 끝났다.
+ *   `fail(REASON.state_lock_timeout, {code:'EEXIST'})` 로 끝났다.
  *   읽기가 잠금 밖이어도 rename 은 원자적이라 리더는 옛 파일 아니면 새 파일을 본다 —
  *   rename 300회를 4-way 동시 읽기와 겹쳐 돌려 읽기 실패 0회였다.
  * - 반대 방향은 Windows 에서 실제로 깨진다: **목적지 파일이 열려 있으면 rename 이 EPERM 이다.**
@@ -76,9 +82,11 @@ import {
  *   호스트 공통이라(설계 §11.3) 다른 기계·컨테이너의 같은 pid 가 같은 임시 경로를 고른다.
  * - 임시 파일에 `fsync` 를 한다. 실측: 200회에 66ms(없음) 대 330ms(있음) — 쓰기 한 번에
  *   +1.3ms 다. 없으면 전원 손실 시 rename 이 데이터보다 먼저 닿아 빈 파일이 남을 수 있고,
- *   그 상태는 위의 격리 경로로 흘러 학습이 통째로 백지가 된다. **디렉터리는 fsync 하지
- *   않는다** — Windows 에서 디렉터리 핸들은 열리지만 그 핸들의 `sync()` 가 EPERM 이다(실측).
- *   그래서 rename 자체가 디스크에 안 닿는 창은 남아 있다.
+ *   그 상태는 위의 격리 경로로 흘러 학습이 통째로 백지가 된다. **디렉터리도 fsync 한다**
+ *   (WS1 태스크 15부터. 그 전에는 안 했다). Windows 에서는 디렉터리 핸들이 열리기는 하지만
+ *   그 핸들의 `sync()` 가 EPERM 이라(실측) 거기서는 예전과 똑같이 rename 자체가 디스크에 안
+ *   닿는 창이 남는다 — 그 강등은 실패가 아니다. POSIX 에서는 그 창이 닫힌다. 재시도 수
+ *   10회 × 5ms 와 함께 이 규약은 이제 `src/util/fs-atomic.mjs` 한 곳에 있다.
  *
  * 규모 — 태스크 클래스 4개 × 축 4개 × 팔 2개 = 셀 16개로 실측: 파일 2422바이트,
  * `readFile`+`JSON.parse` 200회에 132ms(0.7ms/회). 경합 없는 `updatePosterior` 는 잠금
@@ -86,7 +94,7 @@ import {
  * `staleMs`(60초)를 넘기면 상호 배제가 깨지는 것인데(`src/lockfile.mjs:30-35`), 지금 본문은
  * 그 1/14000 이다. 셀 수는 태스크 클래스 × 축으로 상한이 있고 저널처럼 실행마다 늘지 않는다.
  *
- * **어떤 값을 넘겨도** throw 하지 않는다 — 실패는 `{ok:false, reason}` 이다. 태스크 8 은
+ * **어떤 값을 넘겨도** throw 하지 않는다 — 실패는 `fail(REASON.x, params)` 봉투다. 태스크 8 은
  * 실행이 다 끝난 뒤 `try` 없이 이 모듈을 부르고 `.ok` 만 본다. 여기서 던지면 학습 실패가
  * `orch_run` 전체를 죽인다. 값이 아니라 **읽는 행위가 던지는 것**은 다르다: 던지는 getter 를
  * 단 객체나 Proxy 를 `options` 로 넘기면 구조 분해 자리에서 그대로 나간다. 형제
@@ -97,17 +105,13 @@ const CORRUPT = 'posteriors.corrupt.json';
 export const SNAPSHOT_FILE = 'posteriors.prev.json';
 export const GENERATIONS_SNAPSHOT_FILE = 'learning.generations.prev.json';
 
-/** rename 재시도. 위 헤더의 실측이 이 두 수를 고른 근거다. */
-const RENAME_TRIES = 10;
-const RENAME_WAIT_MS = 5;
-
 export const PRIOR = Object.freeze({ alpha: 1, beta: 1 });
 
 /**
  * 셀 키. 태스크 클래스 × 결정 축.
  *
- * 태스크 10 은 `cellKey.split('::')` 로 되돌린다. 태스크 클래스에 `:` 가 하나 들어 있어도
- * (`code:test-bearing`) 구분자와 겹치지 않는다. Symbol 이 와도 던지지 않게 `String` 을 쓴다.
+ * WS7 결정: 생태계 차원을 넣지 않고 이 키를 유지한다. 신뢰 증거 생태계마다 셀을 갈라 활성화
+ * 표본을 다시 희소하게 만들지 않기 위해서다. `split('::')` 복원과 Symbol 안전성도 유지한다.
  */
 export function cellKeyOf(taskClass, axis) {
   return `${String(taskClass)}::${String(axis)}`;
@@ -146,7 +150,7 @@ const clampArm = (value) => {
  */
 function clampCells(raw) {
   const cells = [];
-  for (const [cellKey, arms] of Object.entries(raw)) {
+  for (const [cellKey, arms] of Object.entries(posteriorCellsOf(raw))) {
     if (arms === null || typeof arms !== 'object' || Array.isArray(arms)) continue;
     cells.push([cellKey, Object.fromEntries(Object.entries(arms).map(([arm, value]) => [arm, clampArm(value)]))]);
   }
@@ -165,24 +169,40 @@ async function load(file) {
     bytes = await readFile(file);
   } catch (error) {
     if (error?.code === 'ENOENT') return { state: 'missing' };
-    return { state: 'unreadable', reason: `사후분포를 읽지 못했습니다: ${describe(error)}` };
+    return { state: 'unreadable', failure: fail(REASON.learning_posteriors_read_failed, { detail: errorText(error) }) };
   }
-  const text = bytes.toString('utf8');
-  let raw;
-  try {
-    raw = JSON.parse(text);
-  } catch (error) {
-    return { state: 'corrupt', bytes, reason: `사후분포가 JSON 으로 읽히지 않습니다: ${describe(error)}` };
+  const document = parseStrictJson(bytes);
+  if (!document.ok) {
+    const detail = document.kind === 'ambiguous'
+      ? 'posteriors.json contains duplicate keys or excessive nesting'
+      : 'posteriors.json is not valid JSON';
+    return document.kind === 'ambiguous'
+      ? { state: 'unreadable', bytes, failure: fail(REASON.learning_posteriors_read_failed, { detail }) }
+      : { state: 'corrupt', bytes, failure: fail(REASON.learning_posteriors_not_json, { detail }) };
   }
+  const raw = document.value;
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { state: 'corrupt', bytes, reason: '사후분포 파일이 셀 객체가 아닙니다.' };
+    return { state: 'corrupt', bytes, failure: fail(REASON.learning_posteriors_shape_invalid) };
   }
+  const schema = classifyPosteriorsSchema(raw);
+  if (schema.status === 'invalid') {
+    return {
+      state: 'unreadable',
+      bytes,
+      failure: fail(REASON.learning_posteriors_read_failed, {
+        detail: 'posteriors.json contains an invalid schemaVersion',
+      }),
+    };
+  }
+  if (schema.status === 'newer') return { state: 'newer', bytes, stateSchema: schema.stateSchema };
   return { state: 'ok', raw, bytes };
 }
 
 export async function readPosteriors(stateRoot) {
   const paths = pathsFor(stateRoot);
-  if (paths === null) return { ok: false, reason: '상태 루트가 절대 경로가 아닙니다.' };
+  if (paths === null) return fail(REASON.state_root_not_absolute);
+  const loaded = await load(paths.file);
+  if (loaded.state === 'newer') return { ok: true, cells: {}, stateSchema: loaded.stateSchema };
   // Atomic rename lets ordinary reads stay nonblocking.  Only a visible WAL
   // requires the coordinator so the reader can finish the interrupted pair.
   if (await hasPendingLearningOperation(stateRoot)) {
@@ -195,11 +215,12 @@ export async function readPosteriors(stateRoot) {
 /** Read without the coordinator; only a coordinator callback may use it. */
 export async function readPosteriorsUnlocked(stateRoot) {
   const paths = pathsFor(stateRoot);
-  if (paths === null) return { ok: false, reason: '상태 루트가 절대 경로가 아닙니다.' };
+  if (paths === null) return fail(REASON.state_root_not_absolute);
   const loaded = await load(paths.file);
   if (loaded.state === 'missing') return { ok: true, cells: {} };
   if (loaded.state === 'ok') return { ok: true, cells: clampCells(loaded.raw) };
-  return { ok: false, reason: loaded.reason };
+  if (loaded.state === 'newer') return { ok: true, cells: {}, stateSchema: loaded.stateSchema };
+  return loaded.failure;
 }
 
 /**
@@ -240,8 +261,8 @@ export async function updatePosterior(stateRoot, options) {
  */
 export async function updatePosteriors(stateRoot, updates) {
   const paths = pathsFor(stateRoot);
-  if (paths === null) return { ok: false, reason: '상태 루트가 절대 경로가 아닙니다.' };
-  if (!Array.isArray(updates)) return { ok: false, reason: 'updates 가 배열이 아닙니다.' };
+  if (paths === null) return fail(REASON.state_root_not_absolute);
+  if (!Array.isArray(updates)) return fail(REASON.learning_updates_invalid);
 
   // `= {}` 파라미터 기본값은 `undefined` 에만 걸린다 — `null` 을 넘기면 구조 분해가 그
   // 자리에서 던진다. `lockfile.mjs:42-45`·`journal.mjs:117-120` 와 같은 층위로 여기서
@@ -249,24 +270,30 @@ export async function updatePosteriors(stateRoot, updates) {
   const plan = [];
   for (const options of updates) {
     const { cellKey, arm, alphaDelta = 0, betaDelta = 0 } = options !== null && typeof options === 'object' ? options : {};
-    if (typeof cellKey !== 'string' || cellKey === '') return { ok: false, reason: 'cellKey 가 비어 있습니다.' };
-    if (typeof arm !== 'string' || arm === '') return { ok: false, reason: 'arm 이 비어 있습니다.' };
+    if (typeof cellKey !== 'string' || cellKey === '') return fail(REASON.learning_cell_key_missing);
+    if (typeof arm !== 'string' || arm === '') return fail(REASON.learning_arm_missing);
     plan.push({ cellKey, arm, alphaDelta, betaDelta });
   }
   if (plan.length === 0) return { ok: true };
 
   const got = await withLearningLock(stateRoot, async () => {
     const loaded = await load(paths.file);
-    if (loaded.state === 'unreadable') return { ok: false, reason: loaded.reason };
+    if (loaded.state === 'unreadable') return loaded.failure;
+    if (loaded.state === 'newer') return { ok: false, stateSchema: loaded.stateSchema };
 
     const notes = [];
     let cells = {};
     if (loaded.state === 'corrupt') {
       const moved = await renameWithRetry(paths.file, paths.corrupt);
       if (!moved.ok) {
-        return { ok: false, reason: `${loaded.reason} 그리고 ${CORRUPT} 로 치우지도 못했습니다: ${moved.reason}` };
+        // 사실이 둘(왜 못 읽었나 · 왜 못 치웠나)이고 슬롯은 하나다 — 둘을 이어 싣는다. 하나만
+        // 실으면 사용자는 파일을 고쳐야 할지 권한을 고쳐야 할지 알 수 없다.
+        return fail(REASON.learning_posteriors_quarantine_failed, {
+          path: CORRUPT,
+          detail: `${loaded.failure.error} / ${moved.reason}`,
+        });
       }
-      notes.push(`손상된 사후분포를 ${CORRUPT} 로 치우고 백지에서 다시 시작합니다: ${loaded.reason}`);
+      notes.push(renderNotice('posteriors_corrupt_set_aside', { path: CORRUPT, reason: loaded.failure.error }));
     } else if (loaded.state === 'ok') {
       cells = clampCells(loaded.raw);
     }
@@ -288,7 +315,7 @@ export async function updatePosteriors(stateRoot, updates) {
     }
 
     const written = await writeAtomic(paths, Object.fromEntries(byCell));
-    return written.ok ? { ok: true, notes } : { ok: false, reason: written.reason };
+    return written.ok ? { ok: true, notes } : written;
   });
 
   return settle(got);
@@ -313,7 +340,7 @@ export async function commitLearningMutation(stateRoot, mutation, options) {
 
 export async function commitLearningMutationUnlocked(stateRoot, mutation, options) {
   const paths = pathsFor(stateRoot);
-  if (paths === null) return { ok: false, reason: '상태 루트가 절대 경로가 아닙니다.' };
+  if (paths === null) return fail(REASON.state_root_not_absolute);
   const updates = Array.isArray(mutation?.updates) ? mutation.updates : [];
   const plan = normalizeUpdates(updates);
   if (!plan.ok) return plan;
@@ -328,7 +355,7 @@ export async function commitLearningMutationUnlocked(stateRoot, mutation, option
   if (mutation?.journal !== null && mutation?.journal !== undefined) {
     const generations = await readGenerationsUnlocked(stateRoot);
     if (!generations.ok) return { ...generations, pending: false };
-    const prepared = prepareJournalTarget(mutation.journal, generations.generations);
+    const prepared = prepareJournalTarget(mutation.journal, generations.generations, options?.now);
     if (!prepared.ok) return { ...prepared, pending: false };
     journal = prepared.entry;
   }
@@ -336,7 +363,12 @@ export async function commitLearningMutationUnlocked(stateRoot, mutation, option
   const operation = {
     version: 1,
     operationId: makeOperationId(),
-    targets: { posteriors: target.cells, generations: null, journal, quarantine: target.quarantine },
+    targets: {
+      posteriors: target.cells === null ? null : versionedPosteriors(target.cells),
+      generations: null,
+      journal,
+      quarantine: target.quarantine,
+    },
   };
   const committed = await commitLearningOperationUnlocked(stateRoot, operation, options);
   if (!committed.ok) {
@@ -364,15 +396,15 @@ export async function commitLearningMutationUnlocked(stateRoot, mutation, option
  *   `learning.mjs` 의 작업 형식은 그대로 version 1 이다.
  */
 function normalizeUpdates(updates) {
-  if (!Array.isArray(updates)) return { ok: false, reason: 'updates 가 배열이 아닙니다.' };
+  if (!Array.isArray(updates)) return fail(REASON.learning_updates_invalid);
   const plan = [];
   const seenCells = new Set();
   for (const options of updates) {
     const { cellKey, arm, alphaDelta = 0, betaDelta = 0 } = options !== null && typeof options === 'object' ? options : {};
-    if (typeof cellKey !== 'string' || cellKey === '') return { ok: false, reason: 'cellKey 가 비어 있습니다.' };
-    if (typeof arm !== 'string' || arm === '') return { ok: false, reason: 'arm 이 비어 있습니다.' };
+    if (typeof cellKey !== 'string' || cellKey === '') return fail(REASON.learning_cell_key_missing);
+    if (typeof arm !== 'string' || arm === '') return fail(REASON.learning_arm_missing);
     if (seenCells.has(cellKey)) {
-      return { ok: false, reason: `한 트랜잭션에 같은 cellKey 가 두 번 왔습니다: ${cellKey}` };
+      return fail(REASON.learning_cell_key_duplicated, { cell: cellKey });
     }
     seenCells.add(cellKey);
     plan.push({ cellKey, arm, alphaDelta, betaDelta });
@@ -382,7 +414,8 @@ function normalizeUpdates(updates) {
 
 async function buildPosteriorTarget(paths, plan) {
   const loaded = await load(paths.file);
-  if (loaded.state === 'unreadable') return { ok: false, reason: loaded.reason };
+  if (loaded.state === 'unreadable') return loaded.failure;
+  if (loaded.state === 'newer') return { ok: false, stateSchema: loaded.stateSchema };
   const notes = [];
   let quarantine = null;
   let cells = {};
@@ -392,7 +425,7 @@ async function buildPosteriorTarget(paths, plan) {
     // recovery writes that copy and the posterior target in the same replay.
     // A process crash before the WAL therefore leaves the original untouched.
     quarantine = { file: CORRUPT, bytes: loaded.bytes.toString('base64') };
-    notes.push(`손상된 사후분포를 ${CORRUPT} 로 보존하고 백지에서 다시 시작합니다: ${loaded.reason}`);
+    notes.push(renderNotice('posteriors_corrupt_preserved', { path: CORRUPT, reason: loaded.failure.error }));
   } else if (loaded.state === 'ok') {
     cells = clampCells(loaded.raw);
   }
@@ -410,12 +443,18 @@ async function buildPosteriorTarget(paths, plan) {
   return { ok: true, cells: Object.fromEntries(byCell), notes, quarantine };
 }
 
-function prepareJournalTarget(entry, generations) {
+/**
+ * ★ `clock` 은 **테스트가 정정 시각을 못박기 위한 이음새**다(`orch_reward` 가 `deps.now`
+ *   로 흘려보낸다). 기본값이 진짜 시계라 주지 않으면 찍히는 바이트가 그대로다 — 이것이
+ *   없으면 "교체 줄이 새로 찍혔다" 를 「씨앗 시각보다 크다」로밖에 못 재고, 그 단언은
+ *   2033년까지만 참인 데다 언제 찍혔는지는 말해 주지 않는다.
+ */
+function prepareJournalTarget(entry, generations, clock) {
   try {
     if (entry === null || typeof entry !== 'object' || typeof entry.runId !== 'string' || entry.runId === '') {
-      return { ok: false, reason: 'runId 가 있는 객체여야 합니다.' };
+      return fail(REASON.learning_journal_record_invalid);
     }
-    const now = Date.now();
+    const now = typeof clock === 'function' ? clock() : Date.now();
     const taskClass = typeof entry.taskClass === 'string' ? entry.taskClass : null;
     const axesOf = (value) => (Array.isArray(value) ? value.filter((axis) => typeof axis === 'string' && axis !== '') : []);
     const mapFor = (axes) => Object.fromEntries(axes.map((axis) => [axis, taskClass === null ? 0 : generationOf(generations, cellKeyOf(taskClass, axis))]));
@@ -432,13 +471,13 @@ function prepareJournalTarget(entry, generations) {
       },
     };
   } catch (error) {
-    return { ok: false, reason: `실행 저널 작업을 만들지 못했습니다: ${describe(error)}` };
+    return fail(REASON.learning_journal_row_unbuildable, { detail: errorText(error) });
   }
 }
 
 export async function resetPosteriors(stateRoot, options) {
   const paths = pathsFor(stateRoot);
-  if (paths === null) return { ok: false, reason: '상태 루트가 절대 경로가 아닙니다.' };
+  if (paths === null) return fail(REASON.state_root_not_absolute);
   const { cellKey = null, cellKeys, taskClass, onPhase } = options !== null && typeof options === 'object' ? options : {};
   // ★ 문자열이 아닌 `cellKey` 를 조용히 **전체 삭제**로 떨어뜨리지 않는다. `null`·`undefined`
   //   는 "전부 지워라" 라는 뜻이지만 `42`·`['a::b']`·`{toString(){…}}` 는 셀 하나를 지우려다
@@ -446,20 +485,20 @@ export async function resetPosteriors(stateRoot, options) {
   //   사라지고 `{ok:true, cleared:2}` 라는 답만 남는다. `orch_stats` 에 이미 `task_class`
   //   인자가 있으니 셀 범위 reset 이 붙는 순간 이 자리에 값이 흘러든다.
   if (cellKey !== null && cellKey !== undefined) {
-    if (typeof cellKey !== 'string') return { ok: false, reason: 'cellKey 가 문자열이 아닙니다.' };
-    if (cellKey === '') return { ok: false, reason: 'cellKey 가 비어 있습니다.' };
+    // 「문자열이 아니다」와 「빈 문자열이다」는 사용자에게 같은 조치다 — 코드 하나로 접는다.
+    if (typeof cellKey !== 'string' || cellKey === '') return fail(REASON.learning_cell_key_invalid);
   }
   if (cellKeys !== undefined) {
-    if (cellKey !== null && cellKey !== undefined) return { ok: false, reason: 'cellKey 와 cellKeys 를 함께 줄 수 없습니다.' };
-    if (!Array.isArray(cellKeys)) return { ok: false, reason: 'cellKeys 가 배열이 아닙니다.' };
+    if (cellKey !== null && cellKey !== undefined) return fail(REASON.learning_cell_key_conflict);
+    if (!Array.isArray(cellKeys)) return fail(REASON.learning_cell_keys_invalid);
     for (const key of cellKeys) {
-      if (typeof key !== 'string' || key === '') return { ok: false, reason: 'cellKeys 에 빈 문자열 아닌 문자열만 넣으세요.' };
+      if (typeof key !== 'string' || key === '') return fail(REASON.learning_cell_keys_invalid);
     }
   }
   if (taskClass !== undefined) {
-    if (typeof taskClass !== 'string' || taskClass === '') return { ok: false, reason: 'taskClass 가 빈 문자열 아닌 문자열이 아닙니다.' };
+    if (typeof taskClass !== 'string' || taskClass === '') return fail(REASON.learning_task_class_invalid);
     if (cellKey !== null && cellKey !== undefined || cellKeys !== undefined) {
-      return { ok: false, reason: 'taskClass 는 cellKey 또는 cellKeys 와 함께 줄 수 없습니다.' };
+      return fail(REASON.learning_task_class_conflict);
     }
   }
   // `cellKey` 는 기존 단일 호출 계약이다. 범위 reset 은 목록을 이 자리로 넘겨 한 번의
@@ -468,12 +507,13 @@ export async function resetPosteriors(stateRoot, options) {
 
   const got = await withLearningLock(stateRoot, async () => {
     const loaded = await load(paths.file);
-    if (loaded.state === 'unreadable') return { ok: false, reason: loaded.reason };
+    if (loaded.state === 'unreadable') return loaded.failure;
+    if (loaded.state === 'newer') return { ok: false, stateSchema: loaded.stateSchema };
     if (taskClass !== undefined) {
       if (loaded.state === 'missing') return { ok: true, cleared: 0, asked: 0, cellKeys: [], notes: [] };
-      if (loaded.state !== 'ok') return { ok: false, reason: '손상된 사후분포에서는 taskClass 범위를 정할 수 없습니다. 전체 reset을 사용하세요.' };
+      if (loaded.state !== 'ok') return fail(REASON.learning_scope_unreadable);
       only = new Set(
-        Object.keys(loaded.raw).filter((key) => {
+        Object.keys(posteriorCellsOf(loaded.raw)).filter((key) => {
           const marker = key.indexOf('::');
           return marker >= 0 && key.slice(0, marker) === taskClass;
         }),
@@ -504,19 +544,26 @@ export async function resetPosteriors(stateRoot, options) {
       // `posteriors.prev.json` 은 reset의 마지막 회복점, `posteriors.corrupt.json` 은 update의
       // 격리본이라 서로 덮지 않는다. 어느 쪽도 증거를 잃지 않게 손상 바이트 자체를 먼저 쓴다.
       const snapshotted = await writeSnapshot(paths, loaded.bytes);
-      if (!snapshotted.ok) return { ok: false, reason: `스냅샷을 쓰지 못해 reset 하지 않았습니다: ${snapshotted.reason}` };
+      if (!snapshotted.ok) return fail(REASON.learning_snapshot_failed, { detail: snapshotted.error });
       const generationsSnapshotted = await writeGenerationSnapshot(paths);
-      if (!generationsSnapshotted.ok) return { ok: false, reason: `세대 스냅샷을 쓰지 못해 reset 하지 않았습니다: ${generationsSnapshotted.reason}` };
+      if (!generationsSnapshotted.ok) return fail(REASON.learning_generations_snapshot_failed, { detail: generationsSnapshotted.error });
       const advanced = await resetGenerationTarget(stateRoot, {}, null, onPhase);
       if (!advanced.ok) return { ...advanced, ...(asked === undefined ? {} : { asked, cellKeys: selectedKeys }) };
-      return { ok: true, cleared: 0, discarded: true, snapshotted: true, notes: [`읽을 수 없는 사후분포를 버렸습니다: ${loaded.reason}`] };
+      return {
+        ok: true,
+        cleared: 0,
+        discarded: true,
+        snapshotted: true,
+        notes: [renderNotice('posteriors_unreadable_discarded', { reason: loaded.failure.error })],
+      };
     }
 
     // ★ 클램프한 뷰가 아니라 **날것**에서 지운다. 클램프는 팔 객체가 아닌 셀을 버리는데,
     //   그 뷰를 도로 쓰면 셀 하나를 지우라는 호출이 사용자가 지우라고 하지 않은 셀까지
     //   함께 없앤다. 지우라고 한 것만 지운다 — 남는 쓰레기는 `readPosteriors` 가 어차피
     //   무시하고, 다음 `updatePosterior` 가 정상화한다.
-    const byCell = new Map(Object.entries(loaded.raw));
+    const rawCells = posteriorCellsOf(loaded.raw);
+    const byCell = new Map(Object.entries(rawCells));
     if (only === null) byCell.clear();
     else if (only instanceof Set) {
       for (const key of only) byCell.delete(key);
@@ -524,17 +571,17 @@ export async function resetPosteriors(stateRoot, options) {
 
     // ★ `cleared` 는 **파일에서 사라진 최상위 셀의 수**다. 전체 삭제와 셀 삭제를 같은 축으로
     //   센다 — 지운 것보다 적게 말하면 사용자가 남았다고 믿는다.
-    const cleared = Object.keys(loaded.raw).length - byCell.size;
+    const cleared = Object.keys(rawCells).length - byCell.size;
     // 지울 것이 없으면 쓰지 않는다 — 없던 파일을 만들지도, 멀쩡한 파일의 시각을 흔들지도
     // 않는다.
     if (cleared === 0) return { ok: true, cleared: 0, ...(asked === undefined ? {} : { asked, cellKeys: selectedKeys }), notes: [] };
 
     // 삭제와 같은 잠금 안에서, 본 파일보다 먼저 쓴다. 실패하면 본 파일은 아직 그대로다.
     const snapshotted = await writeSnapshot(paths, loaded.bytes);
-    if (!snapshotted.ok) return { ok: false, reason: `스냅샷을 쓰지 못해 reset 하지 않았습니다: ${snapshotted.reason}` };
+    if (!snapshotted.ok) return fail(REASON.learning_snapshot_failed, { detail: snapshotted.error });
     const generationsSnapshotted = await writeGenerationSnapshot(paths);
-    if (!generationsSnapshotted.ok) return { ok: false, reason: `세대 스냅샷을 쓰지 못해 reset 하지 않았습니다: ${generationsSnapshotted.reason}` };
-    const removed = Object.keys(loaded.raw).filter((key) => !byCell.has(key));
+    if (!generationsSnapshotted.ok) return fail(REASON.learning_generations_snapshot_failed, { detail: generationsSnapshotted.error });
+    const removed = Object.keys(rawCells).filter((key) => !byCell.has(key));
     const advanced = await resetGenerationTarget(stateRoot, Object.fromEntries(byCell), only === null ? null : removed, onPhase);
     return advanced.ok
       ? { ok: true, cleared, snapshotted: true, ...(asked === undefined ? {} : { asked, cellKeys: removed }), notes: [] }
@@ -545,7 +592,7 @@ export async function resetPosteriors(stateRoot, options) {
   // `discarded:true` 는 "읽을 수 없는 파일을 통째로 버렸다" 는 뜻이다 — `cleared:0` 이 그것을
   // "지울 것이 없었다" 와 구별하지 못한다. `notice` 와 같은 **덧붙는 키**로 둔다(그 갈래에서만
   // 나타난다) — 늘 싣게 하면 이 봉투를 정확 집합으로 재는 기존 단언 다섯이 뜻 없이 붉어진다.
-  const 버렸나 = got.value?.discarded === true ? { discarded: true } : {};
+  const discardedFlag = got.value?.discarded === true ? { discarded: true } : {};
   if (!settled.ok) {
     return got.ok && Number.isInteger(got.value?.asked)
       ? { ...settled, asked: got.value.asked, cellKeys: got.value.cellKeys }
@@ -553,7 +600,7 @@ export async function resetPosteriors(stateRoot, options) {
   }
   return {
     ...settled,
-    ...버렸나,
+    ...discardedFlag,
     cleared: got.value.cleared,
     ...(Number.isInteger(got.value?.asked) ? { asked: got.value.asked, cellKeys: got.value.cellKeys } : {}),
   };
@@ -579,7 +626,7 @@ async function resetGenerationTarget(stateRoot, posteriors, scopedKeys, onPhase)
   return commitLearningOperationUnlocked(stateRoot, {
     version: 1,
     operationId: makeOperationId(),
-    targets: { posteriors, generations: next, journal: null },
+    targets: { posteriors: versionedPosteriors(posteriors), generations: next, journal: null },
   }, { onPhase });
 }
 
@@ -592,10 +639,15 @@ async function resetGenerationTarget(stateRoot, posteriors, scopedKeys, onPhase)
  * 덧붙는 키라 `.ok` 만 보는 태스크 8·10 과 어긋나지 않는다.
  */
 function settle(got) {
-  const leftover = got.released === false ? `사후분포 잠금이 남았습니다: ${got.releaseReason}` : null;
-  if (!got.ok) return { ok: false, reason: [got.reason, leftover].filter(Boolean).join(' / ') };
+  const leftover = got.released === false
+    ? renderNotice('posteriors_lock_left_behind', { reason: got.releaseReason })
+    : null;
+  // ★ 남은 잠금은 **실패의 사유가 아니라 덧붙는 알림**이다. 예전에는 사유 문장에 ` / ` 로 이어
+  //   붙였는데, 그러면 실패 봉투의 다섯 키 중 `error` 만 남고 `reasonCode` 는 사라졌다.
+  const carry = (envelope) => (leftover === null ? envelope : { ...envelope, notice: leftover });
+  if (!got.ok) return carry(got);
   const inner = got.value;
-  if (!inner.ok) return { ok: false, reason: [inner.reason, leftover].filter(Boolean).join(' / ') };
+  if (!inner.ok) return carry(inner);
   const notices = [...inner.notes, leftover].filter(Boolean);
   return notices.length > 0 ? { ok: true, notice: notices.join(' / ') } : { ok: true };
 }
@@ -610,27 +662,33 @@ function bump(base, delta, name) {
   const step = Number.isFinite(delta) ? delta : 0;
   const next = base + step;
   if (!Number.isFinite(next)) {
-    return { value: base, note: `${name} 가 유한한 범위를 넘어 갱신하지 않았습니다.` };
+    return { value: base, note: renderNotice('posterior_out_of_finite_range', { name }) };
   }
   const floor = Math.min(base, PRIOR[name]);
   if (next < floor) {
-    return { value: floor, note: `${name} 가 하한 ${floor} 밑으로 내려가 막았습니다(${base} + ${step} = ${next}).` };
+    return { value: floor, note: renderNotice('posterior_floor_clamped', { name, floor, base, step }) };
   }
   return { value: next, note: null };
 }
 
 /**
- * 임시 파일에 쓰고 fsync 한 뒤 제자리로 옮긴다. 실패하든 성공하든 임시 파일은 남기지 않는다.
+ * 임시 파일에 쓰고 fsync 한 뒤 제자리로 옮긴다. 실패하든 성공하든 임시 파일은 남지 않는다.
  *
- * rename 이 성공하면 임시 경로는 이미 없어 `rm` 이 무연산이고, 실패하면 그것이 치운다.
+ * rename 이 성공하면 임시 경로가 이미 목적지로 옮겨져 치울 것이 없고, 실패하면 도우미가
+ * 치운다(더 이상 `finally` 의 `rm` 이 아니다 — WS1 태스크 15).
  */
 async function writeAtomic(paths, cells) {
-  return writeAtomicBytes(paths, paths.file, FILE, Buffer.from(`${JSON.stringify(cells, null, 2)}\n`, 'utf8'), '사후분포');
+  return writeAtomicBytes(
+    paths,
+    paths.file,
+    FILE,
+    Buffer.from(`${JSON.stringify(versionedPosteriors(cells), null, 2)}\n`, 'utf8'),
+  );
 }
 
 /** reset 전 원본 바이트 하나를 남긴다. JSON으로 다시 만들면 손상 바이트를 잃는다. */
 async function writeSnapshot(paths, bytes) {
-  return writeAtomicBytes(paths, paths.snapshot, SNAPSHOT_FILE, bytes, '사후분포 스냅샷');
+  return writeAtomicBytes(paths, paths.snapshot, SNAPSHOT_FILE, bytes);
 }
 
 /** Reset validity is part of the restorable learning state, not disposable metadata. */
@@ -639,63 +697,29 @@ async function writeGenerationSnapshot(paths) {
   try {
     bytes = await readFile(paths.generations);
   } catch (error) {
-    if (error?.code !== 'ENOENT') return { ok: false, reason: describe(error) };
+    if (error?.code !== 'ENOENT') return fail(REASON.learning_generations_read_failed, { detail: errorText(error) });
     // A missing sidecar is legacy generation 0.  Materialize that exact
     // meaning in the snapshot so restoring it also restores old journal rows.
     bytes = Buffer.from('{\n  "global": 0,\n  "cells": {}\n}\n', 'utf8');
   }
-  return writeAtomicBytes(paths, paths.generationSnapshot, GENERATIONS_SNAPSHOT_FILE, bytes, '학습 세대 스냅샷');
+  return writeAtomicBytes(paths, paths.generationSnapshot, GENERATIONS_SNAPSHOT_FILE, bytes);
 }
 
-async function writeAtomicBytes(paths, target, name, bytes, label) {
+/**
+ * 임시 파일 + fsync + rename 은 `src/util/fs-atomic.mjs` 하나로 모았다. 그 모듈이 헤더의
+ * 실측이 고른 것을 그대로 한다: `'wx'` 배타 생성(남의 임시 파일 위에 쓰지 않고, EEXIST 로
+ * 튕겼으면 그 파일을 지우지도 않는다), 데이터 fsync 와 **삼켜지는** 그 실패(네트워크
+ * 마운트의 EINVAL — 내구성만 잃고 내용은 그대로다), EPERM/EACCES/EBUSY 10회 × 5ms rename
+ * 재시도, 그리고 **실패했을 때** 임시 파일 치우기. 여기 남는 것은 임시 이름과 실패 문장뿐이다.
+ */
+async function writeAtomicBytes(paths, target, name, bytes) {
   const tmp = join(paths.root, `${name}.${process.pid}.${randomUUID()}.tmp`);
-  try {
-    // 'wx' — 남의 임시 파일 위에 쓰지 않는다. UUID 가 겹칠 일은 없지만 앞선 실행이 남긴
-    // 잔재와 이름이 같을 때 조용히 이어 쓰는 것보다 실패하는 편이 낫다.
-    const handle = await open(tmp, 'wx');
-    try {
-      await handle.writeFile(bytes);
-      // fsync 실패는 쓰기 실패가 아니다(네트워크 마운트에서 EINVAL 이 난다) — 내구성만
-      // 잃고 내용은 그대로다. 그래서 삼킨다.
-      await handle.sync().catch(() => {});
-    } finally {
-      await handle.close().catch(() => {});
-    }
-    const moved = await renameWithRetry(tmp, target);
-    return moved.ok ? { ok: true } : { ok: false, reason: `${label}을(를) 제자리로 옮기지 못했습니다: ${moved.reason}` };
-  } catch (error) {
-    return { ok: false, reason: `${label}을(를) 쓰지 못했습니다: ${describe(error)}` };
-  } finally {
-    await rm(tmp, { force: true }).catch(() => {});
-  }
-}
-
-/** Windows 의 rename EPERM(목적지가 열려 있음)은 대개 몇 ms 안에 풀린다. 헤더의 실측 참고. */
-async function renameWithRetry(from, to) {
-  let last = null;
-  for (let attempt = 1; attempt <= RENAME_TRIES; attempt += 1) {
-    try {
-      await rename(from, to);
-      return { ok: true };
-    } catch (error) {
-      last = error;
-      const retryable = error?.code === 'EPERM' || error?.code === 'EACCES' || error?.code === 'EBUSY';
-      if (!retryable || attempt === RENAME_TRIES) break;
-      await new Promise((r) => setTimeout(r, RENAME_WAIT_MS));
-    }
-  }
-  return { ok: false, reason: describe(last) };
-}
-
-/** 던져진 것에서 사람이 읽을 사유를 만든다. 사유를 만들다 또 던지면 계약이 깨진다. */
-function describe(error) {
-  if (error === undefined) return '사유 없이 undefined 가 던져졌습니다.';
-  if (error === null) return '사유 없이 null 이 던져졌습니다.';
-  try {
-    const message = error?.message;
-    if (typeof message === 'string' && message !== '') return message;
-    return String(error);
-  } catch {
-    return '사유를 읽지 못했습니다.';
-  }
+  const written = await writeFileAtomic(target, bytes, { tempPath: tmp, fsync: true, syncDir: true });
+  if (written.ok) return { ok: true };
+  // ★ 별도의 `label` 인자는 없앴다(WS2 Task 16) — 파일 이름이 곧 그 라벨이고, 이름 둘을
+  //   나란히 두면 하나를 고칠 때 다른 하나가 뒤처진다. 두 코드를 가르는 이유는 그대로다:
+  //   「쓰지 못했다」와 「제자리로 옮기지 못했다」는 호출자에게 다른 뜻이다.
+  return written.stage === 'rename'
+    ? fail(REASON.learning_work_publish_failed, { name, detail: written.reason })
+    : fail(REASON.learning_work_write_failed, { name, detail: written.reason });
 }

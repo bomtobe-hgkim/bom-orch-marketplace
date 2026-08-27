@@ -1,9 +1,18 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
+import { TextDecoder } from 'node:util';
 import { withLock } from './lockfile.mjs';
+import { REASON } from './reason-codes.mjs';
+import { fail, renderNotice } from './reason-text.mjs';
+import { errorText } from './util/errors.mjs';
+import { writeFileAtomic } from './util/fs-atomic.mjs';
 
 const FILENAME = 'settings.ini';
 const LOCKNAME = 'settings.lock';
+const METADATA_SECTION = 'bom-orch';
+export const SETTINGS_SCHEMA_VERSION = 1;
+const SETTINGS_DECODER = new TextDecoder('utf-8', { fatal: true });
+const AMBIGUOUS_SETTINGS = 'settings.ini contains ambiguous or invalid schema metadata, or invalid UTF-8';
 
 /**
  * settings.ini 의 섹션 이름이 되는 벤더 id.
@@ -134,9 +143,56 @@ function tierConfig(section) {
 
 /** 파싱된 ini 를 벤더별 tier 설정으로 옮긴다. 읽기와 쓰기가 같은 함수를 쓴다. */
 function toSettings(ini) {
-  const settings = {};
+  const control = ini?.[METADATA_SECTION] ?? {};
+  const settings = {
+    writer: VENDORS.includes(control.writer) ? control.writer : null,
+    learning: control.learning === 'off' ? 'off' : 'on',
+  };
   for (const vendor of VENDORS) settings[vendor] = tierConfig(ini[vendor]);
   return settings;
+}
+
+/** JSON은 400자리 정수를 +Infinity로 읽으므로 진단 가능한 유한 상한으로 포화한다. */
+function jsonSafeSchemaVersion(value) {
+  if (Number.isInteger(value)) return value;
+  return value === Number.POSITIVE_INFINITY ? Number.MAX_VALUE : null;
+}
+
+function classifySettingsSchema(text, ini) {
+  let markers = 0;
+  let section = null;
+  for (const line of splitLines(text)) {
+    const trimmed = line.text.trim();
+    if (trimmed.startsWith('[')) {
+      section = headerNameOf(trimmed);
+    } else if (section === METADATA_SECTION && keyNameOf(trimmed) === 'schemaVersion') {
+      markers += 1;
+    }
+  }
+  if (markers === 0) return { status: 'legacy' };
+  if (markers > 1) return { status: 'invalid' };
+  const raw = ini?.[METADATA_SECTION]?.schemaVersion;
+  const found = typeof raw === 'string' && /^(?:0|[1-9]\d*)$/.test(raw)
+    ? jsonSafeSchemaVersion(Number(raw))
+    : null;
+  if (!Number.isInteger(found)) return { status: 'invalid' };
+  if (found > SETTINGS_SCHEMA_VERSION) {
+    return {
+      status: 'newer',
+      stateSchema: { file: FILENAME, status: 'newer', found, supported: SETTINGS_SCHEMA_VERSION },
+    };
+  }
+  return { status: found === SETTINGS_SCHEMA_VERSION ? 'current' : 'legacy' };
+}
+
+function settingsTextOf(raw) {
+  if (typeof raw === 'string') return raw;
+  if (!ArrayBuffer.isView(raw)) return null;
+  try {
+    return SETTINGS_DECODER.decode(raw);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -150,16 +206,30 @@ function toSettings(ini) {
  *   사용자가 값을 적으면 아무 일도 안 일어나고 아무도 알려주지 않았다. **일부러 안
  *   만든 기능의 손잡이**라 조용한 no-op 중에서도 나쁜 쪽이라 파싱을 지운다. 그 섹션은
  *   다른 미지의 키와 마찬가지로 무시된다.
+ *
+ * ★ `readable` 은 봉투의 `confidence` 가 쓰는 신호다(WS0 §2.2: 「조회는 정본 파일 읽음」이
+ *   verified, 「파일 읽기 실패」가 unverified). **없는 파일은 읽기 실패가 아니다** — 그때의
+ *   「전부 null」 은 이 호출이 확립한 사실이다(파일이 없다는 것을 방금 봤다). 권한·EISDIR
+ *   처럼 파일이 있는데 못 읽은 경우만 거짓이고, 그때의 「전부 null」 은 지어낸 답이다.
  */
-export async function readSettings(stateRoot) {
-  let ini = {};
+export async function readSettingsStatus(stateRoot) {
   try {
-    ini = parseIni(await readFile(join(stateRoot, FILENAME), 'utf8'));
-  } catch {
-    // 없음·읽기 실패 — 빈 설정으로 간다. 설정은 선택 사항이다.
+    const text = settingsTextOf(await readFile(join(stateRoot, FILENAME)));
+    if (text === null) return { settings: toSettings({}), readable: false };
+    const ini = parseIni(text);
+    const schema = classifySettingsSchema(text, ini);
+    if (schema.status === 'invalid') return { settings: toSettings({}), readable: false };
+    return schema.status === 'newer'
+      ? { settings: toSettings({}), readable: true, stateSchema: schema.stateSchema }
+      : { settings: toSettings(ini), readable: true };
+  } catch (error) {
+    return { settings: toSettings({}), readable: error?.code === 'ENOENT' };
   }
+}
 
-  return toSettings(ini);
+/** 설정만. 읽을 수 있었는지까지 필요하면 `readSettingsStatus` 를 쓴다. */
+export async function readSettings(stateRoot) {
+  return (await readSettingsStatus(stateRoot)).settings;
 }
 
 /**
@@ -189,8 +259,15 @@ export function resolveTier(settings, vendorId, tier) {
  * 호출부는 같은 파일의 `writeSettings` 다 — 검사 대상은 패치 조각이 아니라 **파일과
  * 합친 결과**다. 조각만 보면 `{strongEffort:'ultra'}` 처럼 모델이 안 실린 패치에서
  * 위 첫 줄의 이른 반환에 걸려 늘 통과한다(실측).
+ *
+ * ★ `scope`(WS2 Task 16): `writeSettings` 는 벤더·티어를 다루지만 이 함수는 그것을 모른다
+ *   — 밴딧 팔과 같은 목록을 여러 벤더·티어에 걸쳐 검사하기 때문에, vendor·tier 를 하드코딩
+ *   하면 이 함수가 한 벤더에 묶인다. `scope` 를 주면 `config_settings_effort_unsupported`
+ *   (문구에 vendor·tier 가 실린다)를, 안 주면 도구 인자 검증(`src/envelope.mjs`)이 쓰는
+ *   `config_effort_unsupported` 를 낸다 — 실측 결함(vendor/tier 를 몰라 fast 사다리 위반을
+ *   strong 사다리로 잰 것처럼 보이는 오류가 나갔다)의 수정이다.
  */
-export function validateSelection(models, model, effort) {
+export function validateSelection(models, model, effort, scope) {
   if (model === null || model === undefined || effort === null || effort === undefined) return { ok: true };
 
   const entry = Array.isArray(models) ? models.find((m) => m.name === model) : undefined;
@@ -198,20 +275,22 @@ export function validateSelection(models, model, effort) {
 
   if (entry.efforts.includes(effort)) return { ok: true };
 
-  return {
-    ok: false,
-    error: `model '${model}' does not support effort '${effort}'`,
-    recovery: `'${model}' 이 지원하는 effort: ${entry.efforts.join(', ')}. 그중 하나를 고르거나 effort 를 비워 CLI 기본값을 쓰세요.`,
-  };
+  const params = { model, effort, efforts: entry.efforts.join(', ') };
+  return scope
+    ? fail(REASON.config_settings_effort_unsupported, { ...scope, ...params })
+    : fail(REASON.config_effort_unsupported, params);
 }
 
 // ── 쓰기 경로 ──────────────────────────────────────────────────────────────
 
-const REJECT_RECOVERY = 'orch_config 를 인자 없이 불러 쓸 수 있는 벤더·티어·모델을 확인하세요.';
-
-function reject(error, recovery = REJECT_RECOVERY) {
-  return { ok: false, error, recovery };
-}
+/**
+ * 이 모듈의 실패 봉투 — `fail()` 의 다섯 키 그대로다(WS2 Task 16).
+ *
+ * ★ 예전에는 `{ok:false, error, recovery}` 세 키를 손으로 지었고 문장이 여기 살았다. 이제
+ *   문구는 `src/reason-text.mjs` 가 정하고 이 모듈은 **코드만** 고른다 — 호출부
+ *   (`src/tools.mjs runOrchConfig`)는 `reasonCode` 를 봉투에 그대로 싣는다.
+ */
+const reject = (code, params) => fail(code, params);
 
 /**
  * 패치를 `[[vendor, {iniKey: string|null}]]` 로 정규화한다. `null` 은 그 키를 지우라는 뜻.
@@ -221,26 +300,41 @@ function reject(error, recovery = REJECT_RECOVERY) {
  */
 function normalizePatch(patch) {
   if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
-    return reject('설정 조각이 객체가 아닙니다.');
+    return reject(REASON.config_settings_patch_invalid);
   }
 
   const entries = [];
+  const controls = {};
+  for (const [key, allowed] of [['writer', VENDORS], ['learning', ['on', 'off']]]) {
+    if (!Object.hasOwn(patch, key)) continue;
+    const raw = patch[key];
+    if (typeof raw !== 'string') {
+      return reject(REASON.config_settings_value_not_string, { vendor: METADATA_SECTION, key });
+    }
+    if (/[\r\n\u0000]/.test(raw)) {
+      return reject(REASON.config_settings_value_unsafe, { vendor: METADATA_SECTION, key });
+    }
+    const value = raw.trim();
+    if (value !== '' && !allowed.includes(value)) {
+      return reject(REASON.config_argument_not_in_enum, { name: key, value, allowed: [...allowed, ''].join(', ') });
+    }
+    controls[key] = value === '' ? null : value;
+  }
+  if (Object.keys(controls).length > 0) entries.push([METADATA_SECTION, controls]);
   for (const vendor of Object.keys(patch)) {
+    if (vendor === 'writer' || vendor === 'learning') continue;
     if (!VENDORS.includes(vendor)) {
-      return reject(`설정할 수 없는 벤더입니다: ${vendor}`, `쓸 수 있는 벤더: ${VENDORS.join(', ')}`);
+      return reject(REASON.config_settings_vendor_unknown, { vendor, vendors: VENDORS.join(', ') });
     }
     const fields = patch[vendor];
     if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {
-      return reject(`[${vendor}] 의 값이 객체가 아닙니다.`);
+      return reject(REASON.config_settings_section_invalid, { vendor });
     }
 
     const normalized = {};
     for (const field of Object.keys(fields)) {
       if (!Object.hasOwn(TIER_FIELDS, field)) {
-        return reject(
-          `[${vendor}] 에 설정할 수 없는 키입니다: ${field}`,
-          `쓸 수 있는 키: ${Object.keys(TIER_FIELDS).join(', ')}`,
-        );
+        return reject(REASON.config_settings_key_unknown, { vendor, key: field, keys: Object.keys(TIER_FIELDS).join(', ') });
       }
       const raw = fields[field];
       if (raw === null || raw === undefined) {
@@ -248,11 +342,11 @@ function normalizePatch(patch) {
         continue;
       }
       if (typeof raw !== 'string') {
-        return reject(`[${vendor}] ${field} 는 문자열이어야 합니다.`);
+        return reject(REASON.config_settings_value_not_string, { vendor, key: field });
       }
       // 한 줄을 넘기는 값은 뒷줄이 **다른 키**가 된다. NUL 은 경로·파일 취급이 갈린다.
       if (/[\r\n\u0000]/.test(raw)) {
-        return reject(`[${vendor}] ${field} 값에 개행이나 NUL 이 들어 있습니다.`);
+        return reject(REASON.config_settings_value_unsafe, { vendor, key: field });
       }
       const trimmed = raw.trim(); // parseIni 가 어차피 다듬는다 — 쓸 때 맞춰 둔다.
       normalized[TIER_FIELDS[field]] = trimmed === '' ? null : trimmed;
@@ -260,13 +354,14 @@ function normalizePatch(patch) {
     if (Object.keys(normalized).length > 0) entries.push([vendor, normalized]);
   }
 
-  if (entries.length === 0) return reject('바꿀 값이 없습니다.');
+  if (entries.length === 0) return reject(REASON.config_settings_patch_empty);
   return { ok: true, entries };
 }
 
 /** 패치를 적용한 뒤의 (model, effort) 를 티어별로 검사한다. 건드린 티어만 본다. */
 function validateMerged(ini, entries, models) {
   for (const [vendor, fields] of entries) {
+    if (vendor === METADATA_SECTION) continue;
     const list = models && Array.isArray(models[vendor]) ? models[vendor] : null;
     if (list === null) continue; // 목록을 못 얻었다 — 사용자가 적은 값을 믿는다.
 
@@ -279,8 +374,15 @@ function validateMerged(ini, entries, models) {
     for (const tier of new Set(Object.keys(fields).map((iniKey) => INI_KEY_TIER[iniKey]))) {
       const model = merged[TIER_FIELDS[tier]] ?? null;
       const effort = merged[TIER_FIELDS[`${tier}Effort`]] ?? null;
-      const verdict = validateSelection(list, model, effort);
-      if (!verdict.ok) return reject(`[${vendor}] ${tier}: ${verdict.error}`, verdict.recovery);
+      const verdict = validateSelection(list, model, effort, { vendor, tier });
+      // `validateSelection` 이 이미 `fail(REASON.config_effort_unsupported, …)` 를 낸다(WS2 Task
+      // 16) — 그 봉투를 그대로 돌려준다. ★★ 예전에는 여기서 `reject(문장, recovery)` 로 새
+      // 봉투를 지었는데, `reject` 가 `fail(code, params)` 로 바뀐 뒤에도 첫 인자가 여전히
+      // 조립한 **문장**이었다 — `renderReason` 은 모르는 코드에 `TypeError` 를 던진다. 이
+      // 함수는 `withLock` 본문 안에서 불리므로 그 예외는 `state_lock_work_failed` 로 둔갑해
+      // 나갔고, 호출자는 "effort 를 지원하지 않는다" 대신 "쓰기 자체가 실패했다" 는 거짓을
+      // 봤다(실측: `npm test` 의 orch_config effort 거부 테스트).
+      if (!verdict.ok) return verdict;
     }
   }
   return { ok: true };
@@ -429,9 +531,13 @@ let tempCounter = 0;
  *   `validateSelection` 및 실패 봉투와 같은 어휘다(브리프의 `reason` 을 쓰면 봉투가
  *   recovery 를 잃고 일반 문구로 채워진다).
  */
-export async function writeSettings(stateRoot, patch, { models = null } = {}) {
+export async function writeSettings(
+  stateRoot,
+  patch,
+  { models = null, readSettingsFile = readFile, writeSettingsFile = writeFileAtomic } = {},
+) {
   if (typeof stateRoot !== 'string' || stateRoot === '' || !isAbsolute(stateRoot)) {
-    return reject('상태 루트가 절대 경로가 아닙니다.', 'BOM_ORCH_HOME 을 절대 경로로 두거나 비워 두세요.');
+    return reject(REASON.state_root_not_absolute);
   }
 
   const normalized = normalizePatch(patch);
@@ -441,21 +547,27 @@ export async function writeSettings(stateRoot, patch, { models = null } = {}) {
   try {
     await mkdir(stateRoot, { recursive: true });
   } catch (error) {
-    return reject(`상태 디렉터리를 만들지 못했습니다: ${error?.message ?? error}`, '경로 권한을 확인하세요.');
+    // WS1 C2 — `?? error` 는 message 가 빈 오류에서 `[object Object]` 를 냈다. 사다리는 하나다.
+    return reject(REASON.state_directory_create_failed, { detail: errorText(error) });
   }
 
   // 잠금 본문은 읽기 → 검증 → 임시 파일 → rename 이다. `withLock` 은 본문이 staleMs
   // (기본 60초)보다 오래 걸리면 상호 배제가 깨진다 — 그쪽 파일이 실측으로 적어 두었다.
   //
-  // 실측(수정 라운드 2, Windows 11/NTFS, 로컬 tmpdir, `writeSettings` 호출 **전체**,
-  // 50회 × 3판 = 케이스당 150표본). 본문은 그보다 짧다:
-  //     빈 파일  1.7~4.7ms  (판별 중앙값 2.0·2.0·2.4)
-  //     4000줄   4.7~19.6ms (판별 중앙값 5.4·5.5·5.7)
-  // ★ 이것은 **상한이 아니라 관측 범위**다. 앞 라운드가 「4000줄 6.1~12.5ms」로 적어
-  //   상한처럼 읽혔지만, 같은 코드에서 첫 판 최댓값이 **19.6ms** 였다(그 판 50표본 중
-  //   1건. 나머지 두 판의 최댓값은 6.9ms·6.3ms — 첫 판 워밍업으로 보인다). 자릿수가
-  //   같아 결론(staleMs 60초에 한참 못 미친다)은 그대로지만, 「12.5ms 를 안 넘는다」는
-  //   참이 아니다. 하드 실링을 원하면 재는 것이 아니라 staleMs 를 명시로 넘겨야 한다.
+  // 실측(WS1 태스크 15 재측정, Windows 11/NTFS/Node v24.18.0, 로컬 tmpdir, `writeSettings`
+  // 호출 **전체**, 50회 × 3판 = 케이스당 150표본). 본문은 그보다 짧다:
+  //     빈 파일  2.1~12.6ms (판별 중앙값 2.6·2.4·2.4, 판별 최댓값 12.6·3.2·3.1)
+  //     4000줄   2.8~5.9ms  (판별 중앙값 3.3·4.1·3.6, 판별 최댓값 5.9·5.3·4.5)
+  // ★ 이것은 **상한이 아니라 관측 범위**다. 두 케이스 모두 전체 최댓값이 **첫 판에서만**
+  //   나왔고(빈 파일 12.6ms 대 나머지 두 판 3.2·3.1ms) 그 판 50표본 중 1건이다 — 워밍업
+  //   이지 이 코드의 비용이 아니다. 자릿수가 같아 결론(staleMs 60초에 한참 못 미친다)은
+  //   변함없지만, 여기 적힌 최댓값을 「이 값을 안 넘는다」로 읽으면 안 된다. 하드 실링을
+  //   원하면 재는 것이 아니라 staleMs 를 명시로 넘겨야 한다.
+  // ★ 이 수는 쓰기를 `src/util/fs-atomic.mjs` 로 옮긴 **뒤**의 것이다. 같은 세션·같은
+  //   방법으로 옮기기 직전에 잰 대조군은 빈 파일 2.0~3.9ms(중앙값 2.4·2.5·2.4)·4000줄
+  //   2.4~5.9ms(중앙값 3.2·3.2·3.3) 였다 — 중앙값이 그대로다. 이전이 이 수를 움직이지
+  //   않은 이유는 아래에서 `fsync:false` 로 명시 옵트아웃했기 때문이다(fsync 는 쓰기당
+  //   +1.3ms — `src/learn/posteriors.mjs` 헤더의 실측). 그 줄을 지우면 이 표가 거짓이 된다.
   // ★ 이 수는 전부 **무경합** 수치다. 잠금이 남에게 잡혀 있으면 여기는 timeoutMs 를
   //   다 쓰고 실패한다 — 실측 **5.0초**('★ 잠금을 못 잡으면 …' 테스트). 그 값은 측정이
   //   아니라 구조다(`withLock` 의 기본 `timeoutMs` 가 5000ms 다).
@@ -463,48 +575,87 @@ export async function writeSettings(stateRoot, patch, { models = null } = {}) {
   // ⚠ 느린 네트워크 드라이브나 아주 큰 settings.ini 에서도 60초 안에 끝난다고는 **재지
   //   않았다.** 그런 환경이 확인되면 여기에 staleMs 를 명시로 넘겨야 한다.
   const held = await withLock(join(stateRoot, LOCKNAME), async () => {
-    const raw = await readFile(file, 'utf8').catch(() => '');
+    let raw;
+    try {
+      const bytes = await readSettingsFile(file);
+      raw = settingsTextOf(bytes);
+      if (raw === null) return reject(REASON.config_settings_read_failed, { detail: AMBIGUOUS_SETTINGS });
+    } catch (error) {
+      // 없는 파일만 빈 legacy 상태다. 읽을 수 없는 기존 파일까지 빈 값으로 접으면 POSIX의
+      // writable 부모에서는 atomic rename이 그 불투명한 바이트를 새 v1 파일로 교체할 수 있다.
+      if (error?.code !== 'ENOENT') return reject(REASON.config_settings_read_failed, { detail: errorText(error) });
+      raw = '';
+    }
     const ini = parseIni(raw);
+    const schema = classifySettingsSchema(raw, ini);
+    if (schema.status === 'invalid') {
+      return reject(REASON.config_settings_read_failed, { detail: AMBIGUOUS_SETTINGS });
+    }
+    if (schema.status === 'newer') return { ok: false, stateSchema: schema.stateSchema };
 
     const verdict = validateMerged(ini, normalized.entries, models);
     if (!verdict.ok) return verdict;
 
-    const next = patchIniText(raw, normalized.entries);
-    // 바뀐 것이 없으면 쓰지 않는다. 없는 파일을 만들지 않으려는 것이다 — 공백만 준
-    // 요청(`{strong:'   '}` = 없는 키를 지우라)이 실측으로 **빈 settings.ini 를
-    // 만들었고**, 그것은 "거부하면 파일이 안 생긴다" 규칙과 어긋나 보인다.
-    if (next === raw) return { ok: true, settings: toSettings(ini) };
+    const userNext = patchIniText(raw, normalized.entries);
+    // 값도 없고 원문도 없으면 쓰지 않는다. 없는 파일을 만들지 않으려는 것이다 — 공백만 준
+    // 요청(`{strong:'   '}` = 없는 키를 지우라)이 실측으로 **빈 settings.ini 를 만들었고**,
+    // 그것은 "거부하면 파일이 안 생긴다" 규칙과 어긋나 보인다. 원문이 있는 v0 파일은 값이
+    // 같아도 아래 메타 섹션을 더하는 첫 정상 쓰기이므로 이 갈래에 들어오지 않는다.
+    if (userNext === raw && raw === '') return { ok: true, settings: toSettings(ini), readBack: true };
+    const entries = schema.status === 'current' ? normalized.entries : normalized.entries.map(([section, fields]) =>
+      section === METADATA_SECTION
+        ? [section, { schemaVersion: String(SETTINGS_SCHEMA_VERSION), ...fields }]
+        : [section, fields]);
+    if (schema.status !== 'current' && !entries.some(([section]) => section === METADATA_SECTION)) {
+      entries.push([METADATA_SECTION, { schemaVersion: String(SETTINGS_SCHEMA_VERSION) }]);
+    }
+    const next = schema.status === 'current' ? userNext : patchIniText(raw, entries);
+    if (next === raw) return { ok: true, settings: toSettings(ini), readBack: true };
 
     const temp = `${file}.${process.pid}.${tempCounter++}.tmp`;
-    try {
-      await writeFile(temp, next, 'utf8');
-      await rename(temp, file);
-    } catch (error) {
-      await rm(temp, { force: true }).catch(() => {});
-      throw error;
-    }
-    return { ok: true, settings: toSettings(parseIni(next)) };
+    // 임시 이름은 오늘 것 그대로 넘긴다 — 도우미는 이름을 지어내지 않는다(`src/util/fs-atomic.mjs`).
+    // `fsync:false` 는 명시 옵트아웃이다. 이 쓰기는 **잠금 본문 안**이고 바로 위 실측이
+    // 재는 것이 그 본문인데, fsync 는 쓰기마다 +1.3ms 다(`src/learn/posteriors.mjs` 헤더).
+    // settings.ini 는 사용자가 다시 쓸 수 있는 텍스트지 복구 불가능한 학습 상태가 아니다.
+    // `exclusive:false` 도 오늘 동작이다 — `writeFile` 은 고아 임시 파일 위에 그냥 썼고,
+    // 이름이 `<pid>.<카운터>` 라 죽은 프로세스의 고아와 겹칠 수 있어 'wx' 로 막으면 사람이
+    // 지울 때까지 설정 쓰기가 영영 실패한다.
+    const written = await writeSettingsFile(file, Buffer.from(next, 'utf8'), {
+      tempPath: temp, fsync: false, exclusive: false,
+    });
+    // 던진다 — `withLock` 이 「본문이 …」 앞머리를 붙여 주고, 아래가 그 앞머리로 잠금
+    // 실패와 쓰기 실패를 가른다. `{ok:false}` 로 돌려주면 그 구분이 사라진다.
+    if (!written.ok) throw new Error(written.reason);
+    // WS0 §2.2 는 쓰기의 verified 를 「쓴 뒤 **재읽기 일치**」로 정의한다. 방금 만든 문자열을
+    // 다시 파싱한 값은 그 증거가 아니다 — 그것은 rename 이 무엇을 남겼든 똑같이 나온다.
+    // 잠금 **안**에서 읽는다: 밖에서 읽으면 다른 writer 가 끼어든 것을 우리 쓰기 실패로 읽는다.
+    // (위 실측 표는 이 읽기 **이전**의 본문이다. 파일 읽기 한 번이 늘었고, 자릿수는 그대로다.)
+    const settings = toSettings(parseIni(next));
+    const back = await readSettingsStatus(stateRoot);
+    return { ok: true, settings, readBack: back.readable && JSON.stringify(back.settings) === JSON.stringify(settings) };
   });
 
-  // ★ 잠금 실패와 본문 실패는 **호출자에게 다른 뜻**이다(`src/lockfile.mjs` 가 사유
-  //   앞머리로 구분한다). 잠금을 못 잡았으면 본문이 아예 안 돌았으니 파일은 그대로고
-  //   다시 시도하면 된다. 본문이 죽었으면 rename 이 권한·디스크로 실패했을 수 있고
-  //   그때는 다시 시도해도 같은 결과다 — 둘을 같은 문구로 접으면 사용자가 **존재하지
-  //   않는 경합**을 기다린다.
+  // ★★ 잠금 실패와 본문 실패는 **호출자에게 다른 뜻**이다. 잠금을 못 잡았으면 본문이 아예
+  //   안 돌았으니 파일은 그대로고 다시 시도하면 된다. 본문이 죽었으면 rename 이 권한·디스크로
+  //   실패했을 수 있고 그때는 다시 시도해도 같은 결과다 — 둘을 같은 문구로 접으면 사용자가
+  //   **존재하지 않는 경합**을 기다린다.
+  //
+  // ★ 판정은 `reasonCode` 다. WS2 Task 16 이전에는 `held.reason.startsWith('본문이')` 였다 —
+  //   한국어 산문이 제어 흐름이었고, 그 문장을 영어로 옮기는 순간 이 분기가 조용히 죽는다.
+  //   `src/lockfile.mjs` 는 이제 본문 실패에만 `state_lock_work_failed` 를 붙인다.
   if (!held.ok) {
-    const bodyFailed = typeof held.reason === 'string' && held.reason.startsWith('본문이');
-    return reject(
-      held.reason,
-      bodyFailed
-        ? 'settings.ini 의 내용과 경로 권한·디스크 여유를 확인하세요. 경합이 아니라 쓰기 자체가 실패했습니다.'
-        : '다른 프로세스가 설정을 쓰는 중일 수 있습니다. 잠시 뒤 다시 시도하세요 — 설정 파일은 바뀌지 않았습니다.',
-    );
+    return held.reasonCode === REASON.state_lock_work_failed
+      ? reject(REASON.config_settings_write_failed, { detail: held.error })
+      : reject(REASON.config_settings_lock_unavailable, { detail: held.error });
   }
 
   // 잠금이 남았으면 뒤이은 쓰기가 staleMs 동안 조용히 실패한다(lockfile.mjs). 이 서버는
   // stdout 에 못 쓰므로 알릴 채널이 봉투뿐이다.
   if (held.released === false && held.value.ok) {
-    return { ...held.value, notice: `설정 잠금이 남았습니다: ${held.releaseReason ?? '사유 불명'}` };
+    return {
+      ...held.value,
+      notice: renderNotice('config_lock_left_behind', { reason: held.releaseReason ?? errorText(undefined) }),
+    };
   }
   return held.value;
 }

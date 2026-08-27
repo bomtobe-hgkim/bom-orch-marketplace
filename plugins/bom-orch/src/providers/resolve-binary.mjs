@@ -1,5 +1,29 @@
 import { readFileSync, statSync } from 'node:fs';
-import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
+import { delimiter, dirname, isAbsolute, join, posix, win32 } from 'node:path';
+
+/**
+ * 주입받은 platform 의 **경로 문법**. 호스트의 것이 아니다.
+ *
+ * 왜 필요한가: 이 모듈도 `src/providers/child-env.mjs` 도 `platform` 을 인자로 받는데,
+ * 그 약속은 "어느 기계에서 돌리든 두 분기를 다 검증할 수 있다" 였다. 그런데 문법은
+ * 모듈 최상단에서 **호스트** `node:path` 를 읽고 있었으므로 그 약속이 지켜지지 않았다 —
+ * Linux 에서 `{platform:'win32'}` 를 줘도 PATH 구분자는 여전히 `':'` 였고, 그래서
+ * `'C:\a'` 가 `'C'` 와 `'\a'` 로 갈렸다(실측 CI ubuntu·macOS).
+ *
+ * ★ **문법만** 여기서 온다. 실제로 `stat` 할 경로를 잇는 것은 호스트 `join` 이다 —
+ *   파일이 있는 곳은 이 기계의 파일 시스템이지 주입한 platform 의 것이 아니기 때문이다.
+ *
+ * ★ 그래서 `pathDirs` 는 **일부러** 호스트 문법을 그대로 쓴다. 그 함수가 훑는 PATH 는
+ *   이 기계의 PATH 이고, 그 `isAbsolute` 검사는 "구분자 없는 이름을 스폰하면 Windows 의
+ *   libuv 가 자식의 cwd 를 먼저 뒤진다"는 **호스트의** 성질을 막는 자리다. 주입한
+ *   platform 의 문법으로 재면 이 기계에 실재하는 디렉터리를 절대가 아니라고 판정하게 된다.
+ *   여기서 문법을 갈아끼우는 곳은 둘뿐이다: 자식에게 물려줄 PATH 를 짓는 `compactPath`
+ *   와, 다른 플랫폼이 쓴 파일을 읽는 `resolveThroughShim`.
+ */
+export const pathGrammarFor = (platform) => (platform === 'win32' ? win32 : posix);
+
+/** 셈 본문의 경로 조각. win32 본문은 `\` 와 `/` 를 둘 다 구분자로 쓴다. */
+const shimSegments = (raw, windows) => raw.split(windows ? /[\\/]+/ : /\/+/).filter((part) => part !== '');
 
 /**
  * 진짜 실행 파일. 이 순서는 PATHEXT 의 순서가 아니라 여기서 고정한다 — PATHEXT 는
@@ -208,8 +232,16 @@ export function resolveBinary({
  *   "셸을 통해야만 실행되는 것"이지 "npm 이 감싼 node 스크립트"가 아니다.
  *
  * 스크립트가 실제로 존재하는지까지 확인한다. 셈이 가리키는 대상이 지워졌을 수 있다.
+ *
+ * ★ **셈 본문의 문법은 셈이 쓰인 플랫폼의 것**이지 이 기계의 것이 아니다. `.cmd` 본문은
+ *   `%dp0%\node_modules\pkg\bin\tool.js` 처럼 역슬래시로 쓰인다. 호스트 `node:path` 로
+ *   풀면 POSIX 에서는 역슬래시가 **평범한 파일 이름 글자**라 후보가
+ *   `<dir>/node_modules\pkg\bin\tool.js` 가 되고, 그런 파일은 없으므로 null 이 나온다 —
+ *   그러면 `resolveLaunch` 가 원래의 `cli_shim_only` 를 다시 던진다(실측 CI ubuntu·macOS).
+ *   그래서 조각내기는 주입받은 `platform` 의 문법으로 하고, 다시 잇는 것은 **호스트**
+ *   `join` 으로 한다 — 그 결과를 `stat` 할 곳은 이 기계의 파일 시스템이기 때문이다.
  */
-export function resolveThroughShim(shimPath) {
+export function resolveThroughShim(shimPath, { platform = process.platform } = {}) {
   let text;
   try {
     text = readFileSync(shimPath, 'utf8');
@@ -218,13 +250,15 @@ export function resolveThroughShim(shimPath) {
   }
 
   const dir = dirname(shimPath);
+  const windows = platform === 'win32';
+  const { isAbsolute } = pathGrammarFor(platform);
   // 셈이 쓰는 디렉터리 자리표들. 벗겨내고 셈이 있는 디렉터리 기준으로 되돌린다.
   const PLACEHOLDERS = /^(?:%~?dp0%|\$basedir|\$\{basedir\}|\.)[\\/]?/;
 
   for (const match of text.matchAll(/[^\s"'()]+\.(?:js|mjs|cjs)\b/g)) {
     const raw = match[0].replace(PLACEHOLDERS, '');
     if (raw === '') continue;
-    const candidate = isAbsolute(raw) ? raw : resolve(dir, raw);
+    const candidate = isAbsolute(raw) ? raw : join(dir, ...shimSegments(raw, windows));
     if (isFile(candidate)) {
       // node 로 띄운다. 셸은 여전히 쓰지 않는다.
       return { command: process.execPath, prefixArgs: [candidate] };
@@ -247,7 +281,8 @@ export function resolveLaunch(options = {}) {
   } catch (error) {
     if (error?.code !== 'cli_shim_only' || typeof error.shimPath !== 'string') throw error;
 
-    const throughShim = resolveThroughShim(error.shimPath);
+    // 셈을 만든 문법은 `resolveBinary` 가 훑은 그 platform 의 것이다 — 호스트가 아니다.
+    const throughShim = resolveThroughShim(error.shimPath, { platform: options.platform ?? process.platform });
     if (throughShim) return throughShim;
 
     // 셈은 찾았는데 그 안에서 띄울 수 있는 것을 못 꺼냈다. 원래 오류가 여전히 맞다.

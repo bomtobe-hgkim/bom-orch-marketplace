@@ -1,7 +1,7 @@
 {
   "name": "bom-orch",
-  "version": "0.2.2",
-  "description": "Claude와 GPT 두 CLI 워커를 교차검증으로 오케스트레이션하고 무엇이 통했는지 학습하는 MCP 서버",
+  "version": "1.0.0",
+  "description": "An MCP server that orchestrates two CLI workers, Claude and GPT, cross-checks their results, and learns what worked",
   "author": {
     "name": "hyeongi-home"
   },
@@ -17,8 +17,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Bom Orchestration",
-    "shortDescription": "Claude와 GPT 워커를 교차검증하는 MCP 오케스트레이터",
-    "longDescription": "여러 Claude와 GPT CLI 워커를 실행하고 결과를 교차검증하며, 보상 피드백으로 다음 실행 전략을 학습합니다.",
+    "shortDescription": "An MCP orchestrator that cross-checks Claude and GPT workers",
+    "longDescription": "Runs several Claude and GPT CLI workers, cross-checks their results, and learns from reward feedback which strategy to run next.",
     "developerName": "hyeongi-home",
     "category": "Developer Tools",
     "capabilities": [
@@ -27,9 +27,9 @@
       "Local learning"
     ],
     "defaultPrompt": [
-      "이 작업을 Claude와 GPT 워커로 교차검증해 줘.",
-      "사용 가능한 오케스트레이션 모델을 보여 줘.",
-      "최근 실행 통계와 학습 상태를 요약해 줘."
+      "Cross-check this task with a Claude worker and a GPT worker.",
+      "Show me the orchestration models that are available.",
+      "Summarize the recent run statistics and the learning state."
     ]
   }
 }

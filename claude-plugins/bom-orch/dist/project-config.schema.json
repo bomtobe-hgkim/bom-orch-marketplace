@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "bom-orch/project-config/v1",
+  "title": ".bom-orch.json — per-project configuration, read only from the baseline commit",
+  "description": "Roadmap §3.6 / WS0 §5. The server reads this file with `git show <baselineCommit>:.bom-orch.json`; the worktree copy and the working-tree copy are never consulted, and the path is on the security hard list so a delegate touching it is a policy failure. Strict JSON, <=64 KiB, UTF-8, additionalProperties false at every level.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion"],
+  "properties": {
+    "schemaVersion": { "const": 1, "description": "A newer version than the server knows is refused with reasonCode config_schema_newer (roadmap §5.9)." },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 512 },
+          "description": "argv, no shell. First element is the executable name. Overrides deriveTestCommand. Consumed by WS4a."
+        },
+        "cwd": { "type": "string", "default": ".", "pattern": "^(?!.*\\.\\.)[^\\\\\\u0000-\\u001f\\u007f]*$", "description": "Working directory of the test child, relative to the repository root; `..`, backslashes and control characters are forbidden. `.`, `./` and the empty string all mean the repository root. It must already exist inside the evidence worktree - the server creates no directory there - and the pinned definitions are still read from the repository root." },
+        "reporter": { "type": "string", "enum": ["junit-xml", "node-events", "pytest-events", "dotnet-trx", "none"], "description": "Trusted-evidence adapter this run requires. Omit for automatic selection; `none` turns the automatic selection off. `node-events`, `pytest-events` and `dotnet-trx` are injected by the server, so naming one the derived command cannot produce disables machine evidence for the run and says so in a notice." },
+        "resultsPath": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^(?!.*\\.\\.)[^\\\\\\u0000-\\u001f\\u007f]*$", "description": "Relative path of the reporter output, resolved against the REPOSITORY ROOT of the evidence worktree - not against tests.cwd, so a producer that runs in a subdirectory has to be told to write here. Required when reporter is junit-xml, and read only for that reporter: the three injected adapters (node-events, pytest-events, dotnet-trx) are handed a server-owned path on the command line, so this key would be validated and dropped for them. Same character policy as cwd: `..`, backslashes and control characters are forbidden on every platform, because a backslash is a separator on Windows and an ordinary filename character elsewhere. For junit-xml it may name a FILE or a DIRECTORY: Gradle and Maven Surefire write one TEST-<FQCN>.xml per test class, and a directory is read by enumerating TEST-*.xml in byte order and summing the documents." },
+        "timeoutMs": { "type": "integer", "minimum": 10000, "maximum": 3000000, "description": "Upper bound of one test execution. The run's own remaining budget still applies: whichever of the two is smaller wins." },
+        "provisionDeps": { "type": "string", "enum": ["none", "lockfile-install"], "default": "none", "description": "Opt-in dependency provisioning (roadmap §3.6). lockfile-install runs the package manager's lockfile install with lifecycle scripts disabled, from the baseline, before the writer ever runs." }
+      },
+      "if": { "properties": { "reporter": { "enum": ["junit-xml"] } }, "required": ["reporter"] },
+      "then": { "required": ["resultsPath"] }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "description": "Project allowlist of expected-change globs (POSIX style, ** allowed). Union with the per-call scope_allow argument. Security hard-list paths (including this file) are ignored even if listed. Consumed by WS5."
+        }
+      }
+    },
+    "delegation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "writer": { "type": "string", "enum": ["claude", "codex"], "description": "Project-level writer pin. Precedence: per-call writer > this > global settings.ini. Consumed by WS7." }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schemaVersion": 1,
+      "tests": {
+        "command": ["npm", "test"],
+        "cwd": ".",
+        "reporter": "junit-xml",
+        "resultsPath": "reports/junit.xml",
+        "timeoutMs": 600000,
+        "provisionDeps": "none"
+      },
+      "scope": { "allow": ["package-lock.json", ".claude/**"] },
+      "delegation": { "writer": "claude" }
+    }
+  ]
+}

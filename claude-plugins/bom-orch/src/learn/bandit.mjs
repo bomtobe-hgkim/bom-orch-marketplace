@@ -1,5 +1,6 @@
 // src/learn/bandit.mjs
 import { cellKeyOf, PRIOR } from './posteriors.mjs';
+import { evidenceLine, evidenceParagraphText } from '../prompts/instructions.mjs';
 
 /**
  * §7.2 의 결정 축과 팔, 그리고 그 위의 Thompson sampling.
@@ -297,7 +298,8 @@ const count = (value) => {
  */
 export const armAllowed = (axis, arm, allowSingle) => axis !== 'mix' || arm !== 'single' || allowSingle;
 
-const EVIDENCE_HEADER = '━━━ 이 저장소에서 관찰된 사실 ━━━';
+// 근거 문단의 **문장**은 `src/prompts/instructions.mjs` 에 있다 — 그것을 읽는 것은 벤더이고,
+// 벤더 프롬프트는 언어 게이트 밖 경로(`src/prompts/**`)에 살아야 한다(WS2 Task 16).
 
 /**
  * 옵션 하나를 던지는 게터를 견디며 읽는다. 실패하면 `fallback`.
@@ -419,10 +421,13 @@ export function decide(spec) {
       const picked = shapesOf(cell, best);
       const armSeen = Math.max(0, picked.alpha + picked.beta - PRIOR.alpha - PRIOR.beta);
       const wins = Math.max(0, picked.alpha - PRIOR.alpha);
-      const line =
-        armSeen === 0
-          ? `· ${axis}: ${best} — 아직 관측이 없어 탐색으로 골랐습니다 (이 축 전체 ${count(seen)}건)`
-          : `· ${axis}: ${best} — 관측 ${count(armSeen)}건 중 성공 ${count(wins)}건 (이 축 전체 ${count(seen)}건)`;
+      const line = evidenceLine({
+        axis,
+        arm: best,
+        armSeen: count(armSeen),
+        wins: count(wins),
+        seen: count(seen),
+      });
 
       // 결정과 근거를 **한꺼번에** 확정한다 — 위에서 던지면 이 축은 아래 `catch` 로 간다.
       decisions[axis] = best;
@@ -445,11 +450,7 @@ export function decide(spec) {
   return { decisions, sources, evidence, evidenceLines: Object.freeze({ ...evidenceLines }) };
 }
 
-function renderEvidence(lines) {
-  return lines.length > 0
-    ? `${EVIDENCE_HEADER}\n${lines.join('\n')}`
-    : `${EVIDENCE_HEADER}\n· 아직 판단할 만큼의 관측이 없어(축마다 ${OBSERVATION_THRESHOLD}건 필요) 기본값으로 진행합니다.`;
-}
+const renderEvidence = (lines) => evidenceParagraphText(lines, OBSERVATION_THRESHOLD);
 
 /**
  * 설계 §7.5 의 근거 문단을, **호출자가 고른 축만** 담아 렌더링한다.

@@ -1,145 +1,233 @@
 ---
 name: orch-delegate
-description: 다른 벤더의 CLI 에 코딩 작업을 맡기고 교차검증까지 받을 때 씁니다. 결과는 패치 파일이고 적용은 호출자가 합니다.
+description: Hand a coding task to another vendor's CLI and get it cross-checked. The result is a patch file that nothing applies for you; orch_apply is the explicit step that puts it in your repository. If the call is cut off, read the run back with orch_status.
 ---
 
-# 작업 위임과 교차검증
+# Delegating a task and cross-checking it
 
-`orch_run` 은 일회용 git 워크트리에서 워커에게 작업을 시키고, **다른 벤더**가 그 결과를
-읽기 전용으로 검증하며, 테스트는 이 서버가 직접 돌려 종료 코드를 읽습니다.
+`orch_run` gives one task to a worker inside a disposable git worktree, has a **different
+vendor** verify the result read-only, and runs the tests itself, so pass or fail comes from an
+exit code and not a model's word. `orch_status` reads a run back afterwards, and `orch_apply` is the separate call
+that puts a finished run's patch into your repository. Every non-success envelope carries top-level `recovery`.
+It names the next safe action; `REASON_CODES.md` at the plugin root lists every code and the same recovery.
 
-## 인자
+## Arguments
 
-| 도구 | 인자 | 필수 | 기본값 | 허용값 |
+| Tool | Argument | Required | Default | Allowed |
 | --- | --- | --- | --- | --- |
-| `orch_run` | `task` | 예 | — | — |
-| `orch_run` | `project` | 예 | — | — |
-| `orch_run` | `isolation` | 아니오 | `worktree` | `worktree` |
-| `orch_run` | `budget` | 아니오 | `5` | 1~10 정수 |
-| `orch_run` | `wait_ms` | 아니오 | `1800000` | 0 이상 |
-| `orch_run` | `candidates` | 아니오 | `1` | `1`, `2` |
-| `orch_run` | `allow_single` | 아니오 | `false` | — |
+| `orch_run` | `task` | required | — | — |
+| `orch_run` | `project` | required | — | — |
+| `orch_run` | `isolation` | optional | `worktree` | `worktree` |
+| `orch_run` | `budget` | optional | `5` | integer 1-10 |
+| `orch_run` | `wait_ms` | optional | `1800000` | number >= 0 |
+| `orch_run` | `candidates` | optional | `1` | `1`, `2` |
+| `orch_run` | `allow_single` | optional | `false` | — |
+| `orch_run` | `resume_run_id` | optional | — | — |
+| `orch_run` | `scope_allow` | optional | — | — |
+| `orch_run` | `writer` | optional | — | `claude`, `codex` |
+| `orch_status` | `run_id` | optional | — | — |
+| `orch_status` | `runs` | optional | `10` | integer 1-50 |
+| `orch_apply` | `run_id` | required | — | — |
+| `orch_apply` | `check_only` | optional | `false` | — |
 
-- `task` — 무엇을 할지. 구체적일수록 좋습니다.
-- `project` — **절대 경로**여야 하고 git 저장소여야 합니다. 이 서버의 작업 디렉터리는
-  호스트가 물려준 값이라 고정돼 있지 않습니다 — 상대 경로를 주면 엉뚱한 저장소에
-  워크트리가 생깁니다.
-- `budget` — 몇 스텝까지 다시 시도할지. **lane 하나마다** 세는 값입니다 — `candidates: 2`
-  에서는 두 lane이 각각 이만큼 씁니다. 시작한 writer 호출은 봉인 전에 끝나도 한 칸을
-  씁니다. 형식만 고치는 verifier 재요청은 읽기 전용이라 세지 않습니다.
-- `wait_ms` — 최대 대기 시간(밀리초). 이 값은 Run 전체가 나눠 쓰는 **공유 데드라인**
-  하나입니다 — lane마다 따로 주어지지 않습니다. 데드라인이 지나면 새 provider·테스트·
-  judge 호출이 시작되지 않고, 그 시점까지 만들어진 artifact만 회수 경로로 남습니다.
-- `candidates` — 독립 후보 수입니다. `2`이면 두 provider와 lane별 `budget`을 사용합니다.
-  `candidates: 2`와 `allow_single: true`는 함께 쓸 수 없습니다.
-  ⚠ `candidates: 2`는 provider·writer·테스트 비용을 대략 **두 배**로 늘립니다. 두 lane이
-  각자 작성하고 각자 교차검증하며, 회귀 증거도 lane마다 따로 실행하기 때문입니다.
-- `isolation` — 지금 고를 수 있는 값이 하나뿐입니다. 벤더 CLI 의 도구 권한 플래그는
-  델리게이트의 셸을 제한하지 못한다는 것이 확인돼, 실제로 성립하는 격리가 일회용
-  워크트리뿐입니다.
+- `task` — what to do; the more specific, the better.
+- `project` — an **absolute path** to a git repository. This server's working directory is
+  whatever the host handed down, so a relative path lands in the wrong repository.
+- `budget` — attempts a lane may spend, counted **per lane**. A writer call that started costs one
+  attempt even if it is cut short; a format-only verifier retry is read-only and costs nothing.
+- `wait_ms` — the run's one **shared deadline** in milliseconds, never a per-lane allowance.
+  After it passes no new provider, test or judge call starts and only existing artifacts survive.
+- `candidates` — how many independent candidates to run. `2` uses both providers with a
+  per-lane `budget` and cannot be combined with `allow_single`.
+- `isolation` — one value today: vendor CLI tool-permission flags were measured not to
+  constrain the worker's shell, so the disposable worktree is the only isolation that holds.
+- `scope_allow` — globs (POSIX style, `**` allowed) for paths this task is expected to change,
+  unioned with `scope.allow` in the project's `.bom-orch.json`. Matching is two-sided, so `.claude`
+  covers that directory itself and `.claude/**` covers what is under it. It waives a lockfile or an
+  editor-settings directory; it never waives a CI definition, a shell rc, or anything that decides
+  what the tests run — those are ignored even when listed, and a notice says which entries were.
+- `writer` — pin the vendor that writes this run's patch, instead of letting the learned
+  statistics choose. The other vendor still cross-checks it. One run only; `orch_config`
+  sets the standing pin. It cannot be combined with `candidates: 2`, which needs both.
+- `resume_run_id` — continue an earlier run, named by `orch_status`. Its sealed attempts are
+  **read**, never run again, and this call numbers its own attempts from where that run stopped,
+  so `budget` covers what is left. Reuse needs an exact match on the baseline tree and the
+  test environment fingerprint; the synthetic commit may differ even for the same tree. On any mismatch the call is refused with a `resume_*`
+  code and nothing starts, so call again without it. The resumed run gets its own `run_id`.
 
-## `allow_single` 의 기본값은 「금지」쪽입니다
+★ **`candidates: 2` roughly doubles the provider, writer and test cost.** Both lanes write, both
+cross-check, and regression evidence is produced once per lane.
 
-정본은 위 표입니다. 그 값이 「허용 안 함」인 이유: `orch_run` 을 부른 것은 **교차검증을
-요구한 것**이고, 벤더 하나만으로 조용히 돌려 "됐다" 고 하면 그 요청을 배신합니다.
-벤더가 하나뿐인 기계라 실행 자체가 막히는 경우에만 명시적으로 켜세요.
+★ **Regression proof multiplies the test runs.** A run that must prove a regression runs your
+whole test suite up to six times in series per candidate per attempt, against two for a run that
+needs no proof — 22 at the default `budget: 5`. `cost.testRuns` reports it, `preflight.warnings` predicts it.
 
-★ 켜고 끄는 것이 학습에도 영향을 줍니다 — `mix` 축은 켠 호출에서만 후보가 둘이 됩니다.
-orch-learn 스킬을 보세요.
+★ **`allow_single` defaults to `false`.** Calling `orch_run` asks for cross-checking and one vendor
+alone betrays that request. Turning it on is what gives the `mix` axis a second arm — see orch-learn.
 
-## 결과
+## Getting a run back
 
-패치 **파일 경로**가 본문의 `patch.path` 로 돌아옵니다. **이 서버는 패치를 자동으로
-적용하지 않습니다** — 적용은 호출자가 `git apply` 로 직접 합니다. 무엇이 바뀌는지 보고
-나서 적용하라는 뜻입니다.
+`orch_status` reads a finished run off disk: with `run_id` it reconstructs one run; with no
+arguments it lists the recent runs, which is how a `run_id` is found after the host cut the call
+off. `runs` sizes that list and means nothing beside `run_id`. A reconstruction carries how the
+run ended — the stored code, whose sentence is re-rendered on the way out because sentences are
+never written to disk — plus a manifest summary, the plan the run worked from, the verifier
+issues and judge prose it kept, the tail of the log, and the artifact paths.
 
-- `scope.flagged` 가 참이면 패치가 예상 밖의 파일을 건드렸다는 뜻입니다. 적용 전에
-  `scope.reasons` 를 읽으세요(아래 「본문은 줄어서 올 수 있습니다」도 함께 보세요).
-  이때 봉투는 `succeeded` 가 아니라 실패 쪽으로 나갑니다 — 사람이 봐야 한다는 판정이지
-  작업을 버렸다는 뜻이 아니고, 패치 파일은 그대로 남습니다.
-- `patch.empty` 가 참이면 워커가 아무것도 안 바꿨습니다.
-- 본문의 `runId` 가 이 실행의 식별자입니다. 자동 채점이 틀렸으면 그 값을 정정에 씁니다
-  (orch-learn 스킬).
+★ **Model prose there is labelled, never evidence.** Every row carrying model text says
+source: "model", and that text reaches none of the envelope's own sentences. A run with no
+journal row is reported as unknown instead of being given an invented ending, and its
+confidence stays `unverified` until the manifest reads cleanly and the run is over.
 
-### 본문의 최상위 필드
+## Result
 
-| 필드 | 뜻 |
+The patch **file path** comes back as `patch.path`. **`orch_run` never applies the patch** — putting
+it in your repository is a separate `orch_apply` call you make after reading what it changes.
+`patch.empty: true` means the worker changed nothing, and `runId` is the value `orch_reward` takes
+to correct this run's grade.
+
+★ **A flagged scope is a verdict for a human, not a discarded run.** `scope.flagged: true` means
+the patch touched files the policy did not expect; the patch file stays on disk and `scope.reasons`
+says what tripped. The envelope goes out on the failure side rather than `succeeded` UNLESS
+`scope.allowlisted: true`, which says every one of those reasons was one the allowlist named in
+advance — such a run is flagged and still judged on its evidence like any other.
+
+### Top-level fields of the result body
+
+| Field | Meaning |
 | --- | --- |
-| `runId` | 이 실행의 식별자. `orch_reward` 가 받는 값입니다 |
-| `stopReason` | 실행이 끝난 이유. 선택된 후보의 종료 사유이거나 Run 차원의 중단 사유입니다 |
-| `stepCount` | 선택된 후보가 쓴 attempt 수 |
-| `patch` | 선택된 결과의 별칭 패치. 대표 패치가 없는 종료에는 아예 없습니다 |
-| `scope` | 패치가 예상 밖 파일을 건드렸는지 |
-| `worktree` | 일회용 워크트리의 정리 상태 |
-| `blockers` | 진행을 막은 lane과 그 사유 |
-| `learning` | 이 실행이 쓴 결정 축과 실제로 반영한 등급 |
-| `plan` | 계획 단계를 맡은 provider |
-| `steps` | 선택된 후보의 attempt 순서 |
-| `verdict` | 선택된 후보에 대한 verifier 의 구조화된 판정 |
-| `issues` | lane 별로 아직 열려 있는 blocking issue ID |
-| `candidates` | 후보마다의 종료 등급·패치·증명 상태 |
-| `attempts` | 불변 attempt 기록의 참조 |
-| `regressionProof` | 버그 수정 증명의 상태와 증거 참조 |
-| `selection` | 어느 후보가 왜 뽑혔는가 |
-| `artifacts` | 이 실행이 남긴 manifest·후보 패치 경로와 만료 시각 |
-| `omittedCounts` | 본문이 줄면서 빠진 항목 수 |
+| `runId` | this run's identifier |
+| `stopReason` | why the run ended — the same closed thirteen-value vocabulary as the envelope, and every one of the thirteen is listed in the `stopReason` column of `REASON_CODES.md` |
+| `reasonCode` | the registered detail code for that same stop. A success envelope leaves it off the top level, so the body is where the detail survives |
+| `stepCount` | how many attempts the selected candidate spent |
+| `baseline` | the commit and tree the patch is written against, whether the repository was dirty when the run started, and which files that was. A clean start may reuse its HEAD; after uncommitted work is transplanted, the server makes a synthetic commit that no caller ref points at |
+| `patch` | the patch chosen as this run's result. Absent on stops that have no representative patch |
+| `scope` | whether the patch touched files that were not expected |
+| `worktree` | how the disposable worktree was cleaned up |
+| `blockers` | which lanes were stopped, each with a registered code and a sentence |
+| `learning` | the decision axes this run used and the grade it actually applied |
+| `plan` | the provider that planned, and the planner's own text |
+| `steps` | the selected candidate's attempt order |
+| `verdict` | the verifier's structured verdict on the selected candidate |
+| `issues` | the blocking issue identifiers still open, per lane |
+| `candidates` | each candidate's terminal class, patch and proof status |
+| `attempts` | references to the immutable attempt records |
+| `excerpts` | labeled vendor stderr; the first thing a reduced body drops. Today the excerpts a run actually ships ride at the envelope top level, on failure envelopes only |
+| `regressionProof` | the state of the regression proof and its evidence references |
+| `selection` | which candidate was taken, and why |
+| `artifacts` | the manifest and candidate patch paths this run left, and when they expire |
+| `cost` | what this run spent: elapsed time, calls and tokens per vendor, and how many times the suite ran |
+| `preflight` | what was known before any credit was spent: whether evidence was reachable, each vendor's auth state, and the warning keys this run raised |
+| `omittedCounts` | how many items were dropped, per kind |
+| `reduced` | which rung shipped (see below) — `full`, `no_excerpts`, `summarized_attempts`, `limited` or `floor` |
 
-`artifacts.manifestPath` 와 `artifacts.candidatePaths` 는 **절대 경로**이고,
-`artifacts.expiresAt` 이 지나면 리퍼가 지웁니다. `regressionProof.status` 는 버그 수정
-작업에서만 의미가 있습니다.
+`artifacts.manifestPath` and `artifacts.candidatePaths` are **absolute paths**; `artifacts.expiresAt`
+is when this server's cleanup may delete them. `regressionProof.status` matters for a run that needs
+regression proof — the default for code work unless the task reads as a feature, refactor, or docs change.
 
-### `selection.outcome` 다섯 가지
+★ **Retention and manual cleanup.** The default state root is `~/.bom-orch` (or the exact absolute `BOM_ORCH_HOME` you set).
+Patches, run records, and logs expire after 30 days; disposable scratch rooms after 6 hours; `effect_unknown` worktrees after 30 days; and the private npm cache after 30 idle days.
+Apply-recovery and manually retained scratch rooms are kept indefinitely until manual cleanup. The learning journal is append-only and has no automatic retention deletion.
+Retention cleanup is not a background service: it runs only when this MCP server starts or handles a run. Uninstalling either host/plugin does not delete this state.
+To remove it safely, stop both Claude and Codex hosts, uninstall the plugin from both if applicable, and verify the exact state-root path. For the default root, use PowerShell: `Remove-Item -LiteralPath (Join-Path $env:USERPROFILE '.bom-orch') -Recurse -Force`. On POSIX: `rm -rf -- "$HOME/.bom-orch"`. If `BOM_ORCH_HOME` is set, substitute the exact absolute state root you verified instead of the default path. Linux orphan cleanup identifies a process with the kernel boot ID plus `/proc` start ticks, and Windows uses process start ticks. On macOS, the process start identity reported by ps has one-second resolution; an extremely fast same-second PID reuse remains a documented residual, while any missing or malformed identity fails closed without killing or deleting anything.
 
-| 값 | 뜻 |
+### The five `selection.outcome` values
+
+| Value | Meaning |
 | --- | --- |
-| `winner` | 한 후보가 이겼습니다. `patch.path` 에 그 결과가 있습니다 |
-| `single_survivor` | 나머지 lane 이 탈락해 남은 하나가 뽑혔습니다 |
-| `equivalent` | 두 후보의 패치 바이트가 같아 판정 없이 앞 lane 을 씁니다 |
-| `tie` | 판정이 갈렸습니다 |
-| `none` | 뽑을 수 있는 후보가 없습니다 |
+| `winner` | one candidate won, and `patch.path` holds its result |
+| `single_survivor` | the other lane dropped out and the remaining one was taken |
+| `equivalent` | the two patches were byte-identical, so the first lane is used without a judgment |
+| `tie` | the judgment split |
+| `none` | there was no candidate to take |
 
-⚠ **`tie` 에는 대표 패치가 없습니다.** `selection.selectedCandidateId` 가 `null` 이고
-`patch` 도 없습니다. 대신 두 후보의 패치가 `artifacts.candidatePaths` 에 그대로 남으니
-직접 읽고 고르세요. `none` 도 대표 패치를 만들지 않습니다.
+★ **A `tie` ships no representative patch**: `selection.selectedCandidateId` is `null` and there
+is no `patch`. Both patches stay in `artifacts.candidatePaths`. `none` ships none either.
 
-### 신뢰도는 machine 증거가 정합니다
+★ **Confidence has three values.** `verified` — this call established the fact by machine.
+`unverified` — the best report with no machine evidence, or with partial or stale evidence.
+`disputed` — evidence or policy **contradicts** success, and the status is forced to `failed`.
 
-verifier 는 이제 **구조화된 JSON 판정**을 냅니다 — 산문 승인이 아니라 검사 항목과 이슈
-목록입니다. 그 판정만으로는 `verified` 가 되지 않습니다.
+★ **A run whose tests were missing or untrusted is capped at `unverified`.** That result is
+usable but must not be read as "the tests passed". `disputed` is what a verifier that failed
+twice, a broken hard scope rule, or tampering with the test definitions produces.
 
-⚠ 테스트를 못 찾았거나, 실행은 됐는데 어느 테스트가 어느 파일을 덮는지 **신뢰할 수 없는**
-러너였다면 봉투의 confidence 는 `unverified` 로 묶입니다. 그 상태의 결과도 쓸 수는 있지만
-「테스트가 통과했다」는 주장으로 읽으면 안 됩니다.
+★ **What `verified` needs depends on the test ecosystem.** The table above the install commands in
+the marketplace repository's README says what each one yields; outside those rows nothing tells this
+server which test covered which file, so a run that needs regression proof stops at `unverified`.
 
-### 경로가 너무 길면 실행 전에 막습니다
+★ **The verifier is read-only and returns a structured verifier verdict** — checks and issues,
+not a prose approval. That verdict alone never makes a run `verified`; machine evidence does.
 
-⚠ 상태 루트가 너무 깊으면 artifact 절대 경로가 본문 상한을 넘습니다. 그때는 provider·
-워크트리·artifact 를 만들기 **전에** `blocked` 로 끝냅니다 — 반쯤 만든 실행을 남기지
-않기 위해서입니다. 더 **짧은** `BOM_ORCH_HOME` 을 지정하고 다시 부르세요.
+★ **Model prose is never evidence.** The verifier's issue bodies are kept with the run artifacts
+under the label "what the model said" — a claim to check, never proof. `excerpts`, labeled vendor
+stderr, is the only text in the envelope this server did not write itself — and even that is a
+process's stderr, never a model's answer.
 
-### 격리에 대한 정직한 한계
+★ **Long state-root paths are refused before the run starts**: the call ends `blocked` before any
+provider, worktree or artifact exists. Point `BOM_ORCH_HOME` at a shorter directory and retry.
 
-⚠ 일회용 워크트리와 그 안의 테스트 실행은 **OS 샌드박스가 아닙니다.** 워커가 만든 코드와
-저장소의 테스트 스크립트는 당신의 사용자 권한으로 돕니다. 신뢰할 수 없는 저장소에는
-이 도구를 쓰지 마세요.
+★ **This is not an OS sandbox.** The worker's code and your repository's test scripts run with
+your own user's privileges inside the disposable worktree — never on a repository you distrust.
 
-## ★ 본문은 줄어서 올 수 있습니다 — 위 필드가 늘 그대로 있지는 않습니다
+★ **Models are not chosen here.** Which vendor runs which role is decided by configuration and
+learning; to change it, see the orch-model skill, which also says where the names come from.
 
-본문에는 크기 상한이 있고, 넘으면 서버가 단계적으로 줄입니다. **줄어든 본문은 위 필드를
-그대로 두지 않습니다.** 무엇을 읽어야 하는지가 단계마다 다릅니다.
+## Applying the patch
 
-- 목록만 줄인 단계에서는 `scope.reasons` 에 **앞쪽 몇 건만** 남고, 뺀 개수가
-  `scope.reasonsOmitted` 로 옵니다. 그 값이 0 이 아니면 목록이 전부가 아닙니다.
-- 가장 많이 줄인 단계에서는 `truncatedReport` 가 참으로 붙고 `scope.reasons` 가
-  **통째로 사라집니다** — 대신 사유 개수만 `scope.reasonCount` 로 옵니다. 그러니
-  `scope.reasons` 가 **없는 것**을 「사유가 없다」로 읽으면 안 됩니다. 사유 본문이
-  필요하면 더 좁은 작업으로 나눠 다시 부르세요.
-- 같은 단계에서 `patch.path` 도 **잘릴 수 있습니다**(경로가 아주 길 때). 잘린 경로로는
-  `git apply` 가 안 됩니다. `scope.flagged` 가 참인 실행은 봉투가 실패 쪽으로 나가고
-  그 안내 문구에 **온전한** 패치 경로가 함께 실리니, `truncatedReport` 가 참이면 본문의
-  경로 대신 그쪽을 쓰세요.
+`orch_apply` takes the `run_id` of a finished run and puts that run's patch into your repository.
+It is the one call in this server that writes outside its own state directory, and it writes only
+when you make it — which is what "the patch is never applied for you" means in practice.
 
-## 모델은 여기서 고르지 않습니다
+★ **The run baseline and apply-time HEAD are separate facts.** A clean start may reuse the starting HEAD.
+When uncommitted work is transplanted, the baseline becomes a server-created synthetic snapshot. An explicit `orch_apply` first checks the target
+working tree as it stands; only when direct application does not fit may it use that baseline for a
+verified three-way onto the target's current committed HEAD. A full apply report distinguishes the run `baseline`,
+target HEAD, and current repository dirtiness. Scope approval comes only from `scope.allow` in the committed `.bom-orch.json`
+at that HEAD; the earlier call's `scope_allow` is not retained. If the final pre-write recheck sees a HEAD
+move, it returns `apply_head_moved` without applying; that check and `git apply` are separate processes: avoid concurrent repository
+changes, and follow the failure envelope's top-level `recovery` for the next safe action.
 
-어떤 벤더의 어떤 모델로 돌지는 설정과 학습이 정합니다. 바꾸려면 orch-model 스킬을
-보세요. 모델 이름은 이 문서에 적지 않습니다 — `orch_models` 가 내는 목록에서 고르세요.
+Before touching anything it checks, in this order, that the name is one this server makes, that the
+run is on this state root, that its records read cleanly, and that the patch itself is there and is
+a file. Each of those refusals carries its own registered reason code: apply-specific gates use an
+`apply_*` code, while state_root_not_absolute and learning_journal_read_failed stay exact. Thus
+"there is no such run" and "the patch was already reclaimed" never arrive as the same answer. `check_only: true` asks for the report without the change.
+
+★ **A run with no representative patch cannot be applied.** A `tie` and a `none` leave nothing under
+`patch.path`, and the cleanup reclaims patch files on its own schedule, so a missing-patch refusal is
+a normal answer for an old run rather than a defect. `orch_status` lists which candidate patches are
+still on disk.
+
+## ★ The body can arrive reduced — not every field above is always present
+
+The body has a size cap; the first rung that fits ships, and `reduced` names it, so "this rung
+dropped it" never has to be inferred from "this field is missing".
+
+- `no_excerpts` drops `excerpts`; `summarized_attempts` keeps each lane's last attempt only; `limited`
+  empties `scope.reasons` (keeping `scope.flagged`, `scope.hardViolation`, `scope.allowlisted` and
+  `scope.reasonCount`), drops the
+  planner text and caps blockers; `floor` is a fixed summary. `omittedCounts` carries a number for every list
+  it dropped; `preflight` disappears at `floor` and `learning`/`steps` empty there, uncounted — `reduced` tells you.
+- A missing `scope.reasons` therefore never means "there were no reasons" — read
+  `scope.reasonCount`, which every rung carries.
+- No rung truncates an absolute path, so a `patch.path` from a reduced body is still a usable path.
+- `truncatedReport` is not a field of the body. `{"truncatedReport":true}` replaces the **whole
+  body** as a last-resort constant when even the fixed floor cannot be serialized.
+- The envelope carries `log.path`, this run's JSONL diagnostic file, whenever one was opened;
+  that is an envelope field, not a body field, and it does not follow the rungs.
+
+## Example envelope
+
+The `floor` rung, taken from this server's golden envelopes — what a body cut to the bone still tells you.
+
+```json
+{
+  "status": "succeeded",
+  "content": "{\"runId\":\"run-golden\",\"stopReason\":\"verified\",\"reasonCode\":\"lane_verified\",\"stepCount\":10,\"baseline\":{\"commit\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"tree\":\"cccccccccccccccccccccccccccccccccccccccc\",\"dirty\":true,\"dirtyFiles\":[\"docs/notes.md\",\"src/lane-a/000-changed-module.mjs\"]},\"patch\":{\"path\":\"/golden/state/patches/run-golden.patch\"},\"scope\":{\"flagged\":false,\"hardViolation\":false,\"allowlisted\":false,\"reasonCount\":2,\"omittedReasonCount\":0},\"worktree\":{\"transplanted\":true,\"ignoredPathCount\":16,\"sharedRuleCount\":0,\"cleanup\":{\"removed\":true,\"unregistered\":true,\"tracked\":false}},\"blockers\":[],\"learning\":null,\"plan\":{\"provider\":\"claude\",\"content\":null,\"source\":\"model\"},\"steps\":[],\"verdict\":{\"candidateId\":\"lane-a\",\"attemptId\":\"run-golden/lane-a/010\",\"verdict\":\"PASS\"},\"issues\":[{\"candidateId\":\"lane-a\",\"openIssueIds\":[],\"openIssueCount\":0,\"resolvedOmittedCount\":0}],\"candidates\":[{\"candidateId\":\"lane-a\",\"patch\":{\"path\":\"/golden/state/runs/run-golden/candidates/lane-a.patch\"},\"proofStatus\":\"proved\",\"openIssueIds\":[],\"openIssueCount\":0}],\"attempts\":[],\"regressionProof\":{\"status\":\"proved\",\"selectedCandidateId\":\"lane-a\",\"evidenceRefs\":[],\"omittedEvidenceCount\":0},\"selection\":{\"outcome\":\"winner\",\"selectedCandidateId\":\"lane-a\"},\"artifacts\":{\"manifestPath\":\"/golden/state/runs/run-golden/manifest.json\",\"candidatePaths\":[\"/golden/state/runs/run-golden/candidates/lane-a.patch\"],\"omittedCount\":0},\"cost\":{\"elapsedMs\":1234567,\"providers\":{\"claude\":{\"calls\":12,\"promptTokens\":1234567,\"evalTokens\":1234567},\"codex\":{\"calls\":9,\"promptTokens\":1234567,\"evalTokens\":1234567}},\"testRuns\":{\"count\":6,\"totalMs\":1098765}},\"omittedCounts\":{\"issues\":0,\"attempts\":10,\"evidence\":0,\"files\":22,\"artifacts\":0,\"scopeReasons\":2,\"blockers\":1,\"planChars\":66},\"reduced\":\"floor\"}",
+  "confidence": "verified",
+  "runId": "run-golden",
+  "stopReason": "verified",
+  "log": { "path": "/golden/state/logs/run-golden.jsonl" }
+}
+```

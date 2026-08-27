@@ -55,11 +55,9 @@ function intOrNull(value) {
 }
 
 /**
- * turn.completed 의 usage 를 읽는다.
- *
- * codex 의 Usage 는 5개 필드가 전부 항상 직렬화되고 기본값이 0 이다. 그래서 여기서는
- * 0 과 "모름"이 구조적으로 구분되지 않는다 — claude 쪽과 다르다. 필드가 아예 없으면
- * 그건 형식이 바뀐 것이므로 null 로 남겨 드러나게 한다.
+ * turn.completed 의 usage 를 읽는다. codex 의 Usage 는 5개 필드가 전부 항상 직렬화되고 기본값이
+ * 0 이라, 여기서는 0 과 "모름"이 구조적으로 구분되지 않는다(claude 쪽과 다르다). 필드가 아예
+ * 없으면 그건 형식이 바뀐 것이므로 null 로 남겨 드러나게 한다.
  */
 function readUsage(usage) {
   if (!usage || typeof usage !== 'object') return null;
@@ -75,14 +73,11 @@ function readUsage(usage) {
 /**
  * ThreadItem 을 우리 모양으로. details 가 flatten 이라 type 과 필드가 같은 층에 있다.
  *
- * ★ 아래 고정 필드는 9종 중 4종(agent_message, reasoning, command_execution, error)만
- *   덮는다. 나머지 5종(file_change, mcp_tool_call, collab_tool_call, web_search,
- *   todo_list)의 도메인 페이로드는 여기에 담을 자리가 없다 — 그런데 그 타입들은
- *   "아는 타입"이라 unknownTypes 에도 안 잡힌다. 즉 조용한 데이터 손실이 된다.
- *
- *   타입마다 필드를 늘리는 대신 원본을 그대로 들고 간다. 파서가 벤더 스키마의
- *   모든 가지를 미리 알아야 할 이유가 없고, 나중에 이 값을 쓰는 쪽이 필요한 것을
- *   꺼내 쓰면 된다. 고정 필드는 자주 쓰는 것에 대한 편의일 뿐이다.
+ * ★ 아래 고정 필드는 9종 중 4종(agent_message, reasoning, command_execution, error)만 덮는다.
+ *   나머지 5종(file_change, mcp_tool_call, collab_tool_call, web_search, todo_list)의 도메인
+ *   페이로드는 담을 자리가 없는데, 그 타입들은 "아는 타입"이라 unknownTypes 에도 안 잡힌다 —
+ *   즉 조용한 데이터 손실이다. 타입마다 필드를 늘리는 대신 원본(`raw`)을 그대로 들고 간다:
+ *   파서가 벤더 스키마의 모든 가지를 미리 알 이유가 없고, 쓰는 쪽이 필요한 것을 꺼내면 된다.
  */
 function readItem(item) {
   return {
@@ -143,6 +138,10 @@ export function collectCodexStream(text) {
       threadId = typeof record.thread_id === 'string' ? record.thread_id : null;
       continue;
     }
+    // ★ 담을 것이 없는 전이 신호. 핸들러가 없어 아래 item.* 분기로 흘렀고 `record.item` 이 없어
+    //   **읽지 못한 줄**로 기록됐다 — 성공한 모든 codex 실행이 드리프트 1 을 달고 나왔다(실측).
+    //   아무도 안 읽던 동안은 조용했지만, WS2 가 그 값을 봉투와 notice 로 올린다.
+    if (record.type === 'turn.started') continue;
     if (record.type === 'turn.completed') {
       turnStatus = 'completed';
       usage = readUsage(record.usage);
@@ -178,8 +177,8 @@ export function collectCodexStream(text) {
 
     const shaped = readItem(item);
 
-    // ★ agent_message 와 reasoning 은 item.started 가 아예 안 온다. started 를
-    //   기다렸다 짝을 맞추면 답변을 영영 못 본다. completed 만으로 성립해야 한다.
+    // ★ agent_message 와 reasoning 은 item.started 가 아예 안 온다. started 를 기다렸다 짝을
+    //   맞추면 답변을 영영 못 본다 — completed 만으로 성립해야 한다.
     if (record.type === 'item.completed' && item.type === 'agent_message' && typeof item.text === 'string') {
       // 중간 코멘터리와 최종 답변을 구분하는 필드가 없다. codex 자신도 final_message 를
       // 매번 덮어쓴다 — 마지막 것이 답이다.

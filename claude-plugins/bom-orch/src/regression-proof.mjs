@@ -1,9 +1,8 @@
-import { createHash } from 'node:crypto';
+import { selectTestDeltaWitnesses } from './test-evidence.mjs';
 import {
   checkFrozenTestPlanEnvironment,
   classifyFrozenTestPath,
   runFrozenTests,
-  selectTestDeltaWitnesses,
 } from './test-runner.mjs';
 import {
   applyPatchBytes,
@@ -12,6 +11,10 @@ import {
   removeWorktree,
   revisionIdentity,
 } from './worktree.mjs';
+import { REASON } from './reason-codes.mjs';
+import { sha256 } from './util/hash.mjs';
+import { hasExactKeys } from './util/objects.mjs';
+import { boundedText, compareUtf8 } from './util/strings.mjs';
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -19,6 +22,18 @@ const SAFE_MODE = new Set(['100644', '100755']);
 const BUG_FIX_PATTERN = /\b(?:bug|bugs|error|errors|failure|failures|regression|regressions|repair|repairs|fix|fixes|fixed|fixing)\b|버그|오류|실패|회귀|고쳐|(?:문제|결함|깨짐|고장)(?:을|를|이|가)?\s*(?:수정|고치|해결)/i;
 const NON_BUG_PATTERN = /\b(?:feature|features|refactor|refactors|refactoring|docs?|documentation)\b|기능|리팩터|문서/i;
 const CODE_CLASSES = new Set(['code:test-bearing', 'code:no-tests']);
+
+/**
+ * 회귀 증명이 **증인으로 받아 주는** 어댑터. `ADAPTER_IDS` 보다 좁은 것이 의도다.
+ * ★★ WS4a 태스크 11 이 `junit-xml-v1` 을 넣어 보고 **실측으로 되돌렸다.** 이 한 줄(과 계획의
+ *   `regressionWitnessTrusted`)만으로는 아무것도 달라지지 않는다: `classifyFrozenTestPath` 에 junit
+ *   갈래가 없어 모든 경로가 `'helper'` 로 떨어지고(실측: 진짜 vitest 프로젝트의 `src/math.test.ts` 조차), 분리는 `test_helper_untrusted` 로 **같은 자리에서** 멈춘다.
+ *   넓히는 커밋이 함께 정할 것은 junit 의 **델타 루트**다 — 증인 루트에는 `src` 가 있어서(Vitest 는
+ *   소스 옆에 테스트를 둔다) 그대로 쓰면 프로덕션 파일이 「테스트 전용 델타」에 실려 증명이 조작된다.
+ * ★ 두 배포 문서의 표가 「증인은 남지만 회귀 증명은 아직 아니다」를 적고 `test/packaging.test.mjs`
+ *   가 그 문장을 **이 목록에서** 유도한다. 목록↔분류기 결합은 `test/test-runner.test.mjs` 가 잰다.
+ */
+export const REGRESSION_WITNESS_ADAPTERS = Object.freeze(['node-events-v1', 'pytest-events-v1']);
 const EVIDENCE_KEYS = [
   'schemaVersion',
   'evidenceId',
@@ -54,15 +69,6 @@ const COMPANION_KEYS = ['witnessIds', 'assertionWitnessIds'];
 const CACHE_CELL_KEYS = ['classified', 'deltaWitnessIds', 'deltaAssertionWitnessIds'];
 const INVALID_EVIDENCE_CACHES = new WeakMap();
 
-function sha256(value) {
-  return createHash('sha256').update(value).digest('hex');
-}
-
-function exactKeys(value, keys) {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) &&
-    Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
-}
-
 function sortedStrings(values) {
   return Array.isArray(values) && values.every((value) => typeof value === 'string')
     ? [...new Set(values)].sort()
@@ -74,7 +80,7 @@ function result(required, status, repairable, evidenceIds = [], reasonCodes = []
     required,
     status,
     repairable,
-    evidenceIds: [...new Set(evidenceIds)].sort((left, right) => Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'))),
+    evidenceIds: [...new Set(evidenceIds)].sort(compareUtf8),
     reasonCodes: [...new Set(reasonCodes)],
     witnessIds: [...new Set(witnessIds)].sort(),
   };
@@ -91,7 +97,7 @@ export function classifyProofRequirement(input = {}) {
 }
 
 function invalidPath(path) {
-  if (typeof path !== 'string' || path === '' || path.length > 4_096 || /[\u0000-\u001f\u007f\uFFFD]/.test(path) ||
+  if (boundedText(path, 4_096) === null ||
       path.includes('\\') || path.startsWith('/') || /^[A-Za-z]:/.test(path)) return true;
   const parts = path.normalize('NFC').split('/');
   return parts.some((part) => part === '' || part === '.' || part === '..');
@@ -118,17 +124,17 @@ export async function splitTestOnlyDelta(input = {}, deps = {}) {
   const entries = Array.isArray(input?.entries) ? input.entries : null;
   const plan = input?.testPlan;
   if (entries === null || !OBJECT_ID_PATTERN.test(input?.baselineRevision ?? '') ||
-      !OBJECT_ID_PATTERN.test(input?.candidateRevision ?? '')) return noDelta('unsafe', 'invalid_delta_input');
-  if (plan?.regressionWitnessTrusted !== true || !['node-events-v1', 'pytest-events-v1'].includes(plan?.adapterId)) {
-    return noDelta('ambiguous', 'untrusted_test_plan');
+      !OBJECT_ID_PATTERN.test(input?.candidateRevision ?? '')) return noDelta('unsafe', REASON.test_delta_input_invalid);
+  if (plan?.regressionWitnessTrusted !== true || !REGRESSION_WITNESS_ADAPTERS.includes(plan?.adapterId)) {
+    return noDelta('ambiguous', REASON.test_plan_untrusted);
   }
   if (!Array.isArray(input.ignoredPaths) || !Array.isArray(input.unsafePaths)) {
-    return noDelta('unsafe', 'path_policy_unavailable');
+    return noDelta('unsafe', REASON.scope_path_policy_unavailable);
   }
-  if (input.ignoredPaths.some(invalidPath)) return noDelta('unsafe', 'invalid_ignored_path');
-  if (input.unsafePaths.some(invalidPath)) return noDelta('unsafe', 'invalid_unsafe_path');
-  if (input.ignoredPaths.length > 0) return noDelta('unsafe', 'ignored_test_path');
-  if (input.unsafePaths.length > 0) return noDelta('unsafe', 'unsafe_test_path');
+  if (input.ignoredPaths.some(invalidPath)) return noDelta('unsafe', REASON.test_delta_ignored_path_invalid);
+  if (input.unsafePaths.some(invalidPath)) return noDelta('unsafe', REASON.test_delta_unsafe_path_invalid);
+  if (input.ignoredPaths.length > 0) return noDelta('unsafe', REASON.test_delta_ignored_path);
+  if (input.unsafePaths.length > 0) return noDelta('unsafe', REASON.test_delta_unsafe_path);
   const definitions = (Array.isArray(plan.pinnedDefinitions) ? plan.pinnedDefinitions : [])
     .map((entry) => entry?.path)
     .filter((path) => typeof path === 'string');
@@ -138,13 +144,13 @@ export async function splitTestOnlyDelta(input = {}, deps = {}) {
   for (const entry of entries) {
     const path = entry?.path;
     if (invalidPath(path) || !['added', 'modified', 'deleted'].includes(entry?.status)) {
-      return noDelta('unsafe', 'invalid_delta_path');
+      return noDelta('unsafe', REASON.test_delta_path_invalid);
     }
-    if (seen.has(path)) return noDelta('unsafe', 'duplicate_delta_path');
+    if (seen.has(path)) return noDelta('unsafe', REASON.test_delta_duplicate_path);
     seen.add(path);
-    if (testDefinitionPath(path, definitions)) return noDelta('unsafe', 'test_definition_tampering');
+    if (testDefinitionPath(path, definitions)) return noDelta('unsafe', REASON.test_definition_tampering);
     if (entry.oldMode !== null && !SAFE_MODE.has(entry.oldMode) ||
-        entry.newMode !== null && !SAFE_MODE.has(entry.newMode)) return noDelta('unsafe', 'unsafe_test_path');
+        entry.newMode !== null && !SAFE_MODE.has(entry.newMode)) return noDelta('unsafe', REASON.test_delta_unsafe_path);
     let pathClass;
     try {
       pathClass = classifyPath(plan, path);
@@ -154,16 +160,16 @@ export async function splitTestOnlyDelta(input = {}, deps = {}) {
     if (pathClass === 'test') {
       testEntries.push(entry);
     } else if (pathClass === 'helper') {
-      return noDelta('ambiguous', 'untrusted_test_helper');
+      return noDelta('ambiguous', REASON.test_helper_untrusted);
     } else if (pathClass !== 'outside') {
-      return noDelta('ambiguous', 'untrusted_test_plan');
+      return noDelta('ambiguous', REASON.test_plan_untrusted);
     }
   }
-  if (testEntries.length === 0) return noDelta('empty', 'no_test_delta');
+  if (testEntries.length === 0) return noDelta('empty', REASON.test_delta_empty);
   if (testEntries.every((entry) => entry.status === 'deleted')) {
-    return noDelta('deletion_only', 'test_delta_deletion_only');
+    return noDelta('deletion_only', REASON.test_delta_deletion_only);
   }
-  const paths = testEntries.map((entry) => entry.path).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+  const paths = testEntries.map((entry) => entry.path).sort(compareUtf8);
   const collect = deps.collectPatchAtRevision ?? collectPatchAtRevision;
   let collected;
   try {
@@ -173,15 +179,15 @@ export async function splitTestOnlyDelta(input = {}, deps = {}) {
       paths,
     });
   } catch {
-    return noDelta('ambiguous', 'test_delta_collection_failed');
+    return noDelta('ambiguous', REASON.test_delta_collection_failed);
   }
-  if (collected?.blocked) return noDelta('ambiguous', 'test_delta_collection_failed');
+  if (collected?.blocked) return noDelta('ambiguous', REASON.test_delta_collection_failed);
   const patch = collected?.patch;
   const files = Array.isArray(collected?.files) ? collected.files : null;
   if (collected?.ok !== true || !Buffer.isBuffer(patch) || patch.length === 0 || files === null ||
       files.length !== paths.length || files.some((path, index) => path !== paths[index]) ||
       !SHA256_PATTERN.test(collected.sha256 ?? '') || collected.sha256 !== sha256(patch) || collected.empty === true) {
-    return noDelta('ambiguous', 'test_delta_collection_mismatch');
+    return noDelta('ambiguous', REASON.test_delta_collection_mismatch);
   }
   return { status: 'separable', patch, sha256: collected.sha256, paths, reasonCodes: [] };
 }
@@ -189,7 +195,7 @@ export async function splitTestOnlyDelta(input = {}, deps = {}) {
 function validClassified(value, record) {
   const witnesses = sortedStrings(value?.witnessIds);
   const failures = sortedStrings(value?.failureFingerprints);
-  if (!exactKeys(value, CLASSIFIED_KEYS) || value.planFingerprint !== record.testPlanFingerprint ||
+  if (!hasExactKeys(value, CLASSIFIED_KEYS) || value.planFingerprint !== record.testPlanFingerprint ||
       value.environmentFingerprint !== record.environmentFingerprint ||
       !['completed', 'not_run', 'spawn_error', 'timeout', 'aborted', 'hung', 'lingering'].includes(value.execution) ||
       !['pass', 'fail', 'unknown'].includes(value.outcome) ||
@@ -217,7 +223,7 @@ function validateEvidenceGroups(input, deltaSha) {
     if (!Array.isArray(records) || records.length !== 2) return null;
     for (let index = 0; index < records.length; index += 1) {
       const record = records[index];
-      if (!exactKeys(record, EVIDENCE_KEYS) || record.schemaVersion !== 1 || record.kind !== kind ||
+      if (!hasExactKeys(record, EVIDENCE_KEYS) || record.schemaVersion !== 1 || record.kind !== kind ||
           record.repetition !== index + 1 || typeof record.evidenceId !== 'string' || record.evidenceId === '' ||
           typeof record.attemptId !== 'string' || record.attemptId === '' ||
           !OBJECT_ID_PATTERN.test(record.baselineRevision) || !OBJECT_ID_PATTERN.test(record.baselineTree) ||
@@ -265,7 +271,7 @@ function sameStrings(a, b) {
 function validatedCompanion(value, record) {
   const witnesses = sortedStrings(value?.witnessIds);
   const assertions = sortedStrings(value?.assertionWitnessIds);
-  if (!exactKeys(value, COMPANION_KEYS) || witnesses === null || assertions === null ||
+  if (!hasExactKeys(value, COMPANION_KEYS) || witnesses === null || assertions === null ||
       witnesses.length !== value.witnessIds.length || assertions.length !== value.assertionWitnessIds.length ||
       !sameStrings(witnesses, value.witnessIds) || !sameStrings(assertions, value.assertionWitnessIds) ||
       witnesses.some((id) => !SHA256_PATTERN.test(id)) || assertions.some((id) => !SHA256_PATTERN.test(id))) return null;
@@ -286,19 +292,15 @@ function validatedCompanions(values, records) {
 function unavailableReason(records) {
   const diagnostics = records.flatMap((record) => record.classified.diagnostics);
   for (const code of [
-    'environment_fingerprint_drift',
-    'executable_identity_drift',
-    'launcher_identity_drift',
-    'test_command_unavailable',
-    'test_delta_apply_failed',
-    'test_queue_poisoned',
-    'deadline_expired',
+    REASON.test_environment_drift, REASON.test_executable_drift, REASON.test_launcher_drift,
+    REASON.test_command_unavailable, REASON.test_delta_apply_failed, REASON.test_queue_poisoned,
+    REASON.test_deadline_expired,
   ]) {
     if (diagnostics.includes(code)) return code;
   }
-  if (records.some((record) => record.classified.failureKind === 'dependency')) return 'test_dependency_unavailable';
+  if (records.some((record) => record.classified.failureKind === 'dependency')) return REASON.test_dependency_unavailable;
   if (records.some((record) => ['not_run', 'spawn_error', 'timeout', 'aborted', 'hung', 'lingering']
-    .includes(record.classified.execution))) return 'test_execution_unavailable';
+    .includes(record.classified.execution))) return REASON.test_execution_unavailable;
   return null;
 }
 
@@ -307,62 +309,62 @@ export function completeRegressionProof(input = {}) {
   const required = input?.required === true;
   if (!required) return result(false, 'not_applicable', false);
   const delta = input?.testDelta;
-  if (!delta || typeof delta !== 'object') return result(true, 'unavailable', false, [], ['test_delta_unavailable']);
+  if (!delta || typeof delta !== 'object') return result(true, 'unavailable', false, [], [REASON.test_delta_unavailable]);
   if (delta.status !== 'separable') {
     const reasons = Array.isArray(delta.reasonCodes) && delta.reasonCodes.length > 0
       ? delta.reasonCodes.filter((code) => typeof code === 'string')
-      : ['test_delta_unavailable'];
+      : [REASON.test_delta_unavailable];
     const repairable = delta.status === 'empty' || delta.status === 'deletion_only';
     return result(true, repairable ? 'not_proven' : 'unavailable', repairable, [], reasons);
   }
   if (!Buffer.isBuffer(delta.patch) || !SHA256_PATTERN.test(delta.sha256 ?? '') || sha256(delta.patch) !== delta.sha256 ||
       !Array.isArray(delta.paths) || delta.paths.length === 0 || !Array.isArray(delta.reasonCodes) || delta.reasonCodes.length !== 0) {
-    return result(true, 'unavailable', false, [], ['test_delta_authority_mismatch']);
+    return result(true, 'unavailable', false, [], [REASON.test_delta_authority_mismatch]);
   }
   const validated = validateEvidenceGroups(input, delta.sha256);
-  if (validated === null) return result(true, 'unavailable', false, [], ['evidence_authority_mismatch']);
+  if (validated === null) return result(true, 'unavailable', false, [], [REASON.evidence_authority_mismatch]);
   const evidenceIds = validated.all.map((record) => record.evidenceId);
   const { b0, br, c } = validated.groups;
   if ([b0, br, c].some((records) => stableSignature(records[0]) !== stableSignature(records[1]))) {
-    return result(true, 'flaky', false, evidenceIds, ['unstable_test_evidence']);
+    return result(true, 'flaky', false, evidenceIds, [REASON.evidence_unstable]);
   }
 
   const b0Unavailable = unavailableReason(b0);
   if (b0Unavailable !== null) return result(true, 'unavailable', false, evidenceIds, [b0Unavailable]);
   if (b0.some((record) => record.classified.execution !== 'completed' || record.classified.outcome !== 'pass')) {
-    return result(true, 'not_proven', false, evidenceIds, ['baseline_not_green']);
+    return result(true, 'not_proven', false, evidenceIds, [REASON.test_baseline_not_green]);
   }
 
   const brUnavailable = unavailableReason(br);
   if (brUnavailable !== null) return result(true, 'unavailable', false, evidenceIds, [brUnavailable]);
   if (br.every((record) => record.classified.execution === 'completed' && record.classified.outcome === 'pass')) {
-    return result(true, 'not_proven', true, evidenceIds, ['regression_test_did_not_fail']);
+    return result(true, 'not_proven', true, evidenceIds, [REASON.test_regression_did_not_fail]);
   }
   if (br.some((record) => record.classified.failureKind === 'collection')) {
-    return result(true, 'not_proven', true, evidenceIds, ['regression_collection_failed']);
+    return result(true, 'not_proven', true, evidenceIds, [REASON.test_regression_collection_failed]);
   }
   if (br.some((record) => record.classified.execution !== 'completed' || record.classified.outcome !== 'fail' ||
       record.classified.failureKind !== 'assertion' || record.classified.reproduction !== true)) {
-    return result(true, 'not_proven', true, evidenceIds, ['regression_witness_missing']);
+    return result(true, 'not_proven', true, evidenceIds, [REASON.test_regression_witness_missing]);
   }
   const brCompanions = validatedCompanions(input.brCompanions, br);
   if (brCompanions === null || brCompanions.some((value) => value.assertionWitnessIds.length === 0)) {
-    return result(true, 'not_proven', true, evidenceIds, ['regression_witness_missing']);
+    return result(true, 'not_proven', true, evidenceIds, [REASON.test_regression_witness_missing]);
   }
   const targetWitnesses = brCompanions[0].assertionWitnessIds;
   if (!sameStrings(targetWitnesses, brCompanions[1].assertionWitnessIds)) {
-    return result(true, 'flaky', false, evidenceIds, ['unstable_test_evidence']);
+    return result(true, 'flaky', false, evidenceIds, [REASON.evidence_unstable]);
   }
 
   const cUnavailable = unavailableReason(c);
   if (cUnavailable !== null) return result(true, 'unavailable', false, evidenceIds, [cUnavailable]);
   if (c.some((record) => record.classified.execution !== 'completed' || record.classified.outcome !== 'pass')) {
-    return result(true, 'not_proven', true, evidenceIds, ['candidate_tests_failed']);
+    return result(true, 'not_proven', true, evidenceIds, [REASON.test_candidate_failed]);
   }
   const candidateCompanions = validatedCompanions(input.candidateCompanions, c);
   if (candidateCompanions === null || candidateCompanions.some((value) =>
     targetWitnesses.some((id) => !value.witnessIds.includes(id)))) {
-    return result(true, 'not_proven', true, evidenceIds, ['candidate_witness_missing']);
+    return result(true, 'not_proven', true, evidenceIds, [REASON.test_candidate_witness_missing]);
   }
   return result(true, 'proved', false, evidenceIds, [], targetWitnesses);
 }
@@ -379,41 +381,58 @@ export function createSerialTestQueue({ now = Date.now } = {}) {
   let tail = Promise.resolve();
   let poisonReason = null;
   let active = 0;
+  // ★★ 봉투의 `cost.testRuns` 가 여기서 난다(WS4b 태스크 6, 계약의 `cost` 행). 자리가 여기인
+  //   이유는 하나다 — **신선한 스위트 실행이 지나는 문이 이것 하나**다(`runOne` 의 두 `enqueue`).
+  //   증거 캐시에 맞은 걸음은 이 문을 안 지나므로 세지 않는데, 그것이 정확히 옳다: 그 실행은
+  //   스위트를 돌리지 않았다. 러너(`src/test-runner.mjs:500`)가 재는 `durationMs` 를 쓰지 않는
+  //   이유도 같다 — 그 수는 자식의 수명이고, 사용자가 기다린 것은 큐에서의 대기까지 포함한
+  //   이 창이다. 시계는 이 큐가 이미 주입받은 `now` 다(새 시계 출처를 안 만든다).
+  let runCount = 0;
+  let runTotalMs = 0;
   const queue = {
     enqueue(start, options = {}) {
-      if (typeof start !== 'function') return Promise.reject(queueError('invalid_test_start'));
+      if (typeof start !== 'function') return Promise.reject(queueError(REASON.test_start_invalid));
       const current = tail.then(async () => {
-        if (poisonReason !== null) throw queueError('test_queue_poisoned');
+        if (poisonReason !== null) throw queueError(REASON.test_queue_poisoned);
         const deadlineAt = options?.deadlineAt;
         if (deadlineAt !== undefined && deadlineAt !== null &&
             (!Number.isFinite(deadlineAt) || now() >= deadlineAt)) {
-          poisonReason = 'deadline_expired';
-          throw queueError('deadline_expired');
+          poisonReason = REASON.test_deadline_expired;
+          throw queueError(REASON.test_deadline_expired);
         }
         active += 1;
+        const runStartedAt = now();
         try {
           const value = await start();
           const execution = value?.execution ?? value?.classified?.execution;
           if (execution === 'hung' || execution === 'lingering') {
-            poisonReason = 'test_process_cleanup_unproven';
+            poisonReason = REASON.test_process_cleanup_unproven;
           }
-          if (value?.cleanupProven === false) poisonReason = 'test_process_cleanup_unproven';
+          if (value?.cleanupProven === false) poisonReason = REASON.test_process_cleanup_unproven;
           return value;
         } finally {
           active -= 1;
+          // 던진 실행도 **돌았다** — 크레딧도 벽시계도 이미 썼으므로 실패한 스위트가 회계에서
+          // 사라지면 봉투는 실제보다 싼 실행을 보고한다. 시계가 뒤로 가는 갈래는 0 으로 접는다.
+          runCount += 1;
+          runTotalMs += Math.max(now() - runStartedAt, 0);
         }
       });
       tail = current.then(() => undefined, () => undefined);
       return current;
     },
     poison(reason) {
-      poisonReason = typeof reason === 'string' && reason !== '' ? reason : 'test_queue_poisoned';
+      poisonReason = typeof reason === 'string' && reason !== '' ? reason : REASON.test_queue_poisoned;
     },
     markCleanupProven() {
-      if (active === 0 && poisonReason === 'test_process_cleanup_unproven') poisonReason = null;
+      if (active === 0 && poisonReason === REASON.test_process_cleanup_unproven) poisonReason = null;
     },
     isPoisoned() {
       return poisonReason !== null;
+    },
+    /** 이 실행이 스위트를 실제로 돌린 횟수와 그 총 벽시계 — 봉투의 `cost.testRuns` 그대로다. */
+    testRuns() {
+      return { count: runCount, totalMs: runTotalMs };
     },
   };
   return Object.freeze(queue);
@@ -465,7 +484,7 @@ function cloneClassified(value, plan) {
 }
 
 function cloneCacheCell(value, plan) {
-  if (!exactKeys(value, CACHE_CELL_KEYS) || !Object.isFrozen(value) ||
+  if (!hasExactKeys(value, CACHE_CELL_KEYS) || !Object.isFrozen(value) ||
       !Object.isFrozen(value.classified) || !Object.isFrozen(value.deltaWitnessIds) ||
       !Object.isFrozen(value.deltaAssertionWitnessIds)) return null;
   const classified = cloneClassified(value.classified, plan);
@@ -488,7 +507,7 @@ function cloneCacheCell(value, plan) {
 }
 
 function createCacheCell(raw, plan, projection) {
-  if (!projection || !exactKeys(projection, COMPANION_KEYS)) return null;
+  if (!projection || !hasExactKeys(projection, COMPANION_KEYS)) return null;
   const classified = cloneClassified(raw, plan);
   const deltaWitnessIds = sortedStrings(projection.witnessIds);
   const deltaAssertionWitnessIds = sortedStrings(projection.assertionWitnessIds);
@@ -569,7 +588,7 @@ function unavailableTests() {
   };
 }
 
-function candidateTests(records) {
+export function summarizeCandidateTests(records) {
   if (records.length === 0) return unavailableTests();
   const facts = records.map((record) => record.classified);
   const stable = facts.length === 2 && stableSignature(records[0]) === stableSignature(records[1]);
@@ -651,11 +670,11 @@ function cleanupOutcome(spec, record, worktree, status) {
 
 function operationalFailure(code) {
   const allowed = new Set([
-    'evidence_persistence_failed',
-    'evidence_authority_mismatch',
-    'evidence_cleanup_unproven',
-    'deadline_expired',
-    'test_process_cleanup_unproven',
+    REASON.evidence_persistence_failed,
+    REASON.evidence_authority_mismatch,
+    REASON.evidence_cleanup_unproven,
+    REASON.test_deadline_expired,
+    REASON.test_process_cleanup_unproven,
   ]);
   return allowed.has(code) ? Object.freeze({ code }) : null;
 }
@@ -686,10 +705,10 @@ export async function runCandidateEvidence(spec, deps = {}) {
   if (!validEvidenceSpec(spec)) {
     return candidateEvidenceResult(
       unavailableTests(),
-      proofUnavailable(true, [], 'invalid_evidence_spec'),
+      proofUnavailable(true, [], REASON.evidence_spec_invalid),
       [],
       [],
-      'evidence_authority_mismatch',
+      REASON.evidence_authority_mismatch,
     );
   }
   const createWorktree = deps.createRevisionWorktree ?? createRevisionWorktree;
@@ -732,19 +751,19 @@ export async function runCandidateEvidence(spec, deps = {}) {
   const checkEnvironment = async (phase, kind, repetition) => {
     if (operationalReason !== null) return false;
     if (spec.deadlineAt !== null && now() >= spec.deadlineAt) {
-      operationalReason = 'deadline_expired';
-      spec.testQueue.poison('deadline_expired');
+      operationalReason = REASON.test_deadline_expired;
+      spec.testQueue.poison(REASON.test_deadline_expired);
       return false;
     }
     let checked;
     try {
       checked = await inspectEnvironment({ plan: spec.frozenTestPlan, phase, kind, repetition });
     } catch {
-      checked = { ok: false, reasonCode: 'environment_fingerprint_drift' };
+      checked = { ok: false, reasonCode: REASON.test_environment_drift };
     }
     if (checked?.ok !== true || !sameExecutable(checked.executable, spec.frozenTestPlan.executable) ||
         checked.environmentFingerprint !== spec.frozenTestPlan.environmentFingerprint) {
-      operationalReason = typeof checked?.reasonCode === 'string' ? checked.reasonCode : 'environment_fingerprint_drift';
+      operationalReason = typeof checked?.reasonCode === 'string' ? checked.reasonCode : REASON.test_environment_drift;
       INVALID_EVIDENCE_CACHES.set(spec.cache, operationalReason);
       return false;
     }
@@ -774,13 +793,13 @@ export async function runCandidateEvidence(spec, deps = {}) {
     );
     if (persisted.status === 'deadline' || persisted.deadlineExpired === true) {
       persistenceFailed = true;
-      operationalReason = 'deadline_expired';
-      spec.testQueue.poison('deadline_expired');
+      operationalReason = REASON.test_deadline_expired;
+      spec.testQueue.poison(REASON.test_deadline_expired);
     }
     if (persisted.status !== 'value' || persisted.value?.ok !== true ||
         persisted.value.ref?.kind !== 'evidence' || persisted.value.ref.candidateId !== spec.laneId) {
       persistenceFailed = true;
-      if (operationalReason === null) operationalReason = 'evidence_persistence_failed';
+      if (operationalReason === null) operationalReason = REASON.evidence_persistence_failed;
     } else {
       evidence.push(Object.freeze({ evidenceOrdinal, record, ref: persisted.value.ref }));
     }
@@ -803,28 +822,28 @@ export async function runCandidateEvidence(spec, deps = {}) {
         purpose,
         revision,
       });
-      if (worktree?.ok !== true) throw queueError('evidence_worktree_unavailable');
+      if (worktree?.ok !== true) throw queueError(REASON.evidence_worktree_unavailable);
       if (kind === 'c' && worktree.lastSnapshot !== spec.candidate.commit ||
           kind !== 'c' && worktree.lastSnapshot !== spec.baseline.commit) {
-        throw queueError('evidence_revision_mismatch');
+        throw queueError(REASON.evidence_revision_mismatch);
       }
       const identity = await identifyRevision(worktree, revision);
       const expectedTree = kind === 'c' ? spec.candidate.treeHash : spec.baseline.tree;
       if (identity?.ok !== true || identity.commit !== revision || identity.tree !== expectedTree) {
-        throw queueError('evidence_revision_mismatch');
+        throw queueError(REASON.evidence_revision_mismatch);
       }
       if (kind === 'br') {
         if (!Buffer.isBuffer(spec.testDelta.patch) || sha256(spec.testDelta.patch) !== spec.testDelta.sha256) {
-          throw queueError('test_delta_authority_mismatch');
+          throw queueError(REASON.test_delta_authority_mismatch);
         }
         const applied = await applyPatch(worktree, { patch: spec.testDelta.patch, sha256: spec.testDelta.sha256 });
-        if (applied?.ok !== true) throw queueError('test_delta_apply_failed');
+        if (applied?.ok !== true) throw queueError(REASON.test_delta_apply_failed);
       }
       if (!(await checkEnvironment('before_spawn', kind, repetition))) throw queueError(operationalReason);
       if (spec.deadlineAt !== null && now() >= spec.deadlineAt) {
-        operationalReason = 'deadline_expired';
-        spec.testQueue.poison('deadline_expired');
-        throw queueError('deadline_expired');
+        operationalReason = REASON.test_deadline_expired;
+        spec.testQueue.poison(REASON.test_deadline_expired);
+        throw queueError(REASON.test_deadline_expired);
       }
       const timeoutMs = spec.deadlineAt === null ? undefined : Math.max(1, spec.deadlineAt - now());
       const raw = await runTests({
@@ -847,19 +866,19 @@ export async function runCandidateEvidence(spec, deps = {}) {
         projection = null;
       }
       const cell = createCacheCell(raw, spec.frozenTestPlan, projection);
-      if (cell === null) throw queueError('classified_test_record_invalid');
+      if (cell === null) throw queueError(REASON.test_record_invalid);
       record = evidenceRecord(spec, kind, repetition, cell.classified);
       await persistRecord(record, cell);
       if (cell.classified.execution === 'hung' || cell.classified.execution === 'lingering') {
-        operationalReason = 'test_process_cleanup_unproven';
-        spec.testQueue.poison('test_process_cleanup_unproven');
+        operationalReason = REASON.test_process_cleanup_unproven;
+        spec.testQueue.poison(REASON.test_process_cleanup_unproven);
       }
       return cell;
     } finally {
       if (worktree?.ok === true) {
         const tracked = await Promise.allSettled(childTracks);
         if (tracked.some((entry) => entry.status !== 'fulfilled' || entry.value !== true)) {
-          operationalReason = 'test_process_cleanup_unproven';
+          operationalReason = REASON.test_process_cleanup_unproven;
         }
         let childrenProven = false;
         let removed = null;
@@ -902,10 +921,10 @@ export async function runCandidateEvidence(spec, deps = {}) {
             ownershipTransferred = handedOff.status === 'value' && handedOff.value === true;
           }
           if (ownershipTransferred) cleanup.push(cleanupOutcome(spec, noticeRecord, worktree, 'reaper_pending'));
-          if (cleanupDeadlineExpired) operationalReason = 'deadline_expired';
-          else if (!ownershipTransferred) operationalReason = 'evidence_cleanup_unproven';
-          else if (operationalReason === null) operationalReason = 'test_process_cleanup_unproven';
-          spec.testQueue.poison('test_process_cleanup_unproven');
+          if (cleanupDeadlineExpired) operationalReason = REASON.test_deadline_expired;
+          else if (!ownershipTransferred) operationalReason = REASON.evidence_cleanup_unproven;
+          else if (operationalReason === null) operationalReason = REASON.test_process_cleanup_unproven;
+          spec.testQueue.poison(REASON.test_process_cleanup_unproven);
         } else {
           cleanup.push(cleanupOutcome(spec, record ?? { evidenceId: id }, worktree, 'removed'));
         }
@@ -915,7 +934,7 @@ export async function runCandidateEvidence(spec, deps = {}) {
 
   const runOne = async (kind, repetition, cacheable) => {
     if (operationalReason !== null || spec.testQueue.isPoisoned()) {
-      if (operationalReason === null) operationalReason = 'test_queue_poisoned';
+      if (operationalReason === null) operationalReason = REASON.test_queue_poisoned;
       return null;
     }
     let key = null;
@@ -927,7 +946,7 @@ export async function runCandidateEvidence(spec, deps = {}) {
       let slots = spec.cache.get(key) ?? null;
       if (slots !== null && (!Array.isArray(slots) || slots.length > 2 ||
           slots.some((slot) => slot !== undefined && (slot === null || typeof slot.then !== 'function')))) {
-        operationalReason = 'invalid_test_cache_entry';
+        operationalReason = REASON.test_cache_entry_invalid;
         INVALID_EVIDENCE_CACHES.set(spec.cache, operationalReason);
         return null;
       }
@@ -946,7 +965,7 @@ export async function runCandidateEvidence(spec, deps = {}) {
     }
     try {
       const cell = cloneCacheCell(await promise, spec.frozenTestPlan);
-      if (cell === null) throw queueError('invalid_test_cache_entry');
+      if (cell === null) throw queueError(REASON.test_cache_entry_invalid);
       if (!producer) await persistRecord(evidenceRecord(spec, kind, repetition, cell.classified), cell);
       if (persistenceFailed) return null;
       return cell.classified;
@@ -958,8 +977,8 @@ export async function runCandidateEvidence(spec, deps = {}) {
           if (slots.every((slot) => slot === undefined)) spec.cache.delete(key);
         }
       }
-      operationalReason = typeof error?.code === 'string' ? error.code : 'test_execution_unavailable';
-      if (['environment_fingerprint_drift', 'executable_identity_drift', 'launcher_identity_drift'].includes(operationalReason)) {
+      operationalReason = typeof error?.code === 'string' ? error.code : REASON.test_execution_unavailable;
+      if ([REASON.test_environment_drift, REASON.test_executable_drift, REASON.test_launcher_drift].includes(operationalReason)) {
         INVALID_EVIDENCE_CACHES.set(spec.cache, operationalReason);
       }
       return null;
@@ -969,8 +988,8 @@ export async function runCandidateEvidence(spec, deps = {}) {
   const c1 = await runOne('c', 1, false);
   if (c1 === null) {
     return candidateEvidenceResult(
-      candidateTests(candidate),
-      proofUnavailable(spec.proofRequirement.required, committedRecords(), operationalReason ?? 'test_execution_unavailable'),
+      summarizeCandidateTests(candidate),
+      proofUnavailable(spec.proofRequirement.required, committedRecords(), operationalReason ?? REASON.test_execution_unavailable),
       evidence,
       cleanup,
       operationalReason,
@@ -978,7 +997,7 @@ export async function runCandidateEvidence(spec, deps = {}) {
   }
   if (operationalReason !== null) {
     return candidateEvidenceResult(
-      candidateTests(candidate),
+      summarizeCandidateTests(candidate),
       proofUnavailable(spec.proofRequirement.required, committedRecords(), operationalReason),
       evidence,
       cleanup,
@@ -987,8 +1006,8 @@ export async function runCandidateEvidence(spec, deps = {}) {
   }
   if (c1.execution !== 'completed' || c1.outcome !== 'pass') {
     return candidateEvidenceResult(
-      candidateTests(candidate),
-      initialFailureProof(spec, candidate, 'candidate_tests_failed'),
+      summarizeCandidateTests(candidate),
+      initialFailureProof(spec, candidate, REASON.test_candidate_failed),
       evidence,
       cleanup,
       operationalReason,
@@ -1011,8 +1030,8 @@ export async function runCandidateEvidence(spec, deps = {}) {
     regressionProof = proofUnavailable(
       spec.proofRequirement.required,
       committedRecords(),
-      persistenceFailed && operationalReason !== 'deadline_expired'
-        ? 'evidence_persistence_failed'
+      persistenceFailed && operationalReason !== REASON.test_deadline_expired
+        ? REASON.evidence_persistence_failed
         : operationalReason,
     );
   } else {
@@ -1027,10 +1046,10 @@ export async function runCandidateEvidence(spec, deps = {}) {
     });
   }
   return candidateEvidenceResult(
-    candidateTests(candidate),
+    summarizeCandidateTests(candidate),
     regressionProof,
     evidence,
     cleanup,
-    persistenceFailed ? 'evidence_persistence_failed' : operationalReason,
+    persistenceFailed ? REASON.evidence_persistence_failed : operationalReason,
   );
 }

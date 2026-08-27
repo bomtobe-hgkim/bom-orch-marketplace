@@ -90,8 +90,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { statSync } from 'node:fs';
-import { delimiter, isAbsolute } from 'node:path';
-import { normalizePathEntry } from './resolve-binary.mjs';
+import { renderNotice } from '../reason-text.mjs';
+import { pathGrammarFor, normalizePathEntry } from './resolve-binary.mjs';
 
 /**
  * `cmd.exe` 가 값을 볼 수 있는 환경 변수의 최대 길이(문자).
@@ -146,7 +146,13 @@ export const CMD_ENV_VALUE_LIMIT = 8_191;
  */
 export function compactPath(rawPath, options = {}) {
   const raw = typeof rawPath === 'string' ? rawPath : '';
-  const windows = (options.platform ?? process.platform) === 'win32';
+  const platform = options.platform ?? process.platform;
+  const windows = platform === 'win32';
+  // ★ PATH 문법은 **주입받은 platform** 에서 온다. 호스트 `node:path` 를 쓰면 이 함수가
+  //   받는 `platform` 인자가 거짓말이 된다 — Linux 러너에서 `{platform:'win32'}` 를 줘도
+  //   구분자가 ':' 라 `'C:\a'` 가 `'C'` 와 `'\a'` 로 쪼개졌다(실측 CI ubuntu·macOS).
+  //   그러면 win32 분기는 Windows 기계에서만 검증되고, 인자를 둔 목적 자체가 사라진다.
+  const { delimiter, isAbsolute } = pathGrammarFor(platform);
   const limit = options.limit ?? CMD_ENV_VALUE_LIMIT;
   const prepend = Array.isArray(options.prepend) ? options.prepend.filter((d) => typeof d === 'string' && d !== '') : [];
 
@@ -229,27 +235,23 @@ function isDirectorySync(path) {
   }
 }
 
-/** 사람이 읽을 축약 사실. 봉투를 가진 호출부만 이 채널을 쓴다. */
+/** 사람이 읽을 축약 사실. 봉투를 가진 호출부만 이 채널을 쓴다. 문구 정본은 `NOTICE_TEXT` 다. */
 function pathNotes(result, limit) {
   const notes = [];
   if (result.allDropped) {
-    notes.push(
-      `PATH 가 ${result.originalChars}자여서 줄이려 했지만 모든 항목(${result.originalEntries}개)이 ` +
-        '걸러져 남는 것이 없었습니다 — 빈 PATH 를 물려주지 않으려고 원본을 그대로 넘겼습니다.',
-    );
+    notes.push(renderNotice('path_shrink_left_nothing', { chars: result.originalChars, count: result.originalEntries }));
   }
   if (result.cleaned) {
-    notes.push(
-      `PATH 가 ${result.originalChars}자여서 ${result.chars}자로 줄였습니다 ` +
-        `(중복 ${result.duplicatesDropped}개, 존재하지 않거나 절대 경로가 아닌 항목 ${result.missingDropped}개 제거) — ` +
-        `cmd.exe 는 ${limit}자를 넘는 환경 변수를 빈 값으로 봅니다.`,
-    );
+    notes.push(renderNotice('path_shrunk', {
+      before: result.originalChars,
+      chars: result.chars,
+      duplicates: result.duplicatesDropped,
+      missing: result.missingDropped,
+      limit,
+    }));
   }
   if (result.stillOverLimit) {
-    notes.push(
-      `정리한 뒤에도 PATH 가 ${result.chars}자로 상한을 넘습니다 — 잘라내면 뒤쪽 디렉터리의 도구를 ` +
-        '조용히 잃으므로 그대로 뒀습니다. 자식이 셸을 띄우면 그 셸에서 PATH 가 비어 보입니다.',
-    );
+    notes.push(renderNotice('path_still_over_limit', { chars: result.chars }));
   }
   return notes;
 }
@@ -309,6 +311,55 @@ export const CODEX_AUTH_NAMES = Object.freeze([
 ]);
 
 /**
+ * 벤더 **게이트웨이 배포**를 고르는 스위치. 부모 env 에 이것이 켜져 있으면 이 서버는 실행을
+ * 크레딧 전에 거부한다(WS4b 스펙 §0-D1-(b), 리서치 메모 §F).
+ *
+ * ★★ **왜 목록이 여기 사는가.** 이 이름들이 거부 대상인 유일한 이유는 위 allowlist 가 그것을
+ *   **버리기 때문**이다(실측, 메모 §F.2: 70키 부모 env 로 `buildChildEnv` 를 태우면 이 둘도
+ *   `AWS_*` 도 `GOOGLE_APPLICATION_CREDENTIALS` 도 전부 사라진다). 그래서 게이트웨이 사용자의
+ *   자식 `claude` 는 자기가 게이트웨이 배포라는 것을 **모른 채** 구독/키체인 경로로 떨어지고,
+ *   그 경로는 순수 게이트웨이 사용자가 채운 적이 없다. 두 사실이 같은 파일에 있어야 한다 —
+ *   언젠가 이 이름들을 옵트인으로 통과시키기로 하면(스펙 §8 의 오너 항목 (a)), 거부 목록은
+ *   **같은 편집에서** 사라져야 하기 때문이다.
+ *
+ * ★★ **목록이 스위치 둘뿐인 이유.** 로드맵 §3.6b 는 `AWS_REGION`·`AWS_PROFILE`·`ANTHROPIC_MODEL`
+ *   ·`OPENAI_BASE_URL` 도 「게이트웨이 변수군」으로 적지만, 그 이름들은 게이트웨이를 **한 번도
+ *   안 쓰는 기계에도 흔히 있다**(AWS CLI 를 쓰는 개발자 전부가 `AWS_PROFILE` 을 갖는다). 그것으로
+ *   막으면 멀쩡한 구독 실행이 설명 없이 죽고, 그때 이 게이트는 자기가 막으려는 것보다 위험해진다
+ *   — `securityFloor` 가 「모르면 막지 않는다」로 답한 바로 그 자리다. 배포를 **고르는** 것은
+ *   이 둘뿐이라 이 둘만 적는다.
+ *
+ * ⚠ **재지 못한 것 하나**: 캡처(`test/captures/claude-help.txt:43`)는 3P 를 셋으로 적는데
+ *   (Bedrock/Vertex/**Foundry**) Foundry 쪽 스위치의 이름은 이 저장소 어디에도 실측이 없다.
+ *   추측한 이름을 넣으면 그것은 검증 못 하는 주장이므로 넣지 않았다 — Foundry 사용자는 오늘
+ *   거부 대신 (WS4b 가 넓힌) 자격증명 분류를 받는다. 그 이름을 고정하는 것은 컨트롤러의 라이브
+ *   세션 몫이고, 그때 이 배열에 한 줄이 는다.
+ */
+export const GATEWAY_ENV_NAMES = Object.freeze(['CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX']);
+
+/** 「명시적으로 껐다」로 읽는 값. `VAR=0` 은 게이트웨이를 **안 쓴다**는 진술이고 막을 이유가 없다. */
+const GATEWAY_OFF = /^(?:0|false|no|off)$/i;
+
+/**
+ * 부모 env 가 게이트웨이 배포를 고르고 있는가. **순수 술어다** — 읽기만 하고 아무것도 안 띄운다.
+ *
+ * 값 읽기는 `readEnvEntry` 를 그대로 쓴다: Windows 환경변수 이름은 대소문자를 안 가리고, 빈
+ * 문자열은 이 파일 전체에서 「설정되지 않음」이다(셸에서 `VAR=` 로 지운 사용자의 의도와 같다).
+ *
+ * ★★ 내는 이름은 **찾은 키**이지 정본 철자가 아니다(최종 리뷰). 대소문자 무시는 win32 사정인데,
+ *   이름이 대소문자를 가리는 POSIX 에서 정본 철자를 보고하면 `claude_code_use_bedrock=1` 을 가진
+ *   사용자가 「설정돼 있지도 않은 이름을 지우라」는 회복 문장을 받는다. 거부 자체는 그대로 둔다 —
+ *   크레딧 전 fail-closed 이고, 그 철자는 사용자가 게이트웨이를 의도했다는 신호다.
+ */
+export function detectGatewayEnv(env = process.env) {
+  const source = env !== null && typeof env === 'object' ? env : {};
+  const names = GATEWAY_ENV_NAMES.map((name) => readEnvEntry(source, name))
+    .filter((found) => found !== null && !GATEWAY_OFF.test(found.value.trim()))
+    .map((found) => found.key);
+  return Object.freeze({ gateway: names.length > 0, names: Object.freeze(names) });
+}
+
+/**
  * 하나의 변수를 대소문자 무시로 읽어 allowlist 의 표준 철자로 돌려준다.
  *
  * Windows 환경변수 이름은 대소문자를 안 가리고 process.env 자체도 그렇게 동작하지만
@@ -322,17 +373,19 @@ export const CODEX_AUTH_NAMES = Object.freeze([
  * 구독 인증으로 넘어가는 대신 빈 키로 인증을 시도하다 실패하게 만든다. 셸에서 `VAR=`
  * 로 "지웠다"고 생각한 사용자의 의도와도 일치한다.
  */
-function readEnvValue(env, name) {
+function readEnvEntry(env, name) {
   const direct = env[name];
-  if (typeof direct === 'string' && direct !== '') return direct;
+  if (typeof direct === 'string' && direct !== '') return { key: name, value: direct };
 
   const wanted = name.toLowerCase();
   for (const key of Object.keys(env)) {
     const value = env[key];
-    if (key.toLowerCase() === wanted && typeof value === 'string' && value !== '') return value;
+    if (key.toLowerCase() === wanted && typeof value === 'string' && value !== '') return { key, value };
   }
-  return undefined;
+  return null;
 }
+/** 값만 필요한 호출부(allowlist)의 어댑터 — 발견된 키가 필요한 자리는 `readEnvEntry` 를 직접 쓴다. */
+const readEnvValue = (env, name) => readEnvEntry(env, name)?.value;
 
 /**
  * 자식 환경을 **빈 객체에서** 만든다.

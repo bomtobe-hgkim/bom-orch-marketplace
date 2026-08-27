@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { open, readFile, rename, rm, stat } from 'node:fs/promises';
+import { open, readFile, rm, stat } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { withLock } from '../lockfile.mjs';
+import { REASON } from '../reason-codes.mjs';
+import { fail } from '../reason-text.mjs';
+import { errorText } from '../util/errors.mjs';
+import { RENAME_ATTEMPTS, RENAME_DELAY_MS, writeFileAtomic } from '../util/fs-atomic.mjs';
+import { parseStrictJson } from '../util/strict-json.mjs';
+import { classifyPosteriorsSchema, versionedPosteriors } from './posterior-schema.mjs';
 
 /**
  * Learning's shared persistence boundary.
@@ -14,15 +20,17 @@ import { withLock } from '../lockfile.mjs';
  * quarantine copy is also a target: preparation never moves the only original
  * bytes before its durable operation exists.
  *
- * This promises restart/process-crash recovery.  It deliberately does not
- * claim directory-fsync or power-loss guarantees that Windows does not offer.
+ * This promises restart/process-crash recovery.  Since WS1 the shared writer
+ * (`src/util/fs-atomic.mjs`) also fsyncs the parent directory after the rename,
+ * so on POSIX the rename itself is durable; Windows still refuses a directory
+ * fsync (EPERM, measured), and there the guarantee stays process-crash-only.
+ * A refused or failed directory fsync is never a write failure — the bytes are
+ * already in place.
  */
 export const LEARNING_LOCK_FILE = 'learning.lock';
 export const PENDING_FILE = 'learning.pending.json';
 export const GENERATIONS_FILE = 'learning.generations.json';
 
-const RENAME_TRIES = 10;
-const RENAME_WAIT_MS = 5;
 const RECOVERY_FAILURE = Symbol('recovery-failure');
 
 const pathsFor = (stateRoot) =>
@@ -58,40 +66,41 @@ export function normalizeGenerations(raw) {
 
 export async function readGenerationsUnlocked(stateRoot) {
   const paths = pathsFor(stateRoot);
-  if (paths === null) return { ok: false, reason: '상태 루트가 절대 경로가 아닙니다.' };
+  if (paths === null) return fail(REASON.state_root_not_absolute);
   try {
     const raw = JSON.parse(await readFile(paths.generations, 'utf8'));
     return { ok: true, generations: normalizeGenerations(raw) };
   } catch (error) {
     if (error?.code === 'ENOENT') return { ok: true, generations: { global: 0, cells: {} } };
-    return { ok: false, reason: `학습 세대를 읽지 못했습니다: ${describe(error)}` };
+    return fail(REASON.learning_generations_read_failed, { detail: errorText(error) });
   }
 }
 
 export async function readGenerations(stateRoot) {
   const locked = await withLearningLock(stateRoot, async () => readGenerationsUnlocked(stateRoot));
-  return locked.ok ? locked.value : { ok: false, reason: locked.reason };
+  return locked.ok ? locked.value : locked;
 }
 
 /** Execute a callback while holding the single learning coordinator. */
 export async function withLearningLock(stateRoot, fn) {
   const paths = pathsFor(stateRoot);
-  if (paths === null) return { ok: false, reason: '상태 루트가 절대 경로가 아닙니다.' };
+  if (paths === null) return fail(REASON.state_root_not_absolute);
   const locked = await withLock(paths.lock, async () => {
     const recovered = await recoverPendingUnlocked(paths);
-    if (!recovered.ok) return { [RECOVERY_FAILURE]: true, reason: recovered.reason };
+    // 복구 실패는 **본문의 값**으로 나오므로 여기서 표시해 두고 아래에서 되꺼낸다 — 봉투를
+    // 그대로 실어야 `reasonCode` 가 살아남는다(예전에는 `reason` 문장만 옮겨 실었다).
+    if (!recovered.ok) return { [RECOVERY_FAILURE]: recovered };
     return fn(paths);
   });
-  if (locked.ok && locked.value?.[RECOVERY_FAILURE] === true) {
-    return { ok: false, reason: locked.value.reason };
-  }
+  const recoveryFailure = locked.ok ? locked.value?.[RECOVERY_FAILURE] : undefined;
+  if (recoveryFailure !== undefined) return recoveryFailure;
   return locked;
 }
 
 /** Recover pending work before a read that needs posterior/journal agreement. */
 export async function recoverLearning(stateRoot) {
   const locked = await withLearningLock(stateRoot, async () => ({ ok: true }));
-  if (!locked.ok) return { ok: false, reason: locked.reason };
+  if (!locked.ok) return locked;
   return locked.value;
 }
 
@@ -114,9 +123,16 @@ export async function hasPendingLearningOperation(stateRoot) {
  */
 export async function commitLearningOperationUnlocked(stateRoot, operation, { onPhase } = {}) {
   const paths = pathsFor(stateRoot);
-  if (paths === null) return { ok: false, reason: '상태 루트가 절대 경로가 아닙니다.' };
+  if (paths === null) return fail(REASON.state_root_not_absolute);
   const normalized = normalizeOperation(operation);
   if (!normalized.ok) return normalized;
+  const schemaRead = await readNewerPosteriorsSchema(paths);
+  if (!schemaRead.ok) return schemaRead;
+  if (schemaRead.stateSchema !== null) return { ok: false, stateSchema: schemaRead.stateSchema };
+  const targetSchema = normalized.operation.targets.posteriors === null
+    ? null
+    : classifyPosteriorsSchema(normalized.operation.targets.posteriors);
+  if (targetSchema?.status === 'newer') return { ok: false, stateSchema: targetSchema.stateSchema };
   const written = await writeAtomicJson(paths, paths.pending, PENDING_FILE, normalized.operation);
   if (!written.ok) return written;
   const afterPending = await phase(onPhase, 'after-pending');
@@ -134,14 +150,59 @@ export const makeOperationId = () => randomUUID();
 async function recoverPendingUnlocked(paths) {
   let raw;
   try {
-    raw = JSON.parse(await readFile(paths.pending, 'utf8'));
+    const document = parseStrictJson(await readFile(paths.pending));
+    if (!document.ok) {
+      return fail(REASON.learning_pending_work_read_failed, {
+        detail: 'learning.pending.json is not an unambiguous UTF-8 JSON document',
+      });
+    }
+    raw = document.value;
   } catch (error) {
     if (error?.code === 'ENOENT') return { ok: true };
-    return { ok: false, reason: `보류 중인 학습 작업을 읽지 못했습니다: ${describe(error)}` };
+    return fail(REASON.learning_pending_work_read_failed, { detail: errorText(error) });
   }
   const normalized = normalizeOperation(raw);
-  if (!normalized.ok) return { ok: false, reason: `보류 중인 학습 작업이 손상됐습니다: ${normalized.reason}` };
+  if (!normalized.ok) return fail(REASON.learning_pending_work_invalid, { detail: normalized.error });
+  const schemaRead = await readNewerPosteriorsSchema(paths);
+  if (!schemaRead.ok) return schemaRead;
+  if (schemaRead.stateSchema !== null) return { ok: false, stateSchema: schemaRead.stateSchema };
+  const targetSchema = normalized.operation.targets.posteriors === null
+    ? null
+    : classifyPosteriorsSchema(normalized.operation.targets.posteriors);
+  if (targetSchema?.status === 'newer') return { ok: false, stateSchema: targetSchema.stateSchema };
   return applyPendingUnlocked(paths, normalized.operation);
+}
+
+async function readNewerPosteriorsSchema(paths) {
+  let bytes;
+  try {
+    bytes = await readFile(paths.posteriors);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { ok: true, stateSchema: null };
+    return fail(REASON.learning_posteriors_read_failed, { detail: errorText(error) });
+  }
+  const document = parseStrictJson(bytes);
+  if (!document.ok) {
+    if (document.kind === 'ambiguous') {
+      return fail(REASON.learning_posteriors_read_failed, {
+        detail: 'posteriors.json contains duplicate keys or excessive nesting',
+      });
+    }
+    // A readable corrupt current file is replayable because the durable WAL is
+    // the complete target.  Only an unreadable file is opaque and fail-closed.
+    return { ok: true, stateSchema: null };
+  }
+  const raw = document.value;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: true, stateSchema: null };
+  }
+  const schema = classifyPosteriorsSchema(raw);
+  if (schema.status === 'invalid') {
+    return fail(REASON.learning_posteriors_read_failed, {
+      detail: 'posteriors.json contains an invalid schemaVersion',
+    });
+  }
+  return { ok: true, stateSchema: schema.status === 'newer' ? schema.stateSchema : null };
 }
 
 async function applyPendingUnlocked(paths, operation, onPhase) {
@@ -159,7 +220,12 @@ async function applyPendingUnlocked(paths, operation, onPhase) {
   if (!afterQuarantine.ok) return afterQuarantine;
 
   if (targets.posteriors !== null) {
-    const posteriors = await writeAtomicJson(paths, paths.posteriors, 'posteriors.json', targets.posteriors);
+    const posteriors = await writeAtomicJson(
+      paths,
+      paths.posteriors,
+      'posteriors.json',
+      versionedPosteriors(targets.posteriors),
+    );
     if (!posteriors.ok) return posteriors;
   }
   const afterPosterior = await phase(onPhase, 'after-posterior');
@@ -179,12 +245,31 @@ async function applyPendingUnlocked(paths, operation, onPhase) {
   const afterJournal = await phase(onPhase, 'after-journal');
   if (!afterJournal.ok) return afterJournal;
 
-  try {
-    await rm(paths.pending, { force: true });
-  } catch (error) {
-    return { ok: false, reason: `보류 중인 학습 작업을 지우지 못했습니다: ${describe(error)}` };
-  }
+  // ★★ WAL 치우기도 **재시도한다**(최종 리뷰 I6). 이 한 줄이 실패하면 트랜잭션 전체가
+  //   `learning_pending_work_unclearable` 로 돌아가는데, 사후분포도 저널 행도 이미 디스크에
+  //   있으므로 그 답은 「아무것도 안 됐다」가 아니라 「치울 것이 남았다」다. Windows 에서
+  //   EPERM/EBUSY 는 흔한 일시 상태(안티바이러스·다른 리더의 열린 핸들)이고, 같은 모듈의
+  //   `writeAtomicBytes` 는 그 셋을 이미 10회 × 5ms 로 다시 시도한다 — 여기만 한 번에 포기하던
+  //   비대칭이 그 실패 등급을 이 경로의 유일한 상시 트리거로 만들고 있었다.
+  const cleared = await removePendingWithRetry(paths.pending);
+  if (!cleared.ok) return fail(REASON.learning_pending_work_unclearable, { detail: cleared.reason });
   return { ok: true };
+}
+
+/** `rm` 을 `renameWithRetry` 와 같은 예산(10회 × 5ms)으로 다시 시도한다. 같은 세 코드만. */
+async function removePendingWithRetry(path) {
+  let last = null;
+  for (let attempt = 1; attempt <= RENAME_ATTEMPTS; attempt += 1) {
+    try {
+      await rm(path, { force: true });
+      return { ok: true };
+    } catch (error) {
+      last = error;
+      if (!['EPERM', 'EACCES', 'EBUSY'].includes(error?.code) || attempt === RENAME_ATTEMPTS) break;
+      await new Promise((resolve) => { setTimeout(resolve, RENAME_DELAY_MS); });
+    }
+  }
+  return { ok: false, reason: errorText(last) };
 }
 
 async function phase(onPhase, name) {
@@ -193,7 +278,7 @@ async function phase(onPhase, name) {
     await onPhase(name);
     return { ok: true };
   } catch (error) {
-    return { ok: false, reason: `학습 저장 경계 ${name} 에서 실패했습니다: ${describe(error)}` };
+    return fail(REASON.learning_write_boundary_failed, { name, detail: errorText(error) });
   }
 }
 
@@ -203,7 +288,10 @@ function normalizeOperation(value) {
   const targets = op?.targets !== null && typeof op?.targets === 'object' ? op.targets : null;
   const posteriors = targets?.posteriors;
   if (op?.version !== 1 || id === null || posteriors === undefined || (posteriors !== null && (typeof posteriors !== 'object' || Array.isArray(posteriors)))) {
-    return { ok: false, reason: 'version, operationId, targets.posteriors 가 있는 작업이어야 합니다.' };
+    return fail(REASON.learning_work_invalid);
+  }
+  if (posteriors !== null && classifyPosteriorsSchema(posteriors).status === 'invalid') {
+    return fail(REASON.learning_work_invalid);
   }
   let generations = null;
   if (targets.generations !== null && targets.generations !== undefined) {
@@ -212,10 +300,10 @@ function normalizeOperation(value) {
   let journal = null;
   if (targets.journal !== null && targets.journal !== undefined) {
     if (targets.journal === null || typeof targets.journal !== 'object' || Array.isArray(targets.journal)) {
-      return { ok: false, reason: 'targets.journal 은 객체 또는 null 이어야 합니다.' };
+      return fail(REASON.learning_work_journal_invalid);
     }
     if (typeof targets.journal.runId !== 'string' || targets.journal.runId === '') {
-      return { ok: false, reason: 'targets.journal 에 runId 가 없습니다.' };
+      return fail(REASON.learning_work_journal_run_id_missing);
     }
     journal = { ...targets.journal, operationId: id };
   }
@@ -228,7 +316,7 @@ function normalizeOperation(value) {
       candidate.file !== 'posteriors.corrupt.json' ||
       typeof candidate.bytes !== 'string'
     ) {
-      return { ok: false, reason: 'targets.quarantine 은 posteriors.corrupt.json 바이트여야 합니다.' };
+      return fail(REASON.learning_work_quarantine_invalid);
     }
     quarantine = { file: candidate.file, bytes: candidate.bytes };
   }
@@ -243,7 +331,7 @@ async function appendJournalOnce(file, entry, operationId) {
   try {
     text = await readFile(file, 'utf8');
   } catch (error) {
-    if (error?.code !== 'ENOENT') return { ok: false, reason: `실행 저널을 읽지 못했습니다: ${describe(error)}` };
+    if (error?.code !== 'ENOENT') return fail(REASON.learning_journal_read_failed, { detail: errorText(error) });
   }
   for (const line of text.split('\n')) {
     try {
@@ -256,7 +344,7 @@ async function appendJournalOnce(file, entry, operationId) {
   try {
     line = JSON.stringify(entry);
   } catch (error) {
-    return { ok: false, reason: `실행 저널 작업을 JSON 으로 만들지 못했습니다: ${describe(error)}` };
+    return fail(REASON.learning_journal_record_unserializable, { detail: errorText(error) });
   }
   try {
     const handle = await open(file, 'a');
@@ -271,7 +359,7 @@ async function appendJournalOnce(file, entry, operationId) {
     }
     return { ok: true };
   } catch (error) {
-    return { ok: false, reason: `실행 저널에 작업을 기록하지 못했습니다: ${describe(error)}` };
+    return fail(REASON.learning_journal_row_write_failed, { detail: errorText(error) });
   }
 }
 
@@ -280,59 +368,35 @@ async function writeAtomicJson(paths, target, name, value) {
   try {
     bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
   } catch (error) {
-    return { ok: false, reason: `${name} 을(를) JSON 으로 만들지 못했습니다: ${describe(error)}` };
+    return fail(REASON.learning_work_unserializable, { name, detail: errorText(error) });
   }
   return writeAtomicBytes(paths, target, name, bytes);
 }
 
+/**
+ * 임시 파일 + fsync + rename 은 `src/util/fs-atomic.mjs` 하나로 모았다(`wx` 배타 생성,
+ * 데이터 fsync, EPERM/EACCES/EBUSY 10회 × 5ms 재시도, **실패하면** 임시 파일 치우기 —
+ * 성공 경로에는 rename 이 이미 가져가 치울 것이 없고, `wx` 가 EEXIST 로 튕겼으면 남의
+ * 파일이라 손대지 않는다). 여기 남는 것은 **이 모듈의 것**뿐이다: 임시 이름과 실패 문장.
+ *
+ * ★ `syncDir:true` 는 여기서 새로 켠 것이다. rename 자체가 디스크에 닿는 창을 닫는다 —
+ *   Windows 에서는 디렉터리 fsync 가 EPERM 이라(실측) 오늘과 같은 「프로세스 크래시까지」
+ *   등급으로 강등되고, POSIX 에서는 진짜 보장이 된다. 어느 쪽이든 **쓰기 실패는 아니다.**
+ * ★ `stage` 로 두 코드를 가른다. 「쓰지 못했다」와 「제자리로 옮기지 못했다」는 호출자에게
+ *   다른 뜻이라 한 코드로 접으면 안 된다.
+ */
 async function writeAtomicBytes(paths, target, name, bytes) {
   const tmp = join(paths.root, `${name}.${process.pid}.${randomUUID()}.tmp`);
-  try {
-    const handle = await open(tmp, 'wx');
-    try {
-      await handle.writeFile(bytes);
-      await handle.sync().catch(() => {});
-    } finally {
-      await handle.close().catch(() => {});
-    }
-    const moved = await renameWithRetry(tmp, target);
-    return moved.ok ? { ok: true } : { ok: false, reason: `${name} 을(를) 제자리로 옮기지 못했습니다: ${moved.reason}` };
-  } catch (error) {
-    return { ok: false, reason: `${name} 을(를) 쓰지 못했습니다: ${describe(error)}` };
-  } finally {
-    await rm(tmp, { force: true }).catch(() => {});
-  }
-}
-
-async function renameWithRetry(from, to) {
-  let last = null;
-  for (let attempt = 1; attempt <= RENAME_TRIES; attempt += 1) {
-    try {
-      await rename(from, to);
-      return { ok: true };
-    } catch (error) {
-      last = error;
-      const retryable = error?.code === 'EPERM' || error?.code === 'EACCES' || error?.code === 'EBUSY';
-      if (!retryable || attempt === RENAME_TRIES) break;
-      await new Promise((resolve) => setTimeout(resolve, RENAME_WAIT_MS));
-    }
-  }
-  return { ok: false, reason: describe(last) };
+  const written = await writeFileAtomic(target, bytes, { tempPath: tmp, fsync: true, syncDir: true });
+  if (written.ok) return { ok: true };
+  return written.stage === 'rename'
+    ? fail(REASON.learning_work_publish_failed, { name, detail: written.reason })
+    : fail(REASON.learning_work_write_failed, { name, detail: written.reason });
 }
 
 function settle(locked) {
-  if (!locked.ok) return { ok: false, reason: locked.reason };
+  if (!locked.ok) return locked;
   const value = locked.value;
-  if (!value?.ok) return { ok: false, reason: value?.reason ?? '학습 작업이 실패했습니다.' };
+  if (!value?.ok) return value?.ok === false ? value : fail(REASON.learning_work_failed);
   return { ok: true };
-}
-
-function describe(error) {
-  if (error === undefined) return '사유 없이 undefined 가 던져졌습니다.';
-  if (error === null) return '사유 없이 null 이 던져졌습니다.';
-  try {
-    return typeof error?.message === 'string' && error.message !== '' ? error.message : String(error);
-  } catch {
-    return '사유를 읽지 못했습니다.';
-  }
 }

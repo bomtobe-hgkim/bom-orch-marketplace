@@ -8,30 +8,35 @@
 import { listProviders } from './providers/index.mjs';
 import { resolveStateRoot } from './state-root.mjs';
 import { POINT_OF_USE_MAX_AGE_MS, readCatalog, shouldRefresh, writeCatalog } from './providers/catalog.mjs';
-import { MAX_CONTENT_CHARS, failure, success, validateArgs } from './envelope.mjs';
+import { failure, success, validateArgs } from './envelope.mjs';
 import { MAX_BUDGET, runOrchestration } from './engine.mjs';
-import { TIERS, VENDORS, readSettings, writeSettings } from './config.mjs';
-import { AXES, OBSERVATION_THRESHOLD, POLICY_V2_AXES, armAllowed, gradeToDeltas, observationsOf } from './learn/bandit.mjs';
+import { TIERS, VENDORS, readSettingsStatus, writeSettings } from './config.mjs';
+import { confidenceOfConfig, confidenceOfModels } from './confidence.mjs';
+import { REASON } from './reason-codes.mjs';
+import { renderNotice, renderReason } from './reason-text.mjs';
+import { statusOfReasonCode } from './run-faults.mjs';
 import { TASK_CLASSES } from './learn/classify.mjs';
-import { findRunUnlocked, readRunsUnlocked } from './learn/journal.mjs';
-import { inspectArtifactRefs } from './run-artifacts.mjs';
-import { join } from 'node:path';
-import { GENERATIONS_SNAPSHOT_FILE, SNAPSHOT_FILE, cellKeyOf, commitLearningMutationUnlocked, readPosteriors, readPosteriorsUnlocked, resetPosteriors } from './learn/posteriors.mjs';
-import { generationOf, readGenerationsUnlocked, withLearningLock } from './learn/learning.mjs';
+import { INSTALL_RECOVERY, errorText } from './util/errors.mjs';
+import { toEngineDeps, toEngineOptions } from './tools/context.mjs';
+import { runOrchApply } from './tools/apply.mjs';
+import { runOrchReward } from './tools/reward.mjs';
+import {
+  AXIS_NOTES,
+  foldResetNotes,
+  resetConfirmationFailure,
+  runOrchReset,
+  runOrchStats,
+} from './tools/stats.mjs';
+import { runOrchStatus } from './tools/status.mjs';
+import { RECENT_RUNS_DEFAULT, RECENT_RUNS_MAX } from './run-read.mjs';
+import { stateSchemaNotice, stateSchemaReason } from './state-schema.mjs';
 
-const GENERIC_RECOVERY = '설치 상태와 PATH 를 확인하거나 다시 시도하세요.';
-
-/** 어떤 값에서도(toString 이 던지는 값 포함) 사람이 읽을 문자열을 뽑는다. */
-function safeErrorText(error) {
-  if (typeof error === 'string') return error !== '' ? error : '알 수 없는 오류';
-  if (error instanceof Error && typeof error.message === 'string' && error.message !== '') return error.message;
-  try {
-    const text = String(error);
-    return text !== '' ? text : '알 수 없는 오류';
-  } catch {
-    return '알 수 없는 오류';
-  }
-}
+// `toEngineDeps`·`toEngineOptions`·`inspectJournalArtifacts`·`MAX_INSPECTED_ARTIFACT_REFS` moved
+// to `./tools/context.mjs`(WS2 Task 16, tools.mjs 를 <=1,459 로 되돌리는 분리) — `orch_reward`
+// 도 같은 배선이 필요한데 `tools/reward.mjs` 가 이 파일을 다시 부르면 순환이 생기기 때문이다.
+// `toEngineOptions` 는 `test/tools.test.mjs` 가 직접 부르므로 이 파일의 이름으로도 남긴다.
+export { toEngineOptions };
+export { AXIS_NOTES, foldResetNotes };
 
 /**
  * `orch_stats({runs})` 의 상한.
@@ -57,11 +62,17 @@ const MAX_RECENT_RUNS = 50;
 /**
  * 도구 스펙. 얼려서 낸다 — 호출부가 실수로 목록을 바꾸면 조용히 다음 요청부터
  * 도구가 늘거나 줄어드는 사고가 난다.
+ *
+ * ★ `description` 은 **영어**다(WS2 §7, Task 16). 이것은 실패 문구가 아니라 **도구 스키마의
+ *   데이터**라서 `REASON_TEXT` 가 아니라 여기 산다 — 매 세션 `tools/list` 에 그대로 실려
+ *   호스트와 모델이 도구를 고르는 유일한 근거가 된다. 문안을 바꾸면
+ *   `contract/tools.json`(`npm run contract:snapshot`)과 `test/packaging.test.mjs` 의 낱말 표가
+ *   같은 커밋에서 함께 움직여야 한다.
  */
 export const TOOL_SPECS = Object.freeze([
   Object.freeze({
     name: 'orch_models',
-    description: 'claude·codex 두 벤더의 설치 상태와 사용 가능한 모델 목록을 조회한다.',
+    description: 'Report the installation state of the claude and codex CLIs and the model list each one offers.',
     args: Object.freeze({
       refresh: Object.freeze({ type: 'boolean', required: false, default: false }),
     }),
@@ -69,10 +80,16 @@ export const TOOL_SPECS = Object.freeze([
   Object.freeze({
     name: 'orch_run',
     description:
-      '작업을 두 벤더 CLI 로 오케스트레이션한다. 일회용 git 워크트리에서 워커가 고치고, ' +
-      '테스트는 이 서버가 직접 돌리며, 검증자가 읽기 전용으로 확인한다. ' +
-      '결과는 사용자 저장소에 적용할 수 있는 패치다. ' +
-      'project 는 절대 경로여야 한다 — MCP stdio 서버의 cwd 는 호스트가 물려준 값이라 고정돼 있지 않다.',
+      'Orchestrate one task across two vendor CLIs: a worker edits inside a disposable git worktree, ' +
+      'this server runs the tests itself, and a verifier reads the result without changing it. ' +
+      'The result is a patch you can apply to your own repository. ' +
+      'project must be an absolute path, because the working directory of an MCP stdio server is ' +
+      'whatever the host handed down and is not fixed. ' +
+      'Pass resume_run_id to continue an earlier run: its sealed attempts are read instead of run ' +
+      'again, and this call spends its budget on what is left - every lane starts at the same ' +
+      'attempt number, so both candidates get the same number of fresh attempts. That works only ' +
+      'when the source tree and the test environment are exactly the ones that run was built on; ' +
+      'otherwise the call is refused and nothing starts, so call again without the argument.',
     args: Object.freeze({
       // 설계 §8.2. 기본값은 **여기**가 권위다 — 엔진 기본값(budget 1 · waitMs 0)은
       // 라이브러리로서의 최소값이라 도구 층에서 설계값으로 덮는다.
@@ -101,7 +118,7 @@ export const TOOL_SPECS = Object.freeze([
         integer: true,
         enum: [1, 2],
         default: 1,
-        description: '독립 후보 수입니다. 2는 두 provider와 lane별 budget을 사용합니다.',
+        description: 'How many independent candidates to run; 2 uses both providers with a per-lane budget.',
       }),
       // 설계 §9.2 는 "한 벤더만으로 조용히 돌려 '됐다'고 하면 요청을 배신한다" 고 못박는다.
       // 그래서 single 은 호출자가 **명시적으로** 허용해야만 밴딧이 뽑을 수 있고(계획 3 §7.2),
@@ -110,7 +127,37 @@ export const TOOL_SPECS = Object.freeze([
         type: 'boolean',
         required: false,
         default: false,
-        description: '한 provider만으로 실행하는 것을 명시적으로 허용합니다.',
+        description: 'Explicitly allow this run to proceed with only one provider.',
+      }),
+      writer: Object.freeze({
+        type: 'string',
+        required: false,
+        enum: Object.freeze([...VENDORS]),
+        description: 'Pin the writer for this run; the other vendor verifies it. Not valid with candidates: 2.',
+      }),
+      // ★ WS0 §1.2 의 행 그대로(WS3 §0-R1). 스키마가 표현할 수 없는 것 둘은 서술자에 있다:
+      //   재사용의 조건(정확히 같은 baseline 과 환경)과, 어긋나면 **새 실행을 시작하지 않는다**는 것.
+      //   기본값이 없는 이유는 「재개하지 않음」이 값이 아니라 인자의 부재이기 때문이다.
+      resume_run_id: Object.freeze({
+        type: 'string',
+        required: false,
+        description: 'Continue an earlier run instead of starting its attempts over.',
+      }),
+      // ★ WS0 §1.2 의 행 그대로(WS5 스펙 §0 D1a). 스키마가 표현할 수 없는 것 둘이 서술자에 있다:
+      //   프로젝트 설정 `.bom-orch.json` 의 `scope.allow` 와 **합집합**이라는 것과, 보안 하드
+      //   리스트는 여기 적어도 무시된다는 것(계약 `project-config.schema.json` 의 같은 문장).
+      //   개수·길이 상한은 `validateArgs` 에 축이 없어 합집합이 강제한다(`src/scope-allowlist.mjs`)
+      //   — 그래서 서술자도 「거부한다」가 아니라 「쓰지 않고 알림으로 말한다」로 적는다.
+      //   기본값이 없는 이유는 `resume_run_id` 와 같다: 「허용목록 없음」은 값이 아니라 인자의 부재다.
+      scope_allow: Object.freeze({
+        type: 'array',
+        items: 'string',
+        required: false,
+        description: 'Globs (POSIX style, ** allowed) for paths this task is expected to change, ' +
+          'unioned with scope.allow in the project .bom-orch.json. At most 32 entries of 256 characters ' +
+          'are used and the rest are reported back unused. Security hard-list paths are ignored even ' +
+          'when listed, so a lockfile or an editor-settings directory can be waived and a CI definition, ' +
+          'a shell rc or anything that decides what the tests run cannot.',
       }),
       // ⚠ 설계 §8.2 의 `files`(프로젝트 밖 참고 파일)는 **여기 없다.** 엔진에 소비자가 없어
       //   받아서 버리기만 했고, 선언까지 해 두면 호출자(모델)는 참고 파일을 줬다고 믿고 그
@@ -123,9 +170,10 @@ export const TOOL_SPECS = Object.freeze([
     // 표현할 수 없는 **인자 사이의 의존**(vendor·tier 는 값과 함께 와야 한다)은 적는다 —
     // `toInputSchema` 는 필드별 제약만 옮길 수 있다.
     description:
-      '오케스트레이션이 쓸 모델과 effort 를 조회하거나 바꿉니다. ' +
-      '인자 없이 부르면 현재 설정과 고를 수 있는 값을 봅니다. ' +
-      '바꾸려면 vendor 와 tier 에 model 또는 effort 를 함께 주세요. 빈 문자열은 값을 지웁니다(= CLI 기본값).',
+      'Read or change the model and effort this orchestration uses. ' +
+      'Called with no arguments it reports the current settings and the values you can choose. ' +
+      'To change a model or effort, pass vendor and tier with it. Writer and learning are independent; ' +
+      'an empty string clears any value back to its default.',
     args: Object.freeze({
       // ★ enum 은 `src/config.mjs` 의 VENDORS 에서 온다 — settings.ini 의 섹션 이름을
       //   아는 것은 그쪽이다. 여기 글자로 적으면 벤더가 늘 때 조용히 갈린다.
@@ -135,14 +183,16 @@ export const TOOL_SPECS = Object.freeze([
       tier: Object.freeze({ type: 'string', required: false, enum: Object.freeze([...TIERS]) }),
       model: Object.freeze({ type: 'string', required: false }),
       effort: Object.freeze({ type: 'string', required: false }),
+      learning: Object.freeze({ type: 'string', required: false, enum: Object.freeze(['on', 'off', '']) }),
+      writer: Object.freeze({ type: 'string', required: false, enum: Object.freeze([...VENDORS, '']) }),
     }),
   }),
   Object.freeze({
     name: 'orch_stats',
     description:
-      '학습 통계를 봅니다 — 태스크 클래스 × 결정 축 셀마다 관측 수와 밴딧 활성 여부. ' +
-      'runs 를 주면 최근 실행 목록(run_id 포함)도 냅니다. ' +
-      'reset 은 사후분포를 지웁니다 — task_class 를 함께 주면 그 클래스의 셀만 지웁니다.',
+      'Read learning statistics without changing them. The default summary shows each cell\'s favored ' +
+      'arm, observation count, observations remaining before activation, and last applied run. ' +
+      'Pass view:full for raw alpha and beta values, or runs to include recent run_id values.',
     args: Object.freeze({
       // ★ enum 은 `src/learn/classify.mjs` 의 TASK_CLASSES 에서 온다 — 클래스를 아는 것은
       //   분류기다. 여기 글자로 적으면 클래스가 늘 때 이 도구만 조용히 뒤처진다
@@ -152,18 +202,71 @@ export const TOOL_SPECS = Object.freeze([
       //   가리키므로 그 목록이 실제로 나와야 한다. 기본은 끈다 — 서술자·응답 크기를 매 호출
       //   키우지 않기 위해서다. 상한의 근거는 `MAX_RECENT_RUNS` 주석에 있다.
       runs: Object.freeze({ type: 'number', integer: true, min: 0, max: MAX_RECENT_RUNS, required: false, default: 0 }),
-      reset: Object.freeze({ type: 'boolean', required: false, default: false }),
+      view: Object.freeze({ type: 'string', required: false, default: 'summary', enum: ['summary', 'full'] }),
+    }),
+  }),
+  Object.freeze({
+    name: 'orch_status',
+    // ★ 인자 둘의 권위는 WS0 §1.3 이다. `runs` 의 두 수는 `src/run-read.mjs` 에서 온다 —
+    //   목록을 실제로 자르는 쪽이 그 상한을 아는 쪽이고, 여기 글자로 적으면 조용히 갈린다.
+    description:
+      'Read one run back from what it left on disk: how it ended, the summary of its manifest, the ' +
+      'verifier issues and judge prose it kept, the tail of its log, and the paths of its artifacts. ' +
+      'Called with no arguments it lists the recent runs with their run_id values, which is how a ' +
+      'call that was cut off is recovered.',
+    args: Object.freeze({
+      run_id: Object.freeze({ type: 'string', required: false }),
+      runs: Object.freeze({
+        type: 'number',
+        integer: true,
+        min: 1,
+        max: RECENT_RUNS_MAX,
+        required: false,
+        default: RECENT_RUNS_DEFAULT,
+      }),
+    }),
+  }),
+  Object.freeze({
+    name: 'orch_apply',
+    // ★ 인자 둘의 권위는 WS0 §1.4 와 `contract/envelope.json` 이다. WS0 §1.4 가 함께 적은
+    //   `three_way`·`candidate_id` 는 **안 받는다** — 그 이유는 `src/tools/apply.mjs` 머리말에 있다.
+    description:
+      "Apply a finished run's patch to your own repository. This is the explicit step: orch_run " +
+      'leaves the patch on disk and never applies it for you, so nothing reaches your working tree ' +
+      'until this call is made. It refuses, each with its own registered code, a run this state root ' +
+      'does not hold, a run whose records cannot be read, and a run whose patch is gone or is not a ' +
+      'file. Pass check_only to have the call report what it would do and change nothing. ' +
+      'orch_status is where a run_id comes from.',
+    args: Object.freeze({
+      run_id: Object.freeze({ type: 'string', required: true }),
+      check_only: Object.freeze({ type: 'boolean', required: false, default: false }),
     }),
   }),
   Object.freeze({
     name: 'orch_reward',
     description:
-      '지난 실행의 평가를 사람이 정정합니다. 이미 반영된 기여를 되돌리고 새 등급을 적용하므로 ' +
-      '같은 run_id 로 여러 번 불러도 결과가 같습니다. run_id 는 orch_stats({runs: 20}) 으로 봅니다.',
+      'Correct by hand the grade an earlier run was given. The contribution already applied is taken ' +
+      'back before the new grade is applied, so repeating the correction with the same run_id leaves ' +
+      'the same result. Ask orch_stats with runs for the run_id values.',
     args: Object.freeze({
       run_id: Object.freeze({ type: 'string', required: true }),
       good: Object.freeze({ type: 'boolean', required: true }),
       note: Object.freeze({ type: 'string', required: false }),
+    }),
+  }),
+  Object.freeze({
+    name: 'orch_reset',
+    description:
+      'Erase the learned posteriors, narrowed to one task class when task_class is given. ' +
+      'This is destructive and runs only when confirm:true is passed.',
+    args: Object.freeze({
+      confirm: Object.freeze({
+        type: 'boolean',
+        required: true,
+        enum: [true],
+        description: 'Pass confirm:true to erase learning.',
+      }),
+      task_class: Object.freeze({ type: 'string', required: false, enum: Object.freeze([...TASK_CLASSES]) }),
     }),
   }),
 ]);
@@ -220,21 +323,30 @@ function safeDescribeError(provider, error) {
     const described = provider?.describeError?.(error);
     if (described && typeof described === 'object') {
       return {
-        error: typeof described.error === 'string' && described.error !== '' ? described.error : safeErrorText(error),
+        error: typeof described.error === 'string' && described.error !== '' ? described.error : errorText(error),
         recovery:
-          typeof described.recovery === 'string' && described.recovery !== '' ? described.recovery : GENERIC_RECOVERY,
+          typeof described.recovery === 'string' && described.recovery !== '' ? described.recovery : INSTALL_RECOVERY,
       };
     }
   } catch {
     // describeError 자신이 깨진 경우 — 아래 폴백으로 간다.
   }
-  return { error: safeErrorText(error), recovery: GENERIC_RECOVERY };
+  return { error: errorText(error), recovery: INSTALL_RECOVERY };
 }
+
+/**
+ * 프로바이더가 사유를 안 준(또는 응답 자체가 모양을 잃은) 자리의 문구. 정본은 레지스트리다 —
+ * 이 파일이 "닿을 수 없습니다" 같은 문장을 스스로 쓰지 않는다(WS2 Task 16).
+ */
+const unclassifiedProbe = () => {
+  const rendered = renderReason(REASON.provider_error_unclassified, { vendor: 'claude, codex' });
+  return { error: rendered.error, recovery: rendered.recovery };
+};
 
 /** discover() 가 정상적으로 돌려준 결과를 벤더 리포트 모양으로 다듬는다. */
 function normalizeDiscovered(discovered) {
   if (!discovered || typeof discovered !== 'object') {
-    return { reachable: false, error: '프로바이더가 알 수 없는 응답을 냈습니다.', recovery: GENERIC_RECOVERY };
+    return { reachable: false, ...unclassifiedProbe(), recovery: INSTALL_RECOVERY };
   }
 
   if (discovered.reachable === true) {
@@ -247,9 +359,9 @@ function normalizeDiscovered(discovered) {
 
   const report = {
     reachable: false,
-    error: typeof discovered.error === 'string' && discovered.error !== '' ? discovered.error : '닿을 수 없습니다.',
+    error: typeof discovered.error === 'string' && discovered.error !== '' ? discovered.error : unclassifiedProbe().error,
     recovery:
-      typeof discovered.recovery === 'string' && discovered.recovery !== '' ? discovered.recovery : GENERIC_RECOVERY,
+      typeof discovered.recovery === 'string' && discovered.recovery !== '' ? discovered.recovery : INSTALL_RECOVERY,
   };
   if (discovered.discoveryTimeout === true) report.discoveryTimeout = true;
   return report;
@@ -263,14 +375,22 @@ function normalizeDiscovered(discovered) {
  *
  * 캐시(Task 7)가 신선하면(POINT_OF_USE_MAX_AGE_MS 안) 프로브를 건너뛴다. refresh
  * 가 참이면 신선해도 강제로 다시 프로브한다.
+ *
+ * ★ WS2 Task 7 수정 I1: `probed` 를 이 함수가 **직접** 낸다. 예전에는 호출부
+ *   (`runOrchModels`)가 `cached !== true` 로 거꾸로 추측했는데, CLI 를 아예 안 띄운 두 자리
+ *   (아래 catch, `providers:[]`)가 "캐시가 아니었다" 는 이유만으로 `probed` 로 잡혔다.
+ *   이제 이 함수가 실제로 무엇을 했는지를 그대로 말한다: 캐시로 답한 갈래는 `probed:false`,
+ *   discover 를 **불렀다면**(성공이든 던졌든) `probed:true` — 실패한 프로브도 "시도했다" 는
+ *   사실은 확립했다. 아래 바깥 catch(캐시 판정 자체가 깨진 경우)는 CLI 를 부르지도 못했으니
+ *   `probed:false` 다.
  */
-async function probeVendor(provider, id, { catalog, refresh, stateRoot }) {
+async function probeVendor(provider, id, { catalog, refresh, stateRoot, shouldRefresh: checkStale = shouldRefresh }) {
   try {
     const cached = catalog?.[id];
-    const stale = shouldRefresh(catalog, id, POINT_OF_USE_MAX_AGE_MS);
+    const stale = checkStale(catalog, id, POINT_OF_USE_MAX_AGE_MS);
 
     if (!refresh && !stale && cached) {
-      return { reachable: true, cached: true, fetchedAt: cached.fetchedAt, models: cached.models };
+      return { reachable: true, cached: true, fetchedAt: cached.fetchedAt, models: cached.models, probed: false };
     }
 
     let discovered;
@@ -286,11 +406,12 @@ async function probeVendor(provider, id, { catalog, refresh, stateRoot }) {
       await writeCatalog(stateRoot, id, report.models).catch(() => false);
     }
 
-    return report;
+    return { ...report, probed: true };
   } catch (error) {
     // 위 블록 어디든(캐시 판정 포함) 예상 못 한 예외가 나도 이 벤더만 실패로
-    // 강등한다 — 다른 벤더의 Promise.all 이 통째로 거부되면 안 된다.
-    return { reachable: false, ...safeDescribeError(provider, error) };
+    // 강등한다 — 다른 벤더의 Promise.all 이 통째로 거부되면 안 된다. CLI 를 부르지도
+    // 못했으므로 `probed:false` — 「캐시가 아니었다」와 「실제로 프로브했다」는 다른 사실이다.
+    return { reachable: false, probed: false, ...safeDescribeError(provider, error) };
   }
 }
 
@@ -302,6 +423,9 @@ async function runOrchModels(value, context) {
   const providers = Array.isArray(wired.providers) ? wired.providers : listProviders();
   const stateRoot = typeof wired.stateRoot === 'string' && wired.stateRoot !== '' ? wired.stateRoot : resolveStateRoot();
   const refresh = value.refresh === true;
+  // ★ I1 테스트 이음매 — 「캐시 판정 자체가 던지는」 outer catch 갈래는 실물로 재현할 수
+  //   없다(정상 파일이면 판정이 안 던진다). `shouldRefresh` 스텁을 여기서만 갈아 끼운다.
+  const checkStale = typeof wired.shouldRefresh === 'function' ? wired.shouldRefresh : shouldRefresh;
 
   const catalog = await readCatalog(stateRoot);
 
@@ -309,11 +433,17 @@ async function runOrchModels(value, context) {
   await Promise.all(
     providers.map(async (provider, index) => {
       const id = typeof provider?.id === 'string' && provider.id !== '' ? provider.id : `unknown-${index}`;
-      vendors[id] = await probeVendor(provider, id, { catalog, refresh, stateRoot });
+      vendors[id] = await probeVendor(provider, id, { catalog, refresh, stateRoot, shouldRefresh: checkStale });
     }),
   );
 
-  return success({ content: JSON.stringify({ vendors }) });
+  // WS0 §2.2 — verified 는 「이번 호출이 CLI 를 실제로 프로브」다. `probeVendor` 가 낸
+  // `probed` 를 그대로 접는다 — 벤더가 하나도 없으면(`providers:[]`) 아무것도 프로브하지
+  // 않았으므로 `every` 의 공진리(vacuous truth)에 기대지 않고 `length > 0` 을 먼저 본다.
+  const reports = Object.values(vendors);
+  const probed = reports.length > 0 && reports.every((report) => report.probed === true);
+  const notice = probed ? undefined : renderNotice('models_from_cache');
+  return success({ content: JSON.stringify({ vendors }), confidence: confidenceOfModels({ probed }), notice });
 }
 
 // ── orch_config ───────────────────────────────────────────────────────────
@@ -322,6 +452,13 @@ async function runOrchModels(value, context) {
 const TIER_FIELDS = Object.freeze(
   Object.fromEntries(TIERS.map((tier) => [tier, Object.freeze({ model: tier, effort: `${tier}Effort` })])),
 );
+
+/** 저장소 접근 실패만 실행 전제 차단이다. 패치 내용 검증 실패는 계속 잘못된 인자다. */
+const CONFIG_STORAGE_FAILURES = new Set([
+  REASON.config_settings_lock_unavailable,
+  REASON.config_settings_read_failed,
+  REASON.config_settings_write_failed,
+]);
 
 /**
  * 고를 수 있는 모델을 벤더별로 낸다.
@@ -347,10 +484,7 @@ async function describeCatalog(stateRoot) {
 function emptyCatalogNotice(vendors) {
   const empty = VENDORS.filter((id) => vendors[id].models.length === 0);
   if (empty.length === 0) return null;
-  return (
-    `${empty.join(', ')} 의 모델 목록이 비어 있습니다 — orch_models 를 먼저 부르면 카탈로그가 채워집니다. ` +
-    '목록이 없는 벤더는 effort 검사를 건너뜁니다.'
-  );
+  return renderNotice('model_catalog_empty', { vendors: empty.join(', ') });
 }
 
 /**
@@ -373,16 +507,18 @@ function unknownModelNotice(vendorId, model, vendors) {
   if (name === '') return null;
   const list = vendors[vendorId].models;
   if (list.length === 0 || list.some((entry) => entry?.name === name)) return null;
-  return `'${name}' 은 지금 발견된 ${vendorId} 목록에 없습니다 — 오타가 아닌지 확인하세요. 새 모델이면 그대로 씁니다.`;
+  return renderNotice('model_not_in_catalog', { model: name, vendor: vendorId });
 }
 
-function configView(current, vendors, notices) {
+function configView(current, vendors, notices, confidence) {
   const notice = notices.filter((text) => typeof text === 'string' && text !== '').join(' ');
-  return success({
-    content: JSON.stringify({ current, vendors }),
-    confidence: 'verified',
-    notice: notice !== '' ? notice : undefined,
-  });
+  return success({ content: JSON.stringify({ current, vendors }), confidence, notice: notice !== '' ? notice : undefined });
+}
+
+/** Explicit shared-state writers all use the same blocked envelope vocabulary. */
+function blockedByStateSchema(stateSchema) {
+  const reason = stateSchemaReason(stateSchema);
+  return reason === null ? null : failure({ status: 'blocked', ...reason });
 }
 
 /**
@@ -397,962 +533,72 @@ async function runOrchConfig(value, context) {
   const vendors = await describeCatalog(stateRoot);
 
   // `undefined` 로만 "안 줬다"를 판정한다. 빈 문자열은 **지우라는 뜻**이라 다른 값이다.
-  const changing = value.model !== undefined || value.effort !== undefined;
+  const changingModel = value.model !== undefined || value.effort !== undefined;
+  const changingControl = value.writer !== undefined || value.learning !== undefined;
+  const changing = changingModel || changingControl;
 
   if (!changing) {
     if (value.vendor !== undefined || value.tier !== undefined) {
-      return failure({
-        status: 'invalid',
-        error: 'vendor·tier 만으로는 바꿀 것이 없습니다 — model 이나 effort 를 주세요.',
-        recovery: 'model 이나 effort 를 함께 주세요. 조회만 하려면 인자 없이 부르세요.',
-      });
+      return failure({ status: 'invalid', reasonCode: REASON.config_change_target_missing });
     }
-    return configView(await readSettings(stateRoot), vendors, [emptyCatalogNotice(vendors)]);
+    const read = await readSettingsStatus(stateRoot);
+    return configView(
+      read.settings,
+      vendors,
+      [stateSchemaNotice(read.stateSchema), emptyCatalogNotice(vendors)],
+      confidenceOfConfig({ readable: read.readable && read.stateSchema === undefined }),
+    );
   }
 
-  if (value.vendor === undefined || value.tier === undefined) {
+  if (changingModel && (value.vendor === undefined || value.tier === undefined)) {
     return failure({
       status: 'invalid',
-      error: 'model·effort 를 바꾸려면 vendor 와 tier 를 함께 주세요.',
-      recovery: `vendor: ${VENDORS.join(', ')} / tier: ${TIERS.join(', ')}`,
+      reasonCode: REASON.config_change_scope_missing,
+      params: { vendors: VENDORS.join(', '), tiers: TIERS.join(', ') },
     });
   }
 
-  const fields = TIER_FIELDS[value.tier];
-  const patch = { [value.vendor]: {} };
-  if (value.model !== undefined) patch[value.vendor][fields.model] = value.model;
-  if (value.effort !== undefined) patch[value.vendor][fields.effort] = value.effort;
+  if (!changingModel && (value.vendor !== undefined || value.tier !== undefined)) {
+    return failure({ status: 'invalid', reasonCode: REASON.config_change_target_missing });
+  }
+  const fields = changingModel ? TIER_FIELDS[value.tier] : null;
+  const patch = {};
+  if (changingModel) {
+    patch[value.vendor] = {};
+    if (value.model !== undefined) patch[value.vendor][fields.model] = value.model;
+    if (value.effort !== undefined) patch[value.vendor][fields.effort] = value.effort;
+  }
+  if (value.writer !== undefined) patch.writer = value.writer;
+  if (value.learning !== undefined) patch.learning = value.learning;
 
   // 목록이 빈 벤더는 null 로 넘긴다 — `writeSettings` 는 그때 검사를 건너뛴다.
   const models = {};
   for (const id of VENDORS) models[id] = vendors[id].models.length > 0 ? vendors[id].models : null;
 
-  const wrote = await writeSettings(stateRoot, patch, { models });
-  if (!wrote.ok) return failure({ status: 'invalid', error: wrote.error, recovery: wrote.recovery });
+  // ★ 이음매(`toEngineDeps` 계약 그대로): 재읽기 불일치는 디스크가 거짓말한 경우라 스텁 없이 못 잰다.
+  const wrote = await (wired.writeSettings ?? writeSettings)(stateRoot, patch, { models });
+  // `writeSettings` 는 이제 `fail()` 봉투를 낸다 — 코드를 그대로 실어야 소비자가 문장이 아니라
+  // 코드로 분기할 수 있다(문구는 이미 레지스트리가 렌더했으므로 다시 만들지 않는다).
+  if (!wrote.ok) {
+    const schemaBlocked = blockedByStateSchema(wrote.stateSchema);
+    if (schemaBlocked !== null) return schemaBlocked;
+    return failure({
+      status: CONFIG_STORAGE_FAILURES.has(wrote.reasonCode) ? statusOfReasonCode(wrote.reasonCode) : 'invalid',
+      reasonCode: wrote.reasonCode,
+      error: wrote.error,
+      recovery: wrote.recovery,
+    });
+  }
 
-  return configView(wrote.settings, vendors, [
-    unknownModelNotice(value.vendor, wrote.settings[value.vendor][fields.model], vendors),
+  const notices = [
+    changingModel ? unknownModelNotice(value.vendor, wrote.settings[value.vendor][fields.model], vendors) : null,
     emptyCatalogNotice(vendors),
     wrote.notice,
-  ]);
+  ];
+  return configView(wrote.settings, vendors, notices, confidenceOfConfig({ readBackMatches: wrote.readBack }));
 }
 
-// ── orch_stats · orch_reward (계획 3 태스크 10) ───────────────────────────
-
-/**
- * 축마다 화면에 함께 실어야 하는 사실. **화면에만 있는 사실이 아니라 코드의 성질**이다.
- *
- * · `mix` — `decide` 는 관측 게이트보다 **먼저** 후보 팔 수를 본다. `allow_single` 없이는
- *   이 축의 후보가 하나뿐이라 관측이 아무리 쌓여도 기본값으로 돈다(§9.2). 그래서 이 축의
- *   활성 여부는 `armAllowed` 를 함께 봐야 참이 된다 — 아래 `cellView` 가 그렇게 한다.
- * · `placement` — `single` 실행도 이 셀을 갱신한다(태스크 8 결정 ②, `src/engine.mjs` 의
- *   `learnable` 주석). 「누가 혼자 다 하나」와 「누가 먼저 하나」가 **한 셀에 합산**되므로,
- *   이 셀의 수를 배치 비교로만 읽으면 안 된다.
- *
- * ★ 키가 `AXES` 밖으로 새면 그 설명은 어떤 셀에도 안 붙는다 — `test/tools.test.mjs` 의
- *   드리프트 가드가 그것을 막는다. 그래서 내보낸다.
- */
-export const AXIS_NOTES = Object.freeze({
-  mix: 'allow_single:true 로 부른 실행에서만 이 축의 팔이 둘이 됩니다(설계 §9.2) — 그 전에는 관측이 쌓여도 기본값으로 돕니다.',
-  placement:
-    'single 실행의 관측도 이 셀에 합산됩니다 — 「누가 먼저 하나」와 「혼자면 누구인가」가 한 셀에 쌓입니다(태스크 8 결정 ②).',
-  // ★ 이 파일의 불변식: 화면과 게이트가 같은 것을 세야 한다. 엔진은 티어 팔이 서로 다른 설정으로
-  //   풀릴 때만 이 축을 배운다(`tier_not_distinguishable`). 모델을 하나도 안 정해두면 두 팔이
-  //   같은 CLI 를 같은 effort 로 띄우므로 관측이 안 쌓이는데, 그 이유를 여기서 말해주지 않으면
-  //   사용자는 "왜 이 축만 안 늘지"를 알 길이 없다.
-  tier:
-    'orch_config 로 이 벤더의 strong/fast 를 서로 다르게 정해두기 전에는 두 팔이 같은 실행이라 관측이 쌓이지 않습니다 — 팔이 실제로 갈릴 때만 배웁니다.',
-});
-
-/**
- * `cellKeyOf` 를 되돌린다. 구분자는 **첫** `::` 다.
- *
- * ★ `split('::')` 로 두 조각을 꺼내면 손으로 쓴 `a::b::c` 에서 꼬리를 조용히 버리고 축 이름을
- *   `b` 라고 지어낸다 — 있지도 않은 축을 화면에 만드는 것이다. 구분자가 아예 없는 키
- *   (손으로 쓴 파일)는 태스크 클래스도 축도 모르는 것이지 `analysis` 가 아니다.
- */
-function splitCellKey(cellKey) {
-  const at = cellKey.indexOf('::');
-  if (at === -1) return { taskClass: null, axis: null };
-  return { taskClass: cellKey.slice(0, at), axis: cellKey.slice(at + 2) };
-}
-
-/**
- * 셀 하나를 화면 모형으로.
- *
- * ★★ **화면과 게이트가 같은 것을 세야 한다.** 두 가지가 그것을 어긴 적이 있다:
- *   ① 관측 수를 `Object.values(arms)` 합으로 세기. 밴딧은 `observationsOf(cell, 그 축의 팔)`
- *      로 센다 — 실측(태스크 5): `{medium:{alpha:1,beta:21}}` 는 셀 합 20, 축의 팔로는 0 이다.
- *      화면이 "밴딧 켜짐" 이라고 하는데 게이트는 안 열린다.
- *   ② 관측 수만 보고 활성 여부를 쓰기. `decide` 는 관측 게이트보다 **먼저**
- *      `arms.length < 2` 에서 떨어뜨리므로 `mix` 축은 `allow_single` 없이 영영 안 켜진다.
- *      그래서 여기서도 `armAllowed` 를 쓴다 — 판정을 베끼지 않고 같은 함수를 부른다.
- *
- * ★★ **불리언 하나로는 답이 안 된다 — 활성 여부는 호출자의 `allow_single` 에 달려 있다.**
- *   `banditActive` 라는 이름 하나로 내면 `armAllowed(axis, arm, false)` 를 못박은 값이라
- *   `mix` 축에서 절반만 참이다. 실측(수정 라운드 1): `analysis::mix = {mix:(11,11),
- *   single:(9,2)}` 에서 화면은 `false` 인데 `decide({allowed:{single:true}})` 는
- *   `sources.mix==='bandit'` 로 밴딧을 태운다. `optInArms` 와 `note` 가 산문으로 보완하지만
- *   **불리언만 읽는 소비자**(태스크 12 의 화면)는 그것을 안 읽는다. 그래서 조건을 이름에
- *   담아 두 값을 낸다 — `byDefault` 는 그냥 부른 `orch_run`, `ifAllowSingle` 은
- *   `allow_single:true` 로 부른 `orch_run` 이다. `mix` 밖의 축은 두 값이 늘 같다.
- *
- * ★ `AXES` 에 없는 축(손으로 쓴 셀 · 옛 축)은 `observations: null` 이다. `0` 으로 내면
- *   데이터가 있는데 없다고 거짓말하는 것이다. `Object.hasOwn` 으로 읽는 이유는 셀 키가
- *   `analysis::toString` 일 수 있기 때문이다 — `AXES[axis]` 로 읽으면 프로토타입에서
- *   함수가 나와 `spec.arms.filter` 가 던진다(실측으로 확인했다). `AXIS_NOTES` 도 같은 이유로
- *   `Object.hasOwn` 이다 — `AXIS_NOTES['__proto__']` 는 `Object.prototype` 이라 그대로 두면
- *   셀에 `"note":{}` 가 붙어 나간다(실측).
- */
-function cellView(cellKey, arms) {
-  const { taskClass, axis } = splitCellKey(cellKey);
-  const spec = axis !== null && Object.hasOwn(AXES, axis) ? AXES[axis] : null;
-  const observations = spec === null ? null : observationsOf(arms, spec.arms);
-  const candidates = spec === null ? [] : spec.arms.filter((arm) => armAllowed(axis, arm, false));
-  const withSingle = spec === null ? [] : spec.arms.filter((arm) => armAllowed(axis, arm, true));
-  const optInArms = spec === null ? [] : spec.arms.filter((arm) => !armAllowed(axis, arm, false));
-  const enough = observations !== null && observations >= OBSERVATION_THRESHOLD;
-
-  const view = {
-    cellKey,
-    taskClass,
-    axis,
-    arms,
-    observations,
-    banditActiveByDefault: enough && candidates.length >= 2,
-    banditActiveIfAllowSingle: enough && withSingle.length >= 2,
-  };
-  if (spec === null) view.unknownAxis = true;
-  if (optInArms.length > 0) view.optInArms = optInArms;
-  if (axis !== null && Object.hasOwn(AXIS_NOTES, axis)) view.note = AXIS_NOTES[axis];
-  return view;
-}
-
-/**
- * 저널 한 줄을 최근 목록 모형으로.
- *
- * ★ `appliedAxes` 가 없는 옛 줄은 `[]` 가 아니라 `null` 이다 — "반영한 축이 없다" 와
- *   "어디에 반영했는지 모른다" 는 다른 사실이고, `orch_reward` 가 뒤엣것을 거부하기 때문에
- *   화면에서도 갈라 보여야 한다.
- */
-const recentView = (run, generations, generationsKnown = true) => {
-  const appliedAxes = Array.isArray(run.appliedAxes) ? run.appliedAxes : null;
-  const appliedCurrent = run.appliedGrade === null || run.appliedGrade === undefined
-    ? null
-    : !generationsKnown
-      ? null
-    : appliedAxes !== null && typeof run.taskClass === 'string'
-      ? appliedAxes.every((axis) => {
-          const recorded = Number.isInteger(run.appliedGenerations?.[axis]) ? run.appliedGenerations[axis] : 0;
-          return generationOf(generations, cellKeyOf(run.taskClass, axis)) === recorded;
-        })
-      : null;
-  return {
-  runId: run.runId,
-  at: Number.isFinite(run.at) ? run.at : null,
-  taskClass: typeof run.taskClass === 'string' ? run.taskClass : null,
-  stopReason: run.outcome?.stopReason ?? null,
-  grade: run.outcome?.grade ?? null,
-  appliedGrade: run.appliedGrade ?? null,
-  appliedCurrent,
-  appliedAxes,
-  // ★ `null` 은 "확인하지 않았다/할 수 없었다" 이고 `[]` 는 "이 실행에 artifact 가 없다" 다.
-  //   정책 v2 이전 줄에는 `artifactRefs` 자체가 없으므로 늘 `null` 이다.
-  artifacts: null,
-};
-};
-
-/**
- * 응답을 `MAX_CONTENT_CHARS` 안으로 줄인다.
- *
- * ★ 왜 봉투에 맡기지 않는가: `success()` 의 자동 자르기는 문자열을 자르므로 **JSON 이
- *   깨진다.** 그러면 호출자는 통계 대신 파싱 오류를 받고, 그것이 하필 통계가 가장 많을 때
- *   일어난다. 그래서 도구가 스스로 줄이고 **무엇을 줄였는지 본문에 적는다** —
- *   notice 만으로는 본문만 읽는 소비자가 그 사실을 못 본다.
- *
- * 사다리 순서는 버려도 덜 아픈 것부터다: 최근 실행 목록 → 팔별 α·β → 셀 자체.
- * 셀은 태스크 클래스 × 축으로 상한이 있어(실행마다 늘지 않는다) 마지막에 둔다.
- */
-function renderStats(view) {
-  const allCells = view.cells;
-  const allRecent = view.recent; // null = 호출자가 요청하지 않았다
-  let keepRecent = allRecent === null ? 0 : allRecent.length;
-  let keepCells = allCells.length;
-  let withArms = true;
-
-  // 사다리는 유한하다: recent 반감 → 팔 제거 → 셀 반감 → 포기. 상한은 그 사실의 그물이다.
-  for (let step = 0; step < 128; step += 1) {
-    const reduced = {};
-    if (allRecent !== null && keepRecent < allRecent.length) {
-      reduced.recent = { asked: allRecent.length, kept: keepRecent };
-    }
-    if (!withArms) reduced.arms = false;
-    if (keepCells < allCells.length) reduced.cells = { asked: allCells.length, kept: keepCells };
-
-    const body = {
-      threshold: view.threshold,
-      posteriors: view.posteriors,
-      journal: view.journal,
-      cells: allCells.slice(0, keepCells).map((cell) => (withArms ? cell : { ...cell, arms: null })),
-    };
-    if (allRecent !== null) {
-      body.recent = allRecent.slice(0, keepRecent);
-      // ★ 최근 목록은 `task_class` 로 **안 걸러진다**(아래 `runOrchStats` 의 주석이 이유다).
-      //   그 사실이 주석에만 있으면 본문을 읽는 소비자는 걸러진 목록으로 안다.
-      body.recentFiltered = false;
-    }
-    if (Object.keys(reduced).length > 0) body.reduced = reduced;
-
-    const text = JSON.stringify(body);
-    if (text.length <= MAX_CONTENT_CHARS) return { text, reduced };
-    if (keepRecent > 0) {
-      keepRecent = Math.floor(keepRecent / 2);
-      continue;
-    }
-    if (withArms) {
-      withArms = false;
-      continue;
-    }
-    if (keepCells > 0) {
-      keepCells = Math.floor(keepCells / 2);
-      continue;
-    }
-    // 셀도 최근 목록도 없는데 넘친다 — 고정 머리말만 남았다는 뜻이라 도달할 수 없다.
-    // 그래도 무한 루프 대신 봉투의 자르기로 넘긴다.
-    return { text, reduced };
-  }
-  return { text: JSON.stringify({ threshold: view.threshold, posteriors: view.posteriors, journal: view.journal, cells: [] }), reduced: {} };
-}
-
-/**
- * `reset` 응답을 `MAX_CONTENT_CHARS` 안으로 줄인다.
- *
- * ★★ **자매 경로가 같은 실패를 갖고 있었다.** `renderStats` 가 사다리를 타는 이유(봉투의
- *    자동 자르기는 JSON 을 깨뜨린다)는 여기에도 그대로 적용되는데 이쪽만 그냥 냈다.
- *    실측(수정 라운드 1): `prose::` 접두 셀 120개를 범위 reset 하면 본문이 상한을 넘어
- *    `SyntaxError: Unterminated string in JSON` 이 났다. 지운 셀의 목록은 길이에 상한이
- *    없다 — 손으로 쓴 셀 키는 얼마든지 길 수 있으므로 개수 상한이 아니라 **길이로** 줄인다.
- */
-function renderReset(reset) {
-  const all = reset.cellKeys;
-  let kept = all === null ? 0 : all.length;
-  for (let step = 0; step < 128; step += 1) {
-    const body = { reset: { ...reset, cellKeys: all === null ? null : all.slice(0, kept) } };
-    const reduced = all !== null && kept < all.length ? { cellKeys: { asked: all.length, kept } } : {};
-    if (all !== null && kept < all.length) body.reduced = reduced;
-    const text = JSON.stringify(body);
-    if (text.length <= MAX_CONTENT_CHARS || kept === 0) return { text, reduced };
-    kept = Math.floor(kept / 2);
-  }
-  // 128번을 반씩 줄이면 0 에 닿는다(`kept === 0` 에서 위가 반환한다) — 여기는 도달하지 않는다.
-  return { text: JSON.stringify({ reset: { ...reset, cellKeys: [] } }), reduced: {} };
-}
-
-/**
- * reset notice 한 조각의 상한. 셀 키와 사유를 **따로** 자른다.
- *
- * ★ 통째로 자르면 긴 셀 키 하나가 상한을 다 먹고 사유가 사라진다 — 손으로 쓴 셀 키에는
- *   길이 상한이 없다(`renderReset` 이 개수가 아니라 길이로 줄이는 것과 같은 이유).
- *   원본 길이를 꼬리에 안 적는 이유는 그것이 자릿수만큼 길이를 흔들어, 이 값을 정확값으로
- *   재는 테스트를 불가능하게 만들기 때문이다.
- */
-const RESET_KEY_CHARS = 100;
-const RESET_REASON_CHARS = 120;
-/**
- * 문장 하나의 마지막 상한. 위 둘(100 + 이음말 13 + 120)을 다 쓴 문장이 233자라 그보다 조금
- * 넉넉하다. **이 상한이 `foldResetNotes` 안에 있어야** 그 함수 하나로 합계가 유한해진다 —
- * 호출부의 `clipTo` 에만 기대면 다음 호출부가 그것을 빠뜨리는 순간 상한이 사라진다.
- */
-const RESET_NOTE_CHARS = 240;
-/** 봉투에 싣는 notice 문장의 수. 넘으면 뒤를 접고 개수만 적는다. */
-const RESET_NOTES_KEPT = 5;
-
-const clipTo = (text, limit) => {
-  const value = typeof text === 'string' ? text : String(text);
-  return value.length > limit ? `${value.slice(0, limit)}…` : value;
-};
-
-/**
- * 범위 reset 의 notice 를 봉투에 실을 한 덩어리로 접는다.
- *
- * ★★ **자매 필드가 같은 실패를 갖고 있었다.** 태스크 10 이 `content` 를 축소 사다리로
- *    묶었지만 `notice` 는 그대로였고, 봉투(`src/envelope.mjs`)는 `content` 만 자른다.
- *    실측(커밋 4c50a4b, 이 기계): 셀 12개가 전부 실패하면 notice 가 **4,401자**,
- *    60개면 **22,017자**였다. 그 상태로 25k 토큰 상한에 부딪히면 잘리는 것은 우리가 고른
- *    것이 아니라 호스트가 고른 꼬리다.
- *
- * 앞쪽(호출자 인자 처리·축소 사실)은 접히지 않고 셀 단위 문장만 접힌다 — 호출부가 그
- * 순서로 넘긴다. `src/engine.mjs` 의 `joinNotices` 가 뒤부터 접는 것과 같은 규칙이다.
- */
-export function foldResetNotes(notes) {
-  const kept = (Array.isArray(notes) ? notes : [])
-    .filter((note) => typeof note === 'string' && note !== '')
-    .map((note) => clipTo(note, RESET_NOTE_CHARS));
-  if (kept.length === 0) return undefined;
-  if (kept.length <= RESET_NOTES_KEPT) return kept.join(' / ');
-  const dropped = kept.length - RESET_NOTES_KEPT;
-  return (
-    `${kept.slice(0, RESET_NOTES_KEPT).join(' / ')} ` +
-    `(그 밖에 ${dropped}건은 접었습니다 — 실패한 셀 수는 본문 reset.failed 입니다.)`
-  );
-}
-
-/** 무엇을 줄였는지 사람 문장으로. 본문의 `reduced` 와 같은 사실을 말한다. */
-function reductionNotice(reduced) {
-  const parts = [];
-  if (reduced.recent) parts.push(`최근 실행 목록을 ${reduced.recent.asked}건에서 ${reduced.recent.kept}건으로 줄였습니다`);
-  if (reduced.arms === false) parts.push('팔별 α·β 를 뺐습니다');
-  if (reduced.cells) parts.push(`셀 목록을 ${reduced.cells.asked}개에서 ${reduced.cells.kept}개로 줄였습니다`);
-  if (reduced.cellKeys) {
-    parts.push(`지운 셀 목록을 ${reduced.cellKeys.asked}개에서 ${reduced.cellKeys.kept}개로 줄였습니다(실제로 지운 수는 cleared 입니다)`);
-  }
-  return parts.length > 0 ? `응답 상한(${MAX_CONTENT_CHARS}자) 때문에 ${parts.join(' / ')}.` : null;
-}
-
-/**
- * `reset`. `task_class` 를 주면 그 클래스의 셀만 지운다.
- *
- * ★★ 범위를 안 좁히면 **필터해 놓고 전부 지우는 도구**가 된다. `orch_stats({task_class})`
- *    로 한 클래스만 보던 사용자가 그 호출에 `reset:true` 를 더하면 화면에 없던 셀까지
- *    사라진다. `src/learn/posteriors.mjs` 의 `resetPosteriors` 주석이 이 자리를 미리
- *    지목해 뒀다("orch_stats 에 이미 task_class 인자가 있으니 …").
- *
- * ★ 손상된 파일에서 **범위** 초기화는 거절한다 — 어느 셀이 그 클래스인지 읽을 수가 없다.
- *   `task_class` 없는 전체 초기화는 그때도 된다(`resetPosteriors` 가 통째로 버린다).
- *
- * ★ 구분자(`::`)가 없는 셀 키는 `taskClass` 가 `null` 이라 **어떤 범위 reset 에도 안 걸린다.**
- *   손으로 쓴 파일에서만 나오는 키인데, 지우는 길은 `task_class` 없는 전체 reset 하나뿐이다.
- *   `orch_stats` 는 그런 셀을 `taskClass:null` 로 보여 주므로 화면에서는 보인다.
- *
- * ★ 범위의 셀 키를 `resetPosteriors` 한 번에 넘긴다. 그러면 잠금·스냅샷·본문 쓰기가 각각
- *   한 번이고 전부 지워지거나 하나도 안 지워진다. 셀마다 부르면 마지막 셀 직전 상태만
- *   스냅샷에 남아 복구가 거짓말이 된다.
- */
-async function resetStats(stateRoot, taskClass, preNotes, operationOptions) {
-  const snapshotFor = () => ({
-    path: join(stateRoot, SNAPSHOT_FILE),
-    generationPath: join(stateRoot, GENERATIONS_SNAPSHOT_FILE),
-    restore: `관련 서버를 중지한 상태에서 ${GENERATIONS_SNAPSHOT_FILE} 을 learning.generations.json 으로 먼저 복사한 뒤 ${SNAPSHOT_FILE} 을 posteriors.json 으로 복사하고 서버를 다시 시작하세요.`,
-  });
-  const snapshotNotice = (snapshot) =>
-    `reset 전 스냅샷은 ${snapshot.path} 및 ${snapshot.generationPath} 입니다. 되돌리려면 관련 서버를 중지한 상태에서 ${GENERATIONS_SNAPSHOT_FILE} 을 learning.generations.json 으로 먼저 복사한 뒤 ${SNAPSHOT_FILE} 을 posteriors.json 으로 복사하고 서버를 다시 시작하세요.`;
-  if (taskClass === undefined) {
-    const cleared = await resetPosteriors(stateRoot, operationOptions);
-    if (!cleared.ok) {
-      return failure({
-        status: 'failed',
-        error: `사후분포를 지우지 못했습니다: ${cleared.reason}`,
-        recovery: '잠시 뒤 같은 reset 을 다시 시도하세요. 보류 중인 작업은 다음 조회가 복구합니다. 필요하면 관련 서버를 중지하고 paired snapshot 복구 절차를 따르세요.',
-      });
-    }
-    return success({
-      // ★ `asked` 는 **모른다**(`null`). 전체 초기화는 셀을 세지 않고 파일을 통째로 버리므로
-      //   "몇 개가 범위였나"에 답할 근거가 없다 — `cleared` 를 그대로 적으면 손상된 파일을
-      //   버렸을 때(`cleared:0`) "범위가 0개였다"는 거짓이 된다. 범위 reset 응답과 필드
-      //   집합을 맞춰 소비자가 두 갈래로 분기하지 않게 한다.
-      //
-      // ★★ `posteriors` 가 **읽지도 못한 채 버렸다**를 본문에 낸다. 이 필드가 없던 동안
-      //    손상 파일을 버린 응답의 본문이 지울 것이 아예 없던 경우와 **바이트로 같았다**
-      //    (실측, 수정 라운드 1 · 커밋 ab0e98a · 둘 다
-      //    `{"reset":{"taskClass":null,"asked":null,"cleared":0,"failed":0,"cellKeys":null}}`
-      //    · 둘 다 `verified`). 그 사실은 한국어 notice 안에만 있었다 — 이 파일이 §3② 에서
-      //    이미 세운 기준(「notice 에만 있으면 본문 소비자는 못 본다」)을 자기 자매 갈래에
-      //    못 적용한 것이다.
-      //    이름과 값(`ok`/`unreadable`)은 **조회 갈래의 최상위 `posteriors`** 와 같게 맞췄다.
-      //    자매끼리 어휘가 갈리면 소비자가 같은 사실을 두 번 배워야 한다.
-      content: JSON.stringify({
-        reset: {
-          taskClass: null,
-          asked: null,
-          cleared: cleared.cleared,
-          failed: 0,
-          cellKeys: null,
-          posteriors: cleared.discarded ? 'unreadable' : 'ok',
-          snapshot: cleared.cleared > 0 || cleared.discarded ? snapshotFor() : null,
-        },
-      }),
-      // ★ 조회 갈래가 손상에 `unverified` 를 내는 것과 **같은 규칙**이다. 읽지도 못한 파일을
-      //   버린 것을 "직접 확인했다" 고 말할 수 없다.
-      confidence: cleared.discarded ? 'unverified' : 'verified',
-      notice: foldResetNotes([
-        ...preNotes,
-        cleared.cleared > 0 || cleared.discarded ? snapshotNotice(snapshotFor()) : null,
-        cleared.notice,
-      ]),
-    });
-  }
-
-  // Scope selection belongs to resetPosteriors' coordinator callback.  Reading
-  // keys here and locking later lets a reward/automatic mutation slip between
-  // selection and generation invalidation.
-  const head = [...preNotes];
-  const one = await resetPosteriors(stateRoot, { taskClass, ...(operationOptions ?? {}) });
-  if (!one.ok && !Number.isInteger(one.asked)) {
-    return failure({
-      status: 'failed',
-      error: `사후분포를 읽지 못해 ${taskClass} 범위만 지울 수 없습니다: ${one.reason}`,
-      recovery: 'task_class 없이 orch_stats({reset:true}) 로 부르면 읽을 수 없는 파일을 통째로 버립니다.',
-    });
-  }
-  const asked = Number.isInteger(one.asked) ? one.asked : 0;
-  const cleared = one.ok ? one.cleared : 0;
-  const failed = one.ok ? 0 : asked;
-  const selectedKeys = Array.isArray(one.cellKeys) ? one.cellKeys : [];
-  const removed = one.ok ? selectedKeys : [];
-  const perCell = one.ok
-    ? [one.notice]
-    : selectedKeys.map((cellKey) => `${clipTo(cellKey, RESET_KEY_CHARS)} 를 지우지 못했습니다: ${clipTo(one.reason, RESET_REASON_CHARS)}`);
-  // ★★ `asked`·`failed` 를 **본문**에 적는다. 이 둘이 없던 동안 12셀이 전부 실패한 응답의
-  //    본문이 `{"reset":{"taskClass":"prose","cleared":0,"cellKeys":[]}}` 였고(실측,
-  //    커밋 4c50a4b), 본문만 읽는 소비자에게 그것은 「그 클래스에는 지울 것이 없었다」로
-  //    읽힌다. 실패는 한국어 notice 안에만 있었다 — 태스크 10 이 다른 자리에서 세운 기준
-  //    (「notice 에만 있으면 본문 소비자는 못 본다」)을 자기 자매 경로에 못 적용한 것이다.
-  // `posteriors:'ok'` — 이 갈래는 위에서 읽기에 **성공**했을 때만 온다. 전체 reset 과 같은
-  // 필드 집합을 유지한다.
-  const rendered = renderReset({
-    taskClass,
-    asked,
-    cleared,
-    failed,
-    cellKeys: removed,
-    posteriors: 'ok',
-    snapshot: cleared > 0 ? snapshotFor() : null,
-  });
-  const shrank = reductionNotice(rendered.reduced);
-  if (shrank !== null) head.push(shrank);
-  return success({
-    content: rendered.text,
-    // ★ 하나라도 못 지웠으면 "직접 확인했다"고 말할 수 없다. status 는 `succeeded` 로 둔다 —
-    //   reset 은 멱등이라 같은 호출을 그대로 다시 하면 남은 것을 마저 지운다.
-    confidence: failed === 0 ? 'verified' : 'unverified',
-    notice: foldResetNotes([...head, cleared > 0 ? snapshotNotice(snapshotFor()) : null, ...perCell]),
-  });
-}
-
-/** `orch_stats` 핸들러: 학습 통계를 보거나 사후분포를 지운다. */
-async function runOrchStats(value, context) {
-  const wired = toEngineDeps(context);
-  const stateRoot = typeof wired.stateRoot === 'string' && wired.stateRoot !== '' ? wired.stateRoot : resolveStateRoot();
-
-  if (value.reset === true) {
-    // ★ `runs` 는 reset 응답에 실을 데가 없다. 조용히 버리면 최근 실행 목록을 보러 온
-    //   호출자가 빈손으로 돌아가면서 그 사실을 모른다 — 이 도구가 없애려는 조용한 무연산이다.
-    const ignored =
-      value.runs > 0
-        ? [`reset 호출이라 runs:${value.runs} 는 무시했습니다 — 최근 실행 목록은 reset 없이 다시 부르세요.`]
-        : [];
-    return resetStats(stateRoot, value.task_class, ignored, wired.learningOperationOptions);
-  }
-
-  const notices = [];
-
-  // Read all three facts inside one coordinator callback.  Reading a posterior,
-  // then an epoch, then a journal under unrelated locks can label an old row as
-  // current (or vice versa) while a reward/reset commits between reads.
-  const snapshot = await withLearningLock(stateRoot, async () => ({
-    posteriors: await readPosteriorsUnlocked(stateRoot),
-    generations: await readGenerationsUnlocked(stateRoot),
-    runs: value.runs > 0 ? await readRunsUnlocked(stateRoot, { limit: value.runs }) : null,
-  }));
-  const posteriors = snapshot.ok
-    ? snapshot.value.posteriors
-    : { ok: false, reason: `학습 coordinator 복구 또는 잠금 실패: ${snapshot.reason}` };
-  const generationState = snapshot.ok
-    ? snapshot.value.generations
-    : { ok: false, reason: snapshot.reason };
-  const runs = snapshot.ok ? snapshot.value.runs : null;
-  // ★ 손상(`{ok:false}`)과 빈 것(`{ok:true, cells:{}}`)을 갈라서 낸다. 뭉개면 "아직 학습이
-  //   없다" 와 "파일이 손상돼 격리됐다" 가 사용자에게 똑같이 보인다 — 태스크 4 가 남긴 인계다.
-  if (!posteriors.ok) notices.push(`학습 사후분포를 읽지 못했습니다: ${posteriors.reason}`);
-  const cells = posteriors.ok
-    ? Object.entries(posteriors.cells)
-        .map(([cellKey, arms]) => cellView(cellKey, arms))
-        .filter((cell) => value.task_class === undefined || cell.taskClass === value.task_class)
-    : [];
-  if (!generationState.ok) notices.push(`학습 세대를 읽지 못했습니다: ${generationState.reason}`);
-
-  // ★ `readRuns` 는 `at` 오름차순이다 — 최근순으로 보이려면 뒤집는다.
-  // ★ `task_class` 로 **거르지 않는다.** `readRuns` 의 창은 `at` 기준 N 건이라, 거른 뒤 세면
-  //   요청한 수를 못 채우면서 "그 클래스의 최근 N 건" 처럼 보인다. 셀만 거른다.
-  let recent = null;
-  let journal = 'skipped';
-  if (value.runs > 0) {
-    if (runs?.ok) {
-      const ordered = [...runs.runs].reverse();
-      recent = ordered
-        .map((run) => recentView(run, generationState.ok ? generationState.generations : { global: 0, cells: {} }, generationState.ok));
-      // The probe reads and hashes files, so it deliberately runs after the
-      // coordinator callback above has released `learning.lock`.
-      let budget = MAX_INSPECTED_ARTIFACT_REFS;
-      let uninspectedRuns = 0;
-      for (let index = 0; index < ordered.length; index += 1) {
-        const refs = ordered[index].artifactRefs;
-        if (!Array.isArray(refs)) continue;
-        if (refs.length > budget) {
-          uninspectedRuns += 1;
-          continue;
-        }
-        budget -= refs.length;
-        const inspected = await inspectJournalArtifacts(stateRoot, refs, wired.artifactInspectionDeps);
-        recent[index].artifacts = inspected.artifacts;
-        if (inspected.failed) uninspectedRuns += 1;
-      }
-      if (uninspectedRuns > 0) {
-        notices.push(`artifact 상태를 확인하지 못한 실행이 ${uninspectedRuns}건 있습니다 — 한 번에 최대 ${MAX_INSPECTED_ARTIFACT_REFS}개 ref 만 엽니다.`);
-      }
-      journal = 'ok';
-    } else {
-      recent = [];
-      journal = 'unreadable';
-      notices.push(`실행 저널을 읽지 못했습니다: ${runs?.reason ?? snapshot.reason}`);
-    }
-  }
-
-  const rendered = renderStats({
-    threshold: OBSERVATION_THRESHOLD,
-    posteriors: posteriors.ok ? 'ok' : 'unreadable',
-    journal,
-    cells,
-    recent,
-  });
-  const shrank = reductionNotice(rendered.reduced);
-  if (shrank !== null) notices.push(shrank);
-
-  return success({
-    content: rendered.text,
-    // 파일을 직접 읽은 값이다. 못 읽은 것이 하나라도 있으면 그렇게 말한다.
-    confidence: posteriors.ok && journal !== 'unreadable' && generationState.ok ? 'verified' : 'unverified',
-    notice: notices.length > 0 ? notices.join(' ') : undefined,
-  });
-}
-
-/**
- * 한 응답에서 실제로 열어 보는 artifact ref 수의 상한.
- *
- * ★ 상한이 필요한 이유: `inspectArtifactRefs` 는 파일을 열고 **해시까지** 다시 계산한다
- *   (`expired` 가 "바이트가 여전히 그 ref 다" 를 포함하기 때문이다). 최근 목록은 최대 50건
- *   이고 실행 하나가 최대 네 개(manifest·후보 둘·winner)를 남기므로, 상한이 없으면 통계
- *   한 번이 패치 200개를 해시한다. 40 은 최근 10건 남짓을 덮는 값이다.
- *
- * ★ 넘치면 **조용히 자르지 않는다** — 확인하지 않은 실행 수를 notice 로 말한다.
- */
-const MAX_INSPECTED_ARTIFACT_REFS = 40;
-
-/**
- * 저장된 ref 는 그대로 두고 `exists`·`expired` 만 실측해 붙인다.
- *
- * ★ 학습 잠금 **밖**에서 부른다. 파일을 열고 해시하는 일을 coordinator 안에서 하면 그동안
- *   모든 학습 writer 가 막히고, 잠금 본문이 `staleMs`(60초) 쪽으로 자란다.
- *
- * ★ 실패는 **진단일 뿐**이다. artifact 가 사라졌거나 확인에 실패했다고 해서 정정이 막히지
- *   않는다 — 보상 권위는 동결된 choice map 이지 패치 내용이 아니다. reset 세대 만료와는
- *   다른 사건이고, 그쪽만 정정을 거절한다.
- */
-async function inspectJournalArtifacts(stateRoot, refs, dependencyInput) {
-  if (!Array.isArray(refs)) return { artifacts: null, omitted: 0, failed: false };
-  if (refs.length === 0) return { artifacts: [], omitted: 0, failed: false };
-  const take = refs.slice(0, MAX_INSPECTED_ARTIFACT_REFS);
-  let result = null;
-  try {
-    result = await inspectArtifactRefs(
-      { stateRoot, refs: take, nowMs: Date.now() },
-      dependencyInput !== null && typeof dependencyInput === 'object' ? dependencyInput : {},
-    );
-  } catch {
-    result = null;
-  }
-  if (result?.ok !== true) return { artifacts: null, omitted: refs.length, failed: true };
-  return {
-    artifacts: result.refs.map(({ ref, exists, expired }) => ({ ...ref, exists, expired })),
-    omitted: refs.length - take.length,
-    failed: false,
-  };
-}
-
-const ZERO_DELTA = Object.freeze({ alphaDelta: 0, betaDelta: 0 });
-
-const sameAxes = (a, b) => Array.isArray(a) && a.length === b.length && a.every((axis, i) => axis === b[i]);
-
-/** Two complete choice maps hold the same arms for the same axes. */
-const sameChoices = (a, b) => {
-  const left = Object.entries(a ?? {});
-  const right = Object.entries(b ?? {});
-  return left.length === right.length && left.every(([axis, arm]) => b[axis] === arm);
-};
-
-/**
- * `axis → arm` 을 읽는다. **하나라도 이상하면 `null`** — 부분 수용이 없다.
- *
- * ★ 왜 모르는 축·팔에서 실패하는가: v1 은 모르는 축을 notice 로 건너뛰지만, 그쪽은
- *   `decisions` 라는 넓은 기록에서 골라 쓰는 경로다. v2 의 map 은 엔진이 **이 Run 이
- *   실제로 돌린 것만** 적은 좁은 기록이라, 거기 낯선 이름이 있으면 그 줄 자체를 믿을 수
- *   없다. 절반만 정정하면 되돌릴 수 없는 반쪽 상태가 남는다.
- */
-function normalizeChoiceMap(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
-  const map = new Map();
-  for (const [axis, arm] of Object.entries(value)) {
-    if (!POLICY_V2_AXES.includes(axis)) return null;
-    if (typeof arm !== 'string' || !AXES[axis].arms.includes(arm)) return null;
-    map.set(axis, arm);
-  }
-  return map;
-}
-
-const sameAxisSet = (axes, map) => !Array.isArray(axes) ||
-  axes.length === map.size && axes.every((axis) => map.has(axis));
-
-/**
- * 정책 v2 줄을 정정 권위로 읽는다. 실패는 `null` 이고 호출자가 실패 봉투를 낸다.
- *
- * 검사하는 것: 두 map 이 모두 온전한가, `appliedChoices ⊆ rewardableChoices` 이고 팔이
- * 같은가, `appliedGrade` 와 `appliedChoices` 가 서로를 부정하지 않는가, 파생 배열
- * (`appliedAxes`/`rewardableAxes`)이 있다면 map 의 축과 같은가.
- */
-function readPolicyV2Authority(run) {
-  const applied = normalizeChoiceMap(run.appliedChoices);
-  const rewardable = normalizeChoiceMap(run.rewardableChoices);
-  if (applied === null || rewardable === null) return null;
-  for (const [axis, arm] of applied) if (rewardable.get(axis) !== arm) return null;
-  const appliedGrade = run.appliedGrade ?? null;
-  if ((appliedGrade === null) !== (applied.size === 0)) return null;
-  if (!sameAxisSet(run.appliedAxes, applied) || !sameAxisSet(run.rewardableAxes, rewardable)) return null;
-  return { applied, rewardable };
-}
-
-/**
- * `orch_reward` 핸들러. 멱등·교체(설계 §7.4).
- *
- * ★★ **되돌리기와 새로 적기는 서로 다른 질문에 답한다.**
- *   · 되돌릴 곳 = `appliedAxes` — 지금 사후분포에 **실제로 들어 있는** 기여.
- *   · 새로 적을 곳 = `rewardableAxes` — 이 실행에 등급을 준다면 갈 곳(엔진의 `axesFor`).
- *   둘을 하나로 뭉개면 두 방향으로 다 틀린다: `appliedAxes` 로만 적으면 **자동 채점이
- *   기권한 실행**(테스트 판정을 못 믿었다 · blocked · 빈 패치)은 정정할 곳이 0개가 되어
- *   사람 손 정정이 조용한 무연산이 되고, `Object.keys(AXES)` 로 적으면 이 실행에서
- *   **무연산이었던 축**(벤더 하나 · 역할 지정 · `test-definition-changed`)에까지 보상이
- *   얹혀 `learnable`·`axesFor` 가 막으려던 거짓 귀속이 사용자 정정 문으로 되돌아온다.
- *
- * ★★ 되돌리기와 적용을 축마다 **순 델타 하나**로 합치고, 그 델타들을 **한 번의
- *   완전 목표를 담은 **학습 WAL 작업 하나**(coordinator 하나 · posterior/journal 목표
- *   쓰기)로 낸다. 두 층 다 이유가 같다 — 중간에서 죽어도 다음 읽기/작업이 같은 목표를
- *   정확히 재생해야 저널의 스칼라 `appliedGrade` 와 사후분포가 어긋나지 않는다.
- *   `posteriors.json` 과 저널은 함께 의도된 목표로 수렴하며, operationId 가 저널 행의
- *   중복 추가를 막는다.
- *   성분별 하한은 순 델타든 두 번 호출이든 같은 값을 낸다(`bump` 이 성분마다 따로 막는다).
- *
- * ★ **쓰기 중 실패하면 pending WAL을 남긴다.** 이후 읽기/작업은 같은 목표를 재생해
- *   posterior와 저널을 정확히 한 번 수렴시킨다. 이번 호출은 `failed` 봉투이지만, 실행
- *   결과 자체를 막지는 않는다.
- *
- * ★ 던지지 않는다. 실패는 봉투다.
- */
-async function runOrchReward(value, context) {
-  const wired = toEngineDeps(context);
-  const stateRoot = typeof wired.stateRoot === 'string' && wired.stateRoot !== '' ? wired.stateRoot : resolveStateRoot();
-
-  // The corrected row's artifact refs travel out of the coordinator so the
-  // filesystem probe below runs with the lock released.
-  const captured = { artifactRefs: null };
-  const locked = await withLearningLock(stateRoot, async () => runOrchRewardUnlocked(value, stateRoot, captured));
-  if (!locked.ok) {
-    return failure({
-      status: 'failed',
-      error: `학습 조정 잠금을 잡지 못했습니다: ${locked.reason}`,
-      recovery: '잠시 뒤 같은 run_id 로 다시 시도하세요. 보류 중인 학습 작업은 다음 읽기 또는 재시도에서 복구됩니다.',
-    });
-  }
-  const envelope = locked.value;
-  if (envelope.status !== 'succeeded' || captured.artifactRefs === null) return envelope;
-  const inspected = await inspectJournalArtifacts(stateRoot, captured.artifactRefs, wired.artifactInspectionDeps);
-  const notices = [];
-  if (typeof envelope.notice === 'string' && envelope.notice !== '') notices.push(envelope.notice);
-  if (inspected.failed) notices.push('artifact 상태를 확인하지 못했습니다 — 정정 자체는 반영됐습니다.');
-  if (inspected.omitted > 0) notices.push(`artifact ref ${inspected.omitted}개는 확인하지 않았습니다(한 번에 최대 ${MAX_INSPECTED_ARTIFACT_REFS}개).`);
-  let body;
-  try {
-    body = JSON.parse(envelope.content);
-  } catch {
-    return envelope;
-  }
-  body.artifacts = inspected.artifacts;
-  return success({
-    content: JSON.stringify(body),
-    confidence: 'verified',
-    notice: notices.length > 0 ? notices.join(' / ') : undefined,
-  });
-}
-
-async function runOrchRewardUnlocked(value, stateRoot, captured = { artifactRefs: null }) {
-  // `findRun` 은 같은 coordinator 를 다시 잡으므로 여기서는 unlocked helper 만 쓴다.
-  const run = await findRunUnlocked(stateRoot, value.run_id);
-
-  if (run === null) {
-    return failure({
-      status: 'invalid',
-      error: `run_id "${safeErrorText(value.run_id)}" 를 저널에서 찾지 못했습니다.`,
-      recovery: 'orch_stats({runs: 20}) 으로 최근 실행 목록을 확인하세요.',
-    });
-  }
-  if (typeof run.taskClass !== 'string' || run.taskClass === '') {
-    return failure({
-      status: 'failed',
-      error: `실행 기록 "${safeErrorText(value.run_id)}" 에 taskClass 가 없어 어느 셀을 고칠지 알 수 없습니다.`,
-      recovery: '이 실행은 학습 셀과 연결돼 있지 않습니다. 다른 run_id 를 고르세요.',
-    });
-  }
-
-  // ★★ 정책 버전이 **정정 권위를 정한다.** v2 줄은 동결된 choice map 만 읽고 `decisions`
-  //   는 절대 읽지 않는다 — 다중 후보에서 `decisions[axis]` 는 밴딧이 뽑았지만 아무 lane 도
-  //   돌리지 않은 팔일 수 있고, 그것을 보상하면 실행하지 않은 선택을 배운다(설계 §14.3).
-  //   그래서 map 이 망가지면 **v1 으로 내려가지 않고** 실패한다. 폴백은 조용한 오귀속이다.
-  const policyVersion = run.policyVersion ?? 1;
-  if (policyVersion !== 1 && policyVersion !== 2) {
-    return failure({
-      status: 'failed',
-      error: `모르는 학습 policyVersion(${safeErrorText(policyVersion)}) 이라 정정 권위를 정할 수 없습니다.`,
-      recovery: '이 줄을 쓴 버전의 도구로 정정하세요. 임의 버전으로 되돌리면 이중 계산이 됩니다.',
-    });
-  }
-  if (Array.isArray(run.artifactRefs)) captured.artifactRefs = run.artifactRefs;
-  const v2 = policyVersion === 2 ? readPolicyV2Authority(run) : null;
-  if (policyVersion === 2 && v2 === null) {
-    return failure({
-      status: 'failed',
-      error: 'policyVersion 2 실행 기록의 appliedChoices/rewardableChoices 가 온전하지 않아 정정하지 않았습니다.',
-      recovery: '이 줄은 손으로 고치지 말고 그대로 두세요. 새 orchestration 을 실행해 현재 형식의 run_id 를 만드세요.',
-    });
-  }
-
-  const generations = await readGenerationsUnlocked(stateRoot);
-  if (!generations.ok) {
-    return failure({
-      status: 'failed',
-      error: `학습 세대를 읽지 못해 정정하지 않았습니다: ${generations.reason}`,
-      recovery: '잠시 뒤 다시 시도하세요. 상태 루트의 learning.generations.json 접근도 확인하세요.',
-    });
-  }
-  const hasExpiredAxis = (axes, recordedGenerations) => axes.some((axis) => {
-    if (typeof axis !== 'string' || axis === '') return false;
-    const recorded = Number.isInteger(recordedGenerations?.[axis]) ? recordedGenerations[axis] : 0;
-    return generationOf(generations.generations, cellKeyOf(run.taskClass, axis)) !== recorded;
-  });
-  // `appliedAxes` and `rewardableAxes` describe independent contracts.  A
-  // null-applied run intentionally has no applied generation, but its current
-  // rewardable generation still makes a later manual grade safe.  Missing maps
-  // remain legacy generation 0 rather than borrowing the other contract's map.
-  const isExpired =
-    (run.appliedGrade !== null && run.appliedGrade !== undefined &&
-      Array.isArray(run.appliedAxes) && hasExpiredAxis(run.appliedAxes, run.appliedGenerations)) ||
-    (Array.isArray(run.rewardableAxes) && hasExpiredAxis(run.rewardableAxes, run.rewardableGenerations));
-  if (isExpired) {
-    return failure({
-      status: 'invalid',
-      error: '이 실행의 학습 세대가 reset 으로 만료되어 정정할 수 없습니다.',
-      recovery: '새 orchestration 을 실행해 현재 학습 세대의 run_id 를 만든 뒤 그 실행을 정정하세요.',
-    });
-  }
-
-  const nextGrade = value.good === true ? 'success' : 'failure';
-  const redoDeltas = gradeToDeltas(nextGrade);
-  const appliedGrade = run.appliedGrade ?? null;
-  const undoDeltas = gradeToDeltas(appliedGrade);
-
-  if (appliedGrade !== null && undoDeltas === null) {
-    return failure({
-      status: 'failed',
-      error: `실행 기록이 모르는 등급(${safeErrorText(appliedGrade)})을 반영했다고 적고 있어 되돌릴 수 없습니다.`,
-      recovery: '되돌리지 않고 새 등급만 더하면 이중 계산이 됩니다. 저널 줄을 확인하세요.',
-    });
-  }
-  // ★ `?? []` 로 읽지 마라. 옛 줄은 `appliedGrade:'success'` 인데 `appliedAxes` 가 없다 —
-  //   `[]` 로 읽으면 되돌릴 축이 0개가 되어 그 α 가 **영원히** 남고 새 등급이 그 위에 얹힌다.
-  if (v2 === null && undoDeltas !== null && !Array.isArray(run.appliedAxes)) {
-    return failure({
-      status: 'failed',
-      error: '실행 기록에 appliedAxes 가 없습니다(옛 형식) — 어느 셀에 반영됐는지 몰라 되돌릴 수 없습니다.',
-      recovery:
-        '되돌리지 않고 새 등급만 더하면 이중 계산이 됩니다. orch_stats({reset:true}) 로 사후분포를 초기화하고 다시 쌓는 것이 회복 경로입니다.',
-    });
-  }
-
-  const notes = [];
-  const holding = [];
-  const updates = [];
-  if (v2 !== null) {
-    // 되돌릴 곳은 `appliedChoices`, 새로 적을 곳은 `rewardableChoices` — 둘 다 팔까지
-    // 동결돼 있으므로 이 자리에서 팔을 추측할 일이 없다. 축 순서는 `POLICY_V2_AXES` 다.
-    for (const axis of POLICY_V2_AXES) {
-      const arm = v2.rewardable.get(axis) ?? v2.applied.get(axis);
-      if (arm === undefined) continue;
-      const back = undoDeltas !== null && v2.applied.has(axis) ? undoDeltas : ZERO_DELTA;
-      const inRedo = v2.rewardable.has(axis);
-      const forward = inRedo ? redoDeltas : ZERO_DELTA;
-      const alphaDelta = forward.alphaDelta - back.alphaDelta;
-      const betaDelta = forward.betaDelta - back.betaDelta;
-      if (alphaDelta !== 0 || betaDelta !== 0) {
-        updates.push({ cellKey: cellKeyOf(run.taskClass, axis), arm, alphaDelta, betaDelta });
-      }
-      if (inRedo) holding.push(axis);
-    }
-  } else {
-    const undoAxes = undoDeltas === null ? [] : run.appliedAxes;
-    let redoAxes;
-    if (Array.isArray(run.rewardableAxes)) {
-      redoAxes = run.rewardableAxes;
-    } else if (undoDeltas !== null) {
-      redoAxes = undoAxes;
-      notes.push('실행 기록에 rewardableAxes 가 없어(옛 형식) 이미 반영돼 있던 축에만 새 등급을 적었습니다.');
-    } else {
-      redoAxes = [];
-      notes.push(
-        '실행 기록에 rewardableAxes 가 없고 사후분포에 반영된 기여도 없어(옛 형식) 새 등급을 적을 셀을 정할 수 없습니다.',
-      );
-    }
-
-    // ★ 모르는 축은 **조용히** 버리지 않는다. 형제 경로(팔이 없는 축)가 문장을 남기는데
-    //   여기만 침묵하면 `rewardableAxes:['oldaxis']` 같은 줄이 `axes:[]` · notice 없음으로
-    //   나가서, 사용자는 정정이 됐다고 믿는다 — 이 도구의 논거가 「조용한 무연산을 없앤다」다.
-    const named = [...new Set([...undoAxes, ...redoAxes])];
-    const axes = named.filter((axis) => Object.hasOwn(AXES, axis));
-    const unknown = named.filter((axis) => !Object.hasOwn(AXES, axis));
-    if (unknown.length > 0) {
-      notes.push(`지금 없는 축이라 건너뜁니다: ${unknown.map((axis) => safeErrorText(axis)).join(', ')}.`);
-    }
-
-    for (const axis of axes) {
-      const decisions = run.decisions !== null && typeof run.decisions === 'object' ? run.decisions : {};
-      const arm = Object.hasOwn(decisions, axis) ? decisions[axis] : null;
-      if (typeof arm !== 'string' || arm === '') {
-        notes.push(`${axis}: 이 실행이 쓴 팔이 저널에 없어 건너뜁니다.`);
-        continue;
-      }
-      const back = undoAxes.includes(axis) ? undoDeltas ?? ZERO_DELTA : ZERO_DELTA;
-      const inRedo = redoAxes.includes(axis);
-      const forward = inRedo ? redoDeltas : ZERO_DELTA;
-      const alphaDelta = forward.alphaDelta - back.alphaDelta;
-      const betaDelta = forward.betaDelta - back.betaDelta;
-
-      if (alphaDelta !== 0 || betaDelta !== 0) {
-        updates.push({ cellKey: cellKeyOf(run.taskClass, axis), arm, alphaDelta, betaDelta });
-      }
-      if (inRedo) holding.push(axis);
-    }
-  }
-
-  // ★★ **한 번의 쓰기다.** 축마다 따로 쓰면 세 축을 고치고 네 번째에서 죽는 반쪽 상태가
-  //    남는데, 저널의 스칼라 `appliedGrade` 로는 그것을 적을 수가 없어 다음 정정이 이중
-  //    계산한다. 실패하면 **저널을 건드리지 않고** 실패 봉투로 나간다 — 아무것도 안 움직인
-  //    상태라 같은 호출을 다시 하면 정확히 같은 결과가 난다(멱등 회복).
-  const wrote = updates.length > 0;
-  const nextApplied = holding.length > 0 ? nextGrade : null;
-  const note = typeof value.note === 'string' ? value.note : null;
-  // ★ `note` 를 안 주면 이전 note 가 **지워진다**(줄 전체를 새로 쓰기 때문이다). 그것이
-  //   틀린 동작은 아니지만 — 안 준 것은 "비워라" 로 읽는 편이 예측 가능하다 — 조용하면 안 된다.
-  if (note === null && typeof run.note === 'string' && run.note !== '') {
-    notes.push(`note 를 주지 않아 이전 기록("${run.note}")을 지웠습니다. 남기려면 같은 문장을 다시 주세요.`);
-  }
-  // v2 는 축 목록이 아니라 **완전한 choice map** 을 비교한다. 같은 축이라도 팔이 달라지면
-  // 그것은 다른 정정이므로 무연산이 아니다.
-  const nextAppliedChoices = v2 === null
-    ? null
-    : Object.fromEntries(holding.map((axis) => [axis, v2.rewardable.get(axis)]));
-  // ★ 바뀔 것이 없으면 줄을 얹지 않는다 — 그것이 멱등이다. 사후분포도 저널도 그대로여야 한다.
-  const unchanged =
-    !wrote &&
-    appliedGrade === nextApplied &&
-    sameAxes(run.appliedAxes, holding) &&
-    (v2 === null || sameChoices(run.appliedChoices, nextAppliedChoices)) &&
-    (run.rewardApplied ?? null) === 'user' &&
-    (run.note ?? null) === note;
-
-  if (!unchanged) {
-    // The pending WAL holds this complete posterior target and this complete
-    // replacement row before either is touched.  Never call a public storage
-    // writer here: this callback already owns learning.lock.
-    const committed = await commitLearningMutationUnlocked(stateRoot, {
-      updates,
-      journal: {
-      ...run,
-      appliedGrade: nextApplied,
-      appliedAxes: holding,
-      ...(v2 === null ? {} : { appliedChoices: nextAppliedChoices }),
-      rewardApplied: 'user',
-      note,
-      },
-    });
-    if (committed.ok !== true) {
-      return failure({
-        status: 'failed',
-        error: `사후분포와 실행 기록을 함께 고치지 못했습니다: ${committed.reason}`,
-        recovery: '보류 중인 작업은 다음 읽기 또는 같은 run_id 로 다시 시도할 때 복구됩니다. 문제가 계속되면 새 orchestration 을 실행하세요.',
-      });
-    }
-    if (Array.isArray(committed.notes) && committed.notes.length > 0) notes.push(committed.notes.join(' / '));
-  }
-
-  return success({
-    content: JSON.stringify({
-      runId: run.runId,
-      previousGrade: appliedGrade,
-      grade: nextApplied,
-      axes: holding,
-      changed: !unchanged,
-    }),
-    confidence: 'verified',
-    notice: notes.length > 0 ? notes.join(' / ') : undefined,
-  });
-}
-
-/**
- * `context` 의 어느 필드가 엔진의 어디로 가는가 — 두 핸들러가 같은 계약을 쓴다.
- *
- * ★ 왜 한자리에 모으는가(실측): 예전에는 `orch_run` 이 `stateRoot` 를 **최상위 옵션**으로
- *   넘겼는데 엔진은 `deps.stateRoot` 만 읽었다. 그래서 `callTool(name, args, { stateRoot })`
- *   로 부르면 워크트리·patches·plans 가 그 디렉터리가 아니라 개발자의 실제 상태 루트에
- *   생겼다(테스트가 실제로 홈을 오염시켰다). `providers` 는 중계 자체가 없어서, 가짜
- *   프로바이더를 주입해도 진짜 레지스트리의 claude 가 떴다. 같은 `context` 를 받는
- *   `orch_models` 는 두 필드를 정상 존중했다 — 두 핸들러가 같은 필드를 다르게 해석했다.
- *
- * 우선순위: 호출자가 `context.deps` 에 직접 적은 값이 이긴다. 그쪽이 더 구체적인 채널이다.
- */
-function toEngineDeps(context) {
-  const deps = context?.deps && typeof context.deps === 'object' ? context.deps : {};
-  const shorthand = {};
-  if (typeof context?.stateRoot === 'string' && context.stateRoot !== '') shorthand.stateRoot = context.stateRoot;
-  if (Array.isArray(context?.providers)) shorthand.providers = context.providers;
-  return { ...shorthand, ...deps };
-}
-
-/**
- * 검증을 통과한 `orch_run` 인자를 엔진 옵션으로 옮긴다.
- *
- * ★ 이름이 다른 이유: MCP 인자는 설계 §8.2 의 snake_case(`wait_ms`·`allow_single`)이고
- *   엔진은 camelCase(`waitMs`·`allowSingle`)다. 옮기는 자리를 하나로 두어 어느 쪽을
- *   바꿔도 여기만 보면 된다.
- *
- * `onProgress` 는 호스트가 `context` 로 준다(`src/server.mjs` 가 진행 토큰이 있을 때만
- * 만든다) — 중계하지 않으면 조용한 긴 스텝에서 호스트의 유휴 타이머가 먼저 끊는다(§6).
- *
- * ★ **내보내는 이유**: `allow_single` 은 계획 3 태스크 6 시점에 엔진 안에 소비자가 없다
- *   (밴딧 배선은 태스크 8 이다). 그래서 완주 테스트로는 이 배선을 잴 수 없고 — 매핑을
- *   통째로 지워도 봉투가 똑같다 — 이 함수를 직접 부르는 것이 재는 유일한 길이다.
- *   `envelope.mjs` 가 `validateArgs` 를 순수 함수로 두는 것과 같은 이유다.
- */
-export function toEngineOptions(value, context) {
-  return {
-    task: value.task,
-    projectPath: value.project,
-    isolation: value.isolation,
-    budget: value.budget,
-    waitMs: value.wait_ms,
-    candidateCount: value.candidates,
-    // ☞ 태스크 8 이 읽는다: `decide({ allowed: { single: options.allowSingle === true } })`.
-    allowSingle: value.allow_single === true,
-    onProgress: typeof context?.onProgress === 'function' ? context.onProgress : undefined,
-    deps: toEngineDeps(context),
-  };
-}
-
+// 학습 통계와 초기화 핸들러는 `./tools/stats.mjs` 에 산다.
 /**
  * `orch_run` 핸들러: 옮긴 옵션을 그대로 엔진에 넘긴다.
  *
@@ -1368,6 +614,37 @@ async function runOrchRun(value, context) {
 const PROGRESS_MIN_INTERVAL_MS = 5_000;
 
 /**
+ * 무엇도 이름을 안 대는 이벤트가 쓰는 이름. **실패 문구가 아니라 진행 알림의 라벨**이라
+ * 레지스트리가 아니라 여기 산다(MCP `notifications/progress` 의 `message` — 봉투 밖 채널이다).
+ */
+const PROGRESS_FALLBACK = 'infra';
+
+/**
+ * 엔진의 내부 단계 이름 → 호스트가 보는 어휘(계약 `envelope.json` 의 `progress.vocabulary`).
+ *
+ * ★ 접는 자리가 여기인 이유: 엔진은 자기 이름으로 말하고(`inspect`·`patch`·`verifier_format`),
+ *   그 이름들은 후보가 하나일 때만 위로 새어 나갔다 — 같은 실행 단계가 `candidates` 값에 따라
+ *   다른 단어로 보이는 것이 WS0 §4 가 적은 결함이다. 접기를 엔진에 두면 엔진이 호스트 어휘를
+ *   알아야 하고, 호스트마다 다시 접어야 한다. 알림을 만드는 이 자리가 유일한 번역기다.
+ */
+export const PROGRESS_PHASES = new Map([
+  ['inspect', 'preflight'], ['preflight', 'preflight'], ['worktree', 'worktree'],
+  ['planner', 'planner'], ['worker', 'writer'], ['writer', 'writer'], ['patch', 'writer'],
+  ['tests', 'tests'], ['verifier', 'verifier'], ['verifier_format', 'verifier'],
+  ['judge', 'judge'], ['judge_format', 'judge'], ['thinker', 'judge'],
+  ['seal', 'seal'], ['scope', 'scope'], ['cleanup', 'cleanup'],
+]);
+
+/** 바인딩의 역할 이름 → 호스트 어휘. 역할이 없으면 접힌 phase 로 한 번 더 찾는다. */
+export const PROGRESS_ROLES = new Map([
+  ['planner', 'planner'], ['worker', 'writer'], ['writer', 'writer'],
+  ['tests', 'tests'], ['verifier', 'verifier'], ['thinker', 'judge'], ['judge', 'judge'],
+]);
+
+/** 음수도 실수도 알림에 실리지 않는다 — `attempt=<k>/<budget>` 은 정수 두 개다. */
+const progressInt = (value, fallback) => (Number.isInteger(value) && value >= 0 ? value : fallback);
+
+/**
  * 호스트의 `notifications/progress` 생산자를 만든다. 진행 토큰이 없으면 `undefined` —
  * 호스트가 요청하지 않은 알림을 보내면 안 된다(MCP 스펙).
  *
@@ -1375,6 +652,11 @@ const PROGRESS_MIN_INTERVAL_MS = 5_000;
  *   올리는데 그것을 받아 호스트로 내보내는 곳이 없었다 — 중계는 살아 있고 생산자가 0곳
  *   이었다. 매니페스트 `timeout` 이 1겹 더 있지만(둘 다 3600000), 조용한 긴 스텝에서
  *   유휴 타이머를 리셋하는 것은 이 알림뿐이다.
+ *
+ * ★★ `message` 는 문장이 아니라 **고정 형식의 한 줄**이다(WS0 §4, 계약의 `messagePattern`):
+ *    `<runId> lane=<A|B|-> role=<..> phase=<..> attempt=<k>/<budget>`. 봉투를 잃은 사용자가
+ *    `run_id` 를 되찾는 경로가 이 알림이므로 runId 는 **첫 줄부터** 실린다. 실리는 값은 전부
+ *    닫힌 어휘·정수·runId 다 — 모델 산문은 이 채널에도 안 들어온다(불변식 4).
  *
  * ★ 절대 던지지 않는다. 전송 실패(닫힌 transport)로 이미 도는 델리게이트를 죽이면 안 된다.
  */
@@ -1386,23 +668,32 @@ export function makeProgressReporter({ sendNotification, progressToken, minInter
   let sequence = 0;
   let lastAt = -Infinity;
   let lastPhase = null;
+  let total = 0;
 
   return (event) => {
     try {
-      const phase = typeof event?.phase === 'string' ? event.phase : '진행';
+      const phase = PROGRESS_PHASES.get(event?.phase) ?? PROGRESS_FALLBACK;
       const at = now();
       // 단계가 바뀌면 상한과 무관하게 보낸다 — 단계 전환이 사람에게 가장 쓸모 있는 신호다.
       if (phase === lastPhase && at - lastAt < gap) return;
       lastPhase = phase;
       lastAt = at;
       sequence += 1;
-      const step = Number.isInteger(event?.step) ? event.step : null;
+      const budget = progressInt(event?.budget, 0);
+      const candidates = progressInt(event?.candidates, 1);
+      // 추정기는 WS0 §4 의 값이다: 시도마다 프로바이더 네 번 + 레인마다 고정 세 단계.
+      // 추정치는 늘 수는 있어도 줄지 않는다 — 줄면 호스트의 막대가 뒤로 간다.
+      total = Math.max(total, candidates * (budget * 4 + 3), sequence);
+      const lane = event?.laneId === 'lane-a' ? 'A' : event?.laneId === 'lane-b' ? 'B' : '-';
+      const role = PROGRESS_ROLES.get(event?.role) ?? PROGRESS_ROLES.get(phase) ?? PROGRESS_FALLBACK;
+      const runId = typeof event?.runId === 'string' && event.runId !== '' ? event.runId : '-';
       const sent = sendNotification({
         method: 'notifications/progress',
         params: {
           progressToken,
           progress: sequence,
-          message: step !== null && step > 0 ? `${phase} (스텝 ${step})` : phase,
+          total,
+          message: `${runId} lane=${lane} role=${role} phase=${phase} attempt=${progressInt(event?.step, 0)}/${budget}`,
         },
       });
       if (sent && typeof sent.catch === 'function') sent.catch(() => {});
@@ -1417,7 +708,10 @@ const HANDLERS = {
   orch_run: runOrchRun,
   orch_config: runOrchConfig,
   orch_stats: runOrchStats,
+  orch_status: runOrchStatus,
+  orch_apply: runOrchApply,
   orch_reward: runOrchReward,
+  orch_reset: runOrchReset,
 };
 
 /**
@@ -1434,8 +728,8 @@ export async function callTool(name, args, context = {}) {
     if (!spec) {
       return failure({
         status: 'invalid',
-        error: `알 수 없는 도구: ${safeErrorText(name)}`,
-        recovery: `사용 가능한 도구: ${TOOL_SPECS.map((t) => t.name).join(', ')}`,
+        reasonCode: REASON.config_tool_unknown,
+        params: { name: errorText(name), tools: TOOL_SPECS.map((t) => t.name).join(', ') },
       });
     }
 
@@ -1446,9 +740,14 @@ export async function callTool(name, args, context = {}) {
     //   JSON-RPC 프레임을 고치라는 뜻이라 스스로 회복할 수 없다.
     //   `undefined` 만 정규화한다 — `null` 은 "값을 명시적으로 비웠다" 라 계속 거부한다
     //   (`args ?? {}` 는 그 둘을 같게 만든다).
-    const validated = validateArgs(args === undefined ? {} : args, spec.args);
+    const input = args === undefined ? {} : args;
+    if (spec.name === 'orch_reset') {
+      const confirmationFailure = resetConfirmationFailure(input);
+      if (confirmationFailure !== null) return confirmationFailure;
+    }
+    const validated = validateArgs(input, spec.args);
     if (!validated.ok) {
-      return failure({ status: 'invalid', error: validated.error, recovery: validated.recovery });
+      return failure({ status: 'invalid', reasonCode: validated.reasonCode, error: validated.error, recovery: validated.recovery });
     }
 
     // ★ 이 분기는 지금 도달할 수 없다 — `TOOL_SPECS` 의 두 이름이 `HANDLERS` 에 다 있다.
@@ -1457,19 +756,11 @@ export async function callTool(name, args, context = {}) {
     //   "계획 범위를 확인하세요" 라고 말하면 고칠 수 없는 일을 시키는 것이다.
     const handler = HANDLERS[spec.name];
     if (typeof handler !== 'function') {
-      return failure({
-        status: 'failed',
-        error: `서버 내부 배선 오류: 도구 '${spec.name}' 의 스펙은 있는데 핸들러가 없습니다.`,
-        recovery: '호출자가 고칠 수 있는 문제가 아닙니다. 서버 로그와 함께 이 문장을 그대로 신고하세요.',
-      });
+      return failure({ status: 'failed', reasonCode: REASON.run_tool_handler_missing, params: { name: spec.name } });
     }
 
     return await handler(validated.value, context);
   } catch (error) {
-    return failure({
-      status: 'failed',
-      error: safeErrorText(error),
-      recovery: '다시 시도하거나 서버 로그를 확인하세요.',
-    });
+    return failure({ status: 'failed', reasonCode: REASON.run_tool_failed, params: { detail: errorText(error) } });
   }
 }

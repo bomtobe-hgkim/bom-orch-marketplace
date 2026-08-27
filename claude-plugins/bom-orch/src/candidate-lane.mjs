@@ -8,40 +8,30 @@ import {
 import { isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
 import { validJudgeView } from './candidate-selection.mjs';
+import { REASON } from './reason-codes.mjs';
+import { MAX_ISSUE_CLAIM_CHARS } from './run-records.mjs';
+import { deepFreeze } from './util/freeze.mjs';
+import { cloneData, exactObject } from './util/objects.mjs';
+import { clipWhole, compareUtf8, isSafeCount } from './util/strings.mjs';
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
-function exactDataObject(value, keys) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
-      Object.getPrototypeOf(value) !== Object.prototype) return null;
-  const own = Reflect.ownKeys(value);
-  if (own.length !== keys.length || own.some((key) => typeof key !== 'string') ||
-      keys.some((key) => !own.includes(key))) return null;
-  for (const key of keys) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) return null;
-  }
-  return value;
-}
-
+/**
+ * writer 가 attempt 를 끝낸 **비정상** 상태의 닫힌 어휘. 불변 attempt 기록의 `writerResult` 로
+ * 남으므로 `src/run-records.mjs` 의 `WRITER_RESULTS` 와 **같은 값 집합**이어야 한다
+ * (그쪽이 저장 단계의 검증기다).
+ *
+ * ★ WS2 Task 15 가 옛 철자(`provider_failed`·`timeout`·`effect_unknown`·`snapshot_failed`·
+ *   `seal_failed`)를 레지스트리 이름으로 옮겼다. 디스크에 남은 옛 값은 읽기 별칭
+ *   (`LEGACY_REASON_ALIASES`)이 계속 받는다 — 쓰기만 새 이름이다(불변식 9, WS2 §2.4).
+ */
 const OPERATIONAL_RESULTS = new Set([
-  'provider_failed',
-  'timeout',
-  'effect_unknown',
-  'snapshot_failed',
-  'seal_failed',
+  REASON.provider_reported_failure,
+  REASON.provider_deadline_exceeded,
+  REASON.provider_outcome_unknown,
+  REASON.git_snapshot_failed,
+  REASON.git_seal_failed,
 ]);
-
-function deepClone(value) {
-  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
-}
-
-function deepFreeze(value) {
-  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
-  Object.freeze(value);
-  for (const child of Object.values(value)) deepFreeze(child);
-  return value;
-}
 
 function emptyUsage() {
   return { calls: 0, promptTokensKnown: 0, evalTokensKnown: 0, incomplete: false };
@@ -55,15 +45,11 @@ function cancelUsage(usage) {
   return { ...usage, calls: Math.max(0, usage.calls - 1) };
 }
 
-function validToken(value) {
-  return Number.isSafeInteger(value) && value >= 0;
-}
-
 function settleUsage(usage, settlement) {
   const next = { ...usage };
-  if (validToken(settlement?.promptTokens)) next.promptTokensKnown += settlement.promptTokens;
+  if (isSafeCount(settlement?.promptTokens)) next.promptTokensKnown += settlement.promptTokens;
   else next.incomplete = true;
-  if (validToken(settlement?.evalTokens)) next.evalTokensKnown += settlement.evalTokens;
+  if (isSafeCount(settlement?.evalTokens)) next.evalTokensKnown += settlement.evalTokens;
   else next.incomplete = true;
   return next;
 }
@@ -86,6 +72,22 @@ function addUsage(left, right) {
 
 function beforeDeadline(spec, deps) {
   return spec.deadlineAt === null || spec.deadlineAt === undefined || deps.now() < spec.deadlineAt;
+}
+
+/**
+ * 이 레인이 **정지 신호 때문에** 멈춘다면 그 사유. 레인은 신호를 직접 안 본다 — 보는 것은
+ * 접힌 하나(`deps.isAborted`)뿐이라 「누가 껐는가」를 답할 수 없다(WS3 §0-C1).
+ *
+ * ★★ 실측 결함(태스크 7 리뷰 M1): 아래 일곱 자리가 `REASON.run_deadline_exceeded` 를 리터럴로
+ *   적고 있었는데, 그 자리를 여는 검사는 접힌 신호를 읽는다. 그래서 호스트가 끊은 실행이
+ *   최상위는 `cancelled` 인데 본문의 후보 줄은 `deadline_exceeded` 였고, 블로커는 "The 3300000
+ *   millisecond deadline ... Raise wait_ms and retry" 라고 말했다 — 정지 버튼을 누른 사용자에게.
+ * ★ 그래서 판정은 여기서 하지 않고 **엔진의 유일한 판정 자리**(`haltReasonCode`)를 그대로
+ *   받아 쓴다. 안 넘겨준 호출자(레인 단위 테스트)에게는 마감이 오늘의 값이다.
+ */
+function haltCode(deps) {
+  const code = deps.haltReasonCode?.();
+  return typeof code === 'string' && code !== '' ? code : REASON.run_deadline_exceeded;
 }
 
 function attemptId(spec, ordinal) {
@@ -127,9 +129,9 @@ function mergeInitialLedger(machineLedger, verdict) {
     ...machineLedger.entries.filter((entry) => entry.namespace === 'verifier'),
     ...verifierLedger.entries,
     ...machineLedger.entries.filter((entry) => entry.namespace === 'machine'),
-  ].map(deepClone);
+  ].map(cloneData);
   const openIds = entries.filter((entry) => entry.status === 'open').map((entry) => entry.id).sort();
-  if (openIds.length > 100) return { ok: false, kind: 'issue_limit_exceeded', code: 'issue_limit_exceeded' };
+  if (openIds.length > 100) return { ok: false, kind: 'issue_limit_exceeded', code: REASON.verifier_issue_limit_exceeded };
   return deepFreeze({
     laneId: machineLedger.laneId,
     entries,
@@ -167,16 +169,20 @@ export function decideAttempt(input) {
     return { action: 'block', terminalClass: 'blocked', reason: input.operational };
   }
   if (input?.policyFailure || input?.tamperFailure) {
-    return { action: 'reject', terminalClass: 'rejected', reason: input.policyFailure ? 'policy_failure' : 'tamper_failure' };
+    return {
+      action: 'reject',
+      terminalClass: 'rejected',
+      reason: input.policyFailure ? REASON.scope_policy_failure : REASON.scope_tamper_failure,
+    };
   }
-  if (input?.stagnated) return { action: 'stagnate', terminalClass: 'rejected', reason: 'stagnated' };
+  if (input?.stagnated) return { action: 'stagnate', terminalClass: 'rejected', reason: REASON.lane_stagnated };
   if (input?.verifier?.verdict !== 'PASS') {
-    if (input?.budgetRemaining) return { action: 'repair', reason: 'verifier_failed' };
-    return { action: 'reject', terminalClass: 'rejected', reason: 'verifier_failed' };
+    if (input?.budgetRemaining) return { action: 'repair', reason: REASON.verifier_failed };
+    return { action: 'reject', terminalClass: 'rejected', reason: REASON.verifier_failed };
   }
   if (input?.machine?.status === 'fail') {
-    if (input?.budgetRemaining && input.machine.repairable === true) return { action: 'repair', reason: 'machine_failed' };
-    return { action: 'reject', terminalClass: 'rejected', reason: 'machine_failed' };
+    if (input?.budgetRemaining && input.machine.repairable === true) return { action: 'repair', reason: REASON.test_machine_failed };
+    return { action: 'reject', terminalClass: 'rejected', reason: REASON.test_machine_failed };
   }
   // ★★ 설계 §10.1: 열린 blocking issue 는 **rejected** 다. verifier 가 PASS 해도 coordinator
   //   machine issue 는 열린 채로 남을 수 있다 — Closed Contract Detail 8 이 「신뢰 가능한
@@ -187,18 +193,18 @@ export function decideAttempt(input) {
   //   `single_survivor` 선택이 저장 단계에서 거절된다**(실측: `invalid_manifest_transition`).
   //   여기서 막으면 두 판정이 갈릴 상태 자체가 생기지 않는다.
   if (Number.isInteger(input?.openIssueCount) && input.openIssueCount > 0) {
-    if (input?.budgetRemaining) return { action: 'repair', reason: 'issues_open' };
-    return { action: 'reject', terminalClass: 'rejected', reason: 'issues_open' };
+    if (input?.budgetRemaining) return { action: 'repair', reason: REASON.verifier_issues_open };
+    return { action: 'reject', terminalClass: 'rejected', reason: REASON.verifier_issues_open };
   }
   if (input?.proof?.required === true && input.proof.status !== 'proved') {
-    if (input.proof.repairable === true && input.budgetRemaining) return { action: 'repair', reason: 'proof_not_proven' };
-    if (input.proof.repairable === true) return { action: 'reject', terminalClass: 'rejected', reason: 'proof_not_proven' };
-    return { action: 'accept', terminalClass: 'usable_unverified', reason: 'evidence_unavailable' };
+    if (input.proof.repairable === true && input.budgetRemaining) return { action: 'repair', reason: REASON.test_proof_not_proven };
+    if (input.proof.repairable === true) return { action: 'reject', terminalClass: 'rejected', reason: REASON.test_proof_not_proven };
+    return { action: 'accept', terminalClass: 'usable_unverified', reason: REASON.evidence_unavailable };
   }
   if (input?.machine?.status === 'unavailable' || input?.evidenceUnavailable) {
-    return { action: 'accept', terminalClass: 'usable_unverified', reason: 'evidence_unavailable' };
+    return { action: 'accept', terminalClass: 'usable_unverified', reason: REASON.evidence_unavailable };
   }
-  return { action: 'accept', terminalClass: 'verified', reason: 'verified' };
+  return { action: 'accept', terminalClass: 'verified', reason: REASON.lane_verified };
 }
 
 function defaultTests() {
@@ -219,8 +225,86 @@ function defaultProof(requirement) {
   };
 }
 
+/**
+ * 범위를 **못 읽었을 때**의 모양 — `normalizedScope` 의 기본값과 정확히 반대쪽이다(WS5 T1 m1).
+ *
+ * ★ 「모르는 것은 승인이 아니다」를 값으로 적는다: 걸렸고(`flagged`), 지울 수 없는 등급이고
+ *   (`hardViolation`), 아무도 안 지웠다(`allowlisted: false`). 사유 목록은 **비어 있다** —
+ *   못 읽은 목록을 지어내는 것보다 0건이 정직하고, 그 0 이 실제 하드 위반과 이것을 가른다.
+ */
+function unreadableScope() {
+  return {
+    flagged: true, hardViolation: true, allowlisted: false,
+    reasons: [], reasonCount: 0, omittedReasonCount: 0, changedFileCount: 0,
+  };
+}
+
+/**
+ * **컷의 술어** — 「플래그가 섰고, 그중 미승인이 하나라도 남았나」(WS5 스펙 §0 D12).
+ *
+ * ★★ 두 항의 곱인 이유는 각 항이 서로 다른 실패를 막기 때문이다:
+ *   - `flagged !== false` 는 **기본 모양 가드**다. 집계 `allowlisted` 는 플래그가 없으면
+ *     거짓이므로(생산자의 ★★), `!allowlisted` 만 읽으면 아무것도 안 걸린 깨끗한 패치가
+ *     컷에 걸린다. `=== true` 가 아니라 `!== false` 인 것은 **두 항이 다 없는 모양**을 닫기
+ *     위해서다 — scope 를 아예 안 준 평가자는 여기서 통과하면 안 된다.
+ *   - `allowlisted !== true` 는 승인의 **명시적 증거**만 받는다. `undefined`·문자열·누락은
+ *     전부 미승인이다. 이 축의 실패는 언제나 닫는 쪽이다(생산자의 `allow` 규칙과 같다).
+ *
+ * ⚠ 「모양이 없으면 닫는다」는 **반만 참이다**(WS5 T4 리뷰 M2). 곱이라서 한 항만 없는 모양은
+ *   열린다: `{ allowlisted: true }`(=`flagged` 키 자체가 없음)는 `undefined !== false`(참)
+ *   `&& true !== true`(거짓) = **승인**이고, `normalizedScope` 는 nullish 가 아닌 객체를 받으면
+ *   키를 안 채우고 그대로 통과시키므로 그 모양이 실제로 `finalScope` 가 될 수 있다. 그 모양이
+ *   생산 경로에 없는 근거는 술어가 아니라 **생산자**다: 「승인됐다」는 명시적 주장은
+ *   `src/engine.mjs` 의 `scopeSummary` 만 만들고, 그것은 세 불린을 언제나 함께 채운다.
+ */
+function unapprovedScope(scope) {
+  return scope?.flagged !== false && scope?.allowlisted !== true;
+}
+
 function normalizedScope(scope) {
-  return scope ?? { flagged: false, reasonCount: 0, omittedReasonCount: 0, changedFileCount: 0 };
+  // ★ `reasons` 는 WS2 Task 11 이 더했다. 이 레인은 그 목록을 **읽지 않고 그대로 나른다** —
+  //   무엇이 걸렸는지는 봉투 조립이 읽는다(Task 15 가 이 파일의 어휘를 옮긴다). 기본값에 빈
+  //   배열을 두는 이유는 셰이프 하나다: 평가자가 scope 를 통째로 생략해도 본문 조립이
+  //   `scope.reasons` 를 배열로 볼 수 있어야 한다. 나머지 세 값의 근거는 `finalScope` 의 ★ 주석이다.
+  // ★ `hardViolation`(WS5 T1)도 같은 이유로 기본값이 있다. `flagged: false` 와 짝이라 이 셰이프
+  //   안에서 「하드 위반 없음」은 참이다 — 플래그가 없는데 하드 위반이 있다고 말하면 봉투가
+  //   거짓을 싣는다.
+  // ★★ 이 기본값은 이제 **「평가자가 scope 를 안 줬다」 하나만** 받는다(WS5 T4 가 T1 m1 을
+  //   닫았다). 복사 실패는 여기 오지 않고 `unreadableScope` 로 간다 — 두 사실을 한 값으로
+  //   접은 것이 원인이었고, 가른 자리는 호출부다(`finalScope` 를 짓는 ★★ 를 보라).
+  //   그래서 이 모양은 **열리는 쪽이어도 맞다**: 아무것도 안 걸렸다고 말한 것과 같다.
+  // ★ `allowlisted`(WS5 T2)도 같은 셰이프에 산다. 기본값이 `false` 인 것은 위 ⚠ 와 **반대로**
+  //   닫는 쪽이다: 「허용목록이 지웠다」를 아무도 말하지 않은 scope 는 지워지지 않은 것이다.
+  return scope ?? { flagged: false, hardViolation: false, allowlisted: false, reasons: [], reasonCount: 0, omittedReasonCount: 0, changedFileCount: 0 };
+}
+
+/**
+ * 열린 이슈의 **본문** — attempt 기록에 실려 실행이 끝난 뒤에도 남는다(WS2 스펙 「verifier 이슈 본문」).
+ * 지금까지 이 기록에는 식별자만 있었고, 그래서 "무엇이 왜 막았는가" 는 실행과 함께 사라졌다.
+ *
+ * ★ `openIssueIds` 와 **같은 순서의 같은 집합**을 낸다 — 검증기(`normalizeIssueBodies`)가 그것을
+ *   조인다. 본문이 다른 결함에 붙는 사고는 조용하기 때문이다.
+ * ★ `claim` 은 모델 산문이라 상한에서 자른다. 말줄임표까지 상한 안에 들어오도록 한 칸을 뺀다 —
+ *   `MAX_ISSUE_CLAIM_CHARS` 를 넘긴 값은 저장 단계가 기록 전체를 거절한다.
+ * ★ 자르는 함수가 `clipPlain` 이 아니라 `clipWhole` 인 이유: 상한이 서로게이트 쌍 한가운데
+ *   떨어지면 맨 `slice` 는 반쪽을 남기고, 그 반쪽을 저장 단계의 `boundedText` 가 거절한다
+ *   (짝 없는 서로게이트는 `Buffer` 에서 U+FFFD 로 조용히 바뀌어 해시를 무너뜨린다). 우리가 자른
+ *   값을 우리 검증기가 못 받는 모양이었고, 그 대가는 이슈 본문이 아니라 레인 전체의 실패였다.
+ * ★ machine 이슈에는 산문이 없다(지문뿐). 그때 `claim` 은 빈 문자열이고 근거는 지문이다 —
+ *   없는 문장을 지어내면 그 문장을 사람이 읽고 원인이라고 믿는다.
+ * ★ 근거는 **digest 로만** 나른다: 원문은 봉투에도 매니페스트에도 들어가지 않는다(불변식 4).
+ */
+function issueBodies(ledger) {
+  const open = new Set(ledger?.openIds ?? []);
+  return (ledger?.entries ?? [])
+    .filter((entry) => open.has(entry.id))
+    .map((entry) => ({
+      id: entry.id,
+      claim: clipWhole(entry.issue?.claim ?? '', MAX_ISSUE_CLAIM_CHARS - 1),
+      evidenceDigest: createHash('sha256').update(entry.issue?.evidence ?? entry.fingerprint ?? '', 'utf8').digest('hex'),
+      severity: 'blocking',
+    }))
+    .sort((left, right) => compareUtf8(left.id, right.id));
 }
 
 function normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult, sealed = null, verdictRef = null, writerUsage, verifierUsage, result, feedback }) {
@@ -230,25 +314,31 @@ function normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult, seal
     attemptId: attemptId(spec, ordinal),
     ordinal,
     retryOf,
-    binding: deepClone(binding),
+    binding: cloneData(binding),
     writerResult,
-    sealed: sealed ? deepClone(sealed) : null,
-    verdictRef: verdictRef ? deepClone(verdictRef) : null,
+    sealed: sealed ? cloneData(sealed) : null,
+    verdictRef: verdictRef ? cloneData(verdictRef) : null,
     usage: { writer: writerUsage, verifier: verifierUsage },
     result,
-    feedback: { openIssueIds: [...(feedback?.openIds ?? [])].sort() },
+    // 두 목록은 **같은 비교기**로 정렬한다. 기본 `.sort()` 는 UTF-16 코드유닛 순서라 ASCII 전용인
+    // 이슈 id(`ISSUE_ID_PATTERN`)에서는 오늘 `compareUtf8` 과 답이 같지만, 그 일치는 패턴이 ASCII
+    // 라는 우연이다 — 순서가 갈리면 본문이 다른 결함에 붙고 저장 단계가 기록을 통째로 거절한다.
+    feedback: {
+      openIssueIds: [...(feedback?.openIds ?? [])].sort(compareUtf8),
+      issues: issueBodies(feedback),
+    },
   });
 }
 
 async function writeTerminal(deps, attempts, attempt) {
-  const immutable = deepFreeze(deepClone(attempt));
+  const immutable = deepFreeze(cloneData(attempt));
   let written;
   try {
     written = await deps.writeAttemptArtifact(immutable);
   } catch {
     written = null;
   }
-  const ref = exactDataObject(written?.ref, ['kind', 'candidateId', 'path', 'sha256', 'bytes', 'expiresAt']);
+  const ref = exactObject(written?.ref, ['kind', 'candidateId', 'path', 'sha256', 'bytes', 'expiresAt']).value ?? null;
   const bytes = Buffer.from(`${JSON.stringify(immutable, null, 2)}\n`, 'utf8');
   if (!written || written.blocked === true || written.ok !== true || ref === null ||
       ref.kind !== 'attempt' || ref.candidateId !== attempt.laneId || !isAbsolute(ref.path) ||
@@ -291,16 +381,16 @@ function canonicalStrings(value, { max, pattern = null } = {}) {
     strings.push(descriptor.value);
   }
   if (Object.keys(value).length !== value.length || new Set(strings).size !== strings.length) return false;
-  const sorted = [...strings].sort((left, right) => Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8')));
+  const sorted = [...strings].sort(compareUtf8);
   return strings.every((value, index) => value === sorted[index]);
 }
 
 function validClassified(value, record) {
-  const exact = exactDataObject(value, [
+  const exact = exactObject(value, [
     'execution', 'outcome', 'failureKind', 'stability', 'reproduction', 'witnessIds',
     'failureFingerprints', 'outputSha256', 'outputChars', 'planFingerprint',
     'environmentFingerprint', 'truncated', 'diagnostics',
-  ]);
+  ]).value ?? null;
   return exact !== null &&
     ['completed', 'not_run', 'spawn_error', 'timeout', 'aborted', 'hung', 'lingering'].includes(value.execution) &&
     ['pass', 'fail', 'unknown'].includes(value.outcome) &&
@@ -317,7 +407,7 @@ function validClassified(value, record) {
 
 function persistedEvidenceMatches(spec, attempt, sealed, evaluation) {
   if (!Array.isArray(evaluation?.cleanup) || evaluation.cleanup.some((entry) => {
-    const exact = exactDataObject(entry, ['kind', 'candidateId', 'attemptId', 'evidenceId', 'path', 'status', 'recoveryPath']);
+    const exact = exactObject(entry, ['kind', 'candidateId', 'attemptId', 'evidenceId', 'path', 'status', 'recoveryPath']).value ?? null;
     return exact === null || entry.kind !== 'evidence' || entry.candidateId !== spec.laneId ||
       entry.attemptId !== attempt || typeof entry.evidenceId !== 'string' || !isAbsolute(entry.path) ||
       entry.status !== 'removed' && entry.status !== 'reaper_pending' ||
@@ -334,12 +424,12 @@ function persistedEvidenceMatches(spec, attempt, sealed, evaluation) {
   for (const entry of ordered) {
     const record = entry?.record;
     const ref = entry?.ref;
-    const exactRecord = exactDataObject(record, [
+    const exactRecord = exactObject(record, [
       'schemaVersion', 'evidenceId', 'attemptId', 'kind', 'repetition', 'baselineRevision', 'baselineTree',
       'candidateRevision', 'candidateTree', 'candidatePatchSha256', 'testPlanFingerprint', 'environmentFingerprint',
       'testDeltaSha256', 'classified',
-    ]);
-    const exactRef = exactDataObject(ref, ['kind', 'candidateId', 'path', 'sha256', 'bytes', 'expiresAt']);
+    ]).value ?? null;
+    const exactRef = exactObject(ref, ['kind', 'candidateId', 'path', 'sha256', 'bytes', 'expiresAt']).value ?? null;
     const expectedId = exactRecord === null ? null : `${attempt}/${record.kind.toUpperCase()}/${record.repetition}`;
     const bytes = exactRecord === null ? null : Buffer.from(`${JSON.stringify(record, null, 2)}\n`, 'utf8');
     const validDelta = record?.kind === 'b0' ? record.testDeltaSha256 === null
@@ -364,13 +454,13 @@ function persistedEvidenceMatches(spec, attempt, sealed, evaluation) {
     paths.add(ref.path);
     expiresAt = ref.expiresAt;
   }
-  ids.sort((left, right) => Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8')));
+  ids.sort(compareUtf8);
   const proofIds = evaluation?.regressionProof?.evidenceIds;
   if (!Array.isArray(proofIds) || new Set(proofIds).size !== proofIds.length ||
       proofIds.some((id) => !ids.includes(id)) ||
       evaluation.regressionProof?.status === 'proved' &&
         (proofIds.length !== ids.length || proofIds.some((id, index) => id !== ids[index]))) return null;
-  return deepFreeze({ ...deepClone(sealed), evidenceIds: ids });
+  return deepFreeze({ ...cloneData(sealed), evidenceIds: ids });
 }
 
 function failureFingerprints(evaluation) {
@@ -385,26 +475,35 @@ function recovery(code, spec, attempt, parent) {
 }
 
 export async function runCandidateLane(spec, deps) {
-  const binding = deepFreeze(deepClone(spec.binding));
+  const binding = deepFreeze(cloneData(spec.binding));
   const attempts = [];
   let ledger = emptyLedger(spec.laneId);
   let previousFingerprint = null;
-  let retryOf = null;
   let finalTests = defaultTests();
   let finalProof = defaultProof(spec.proofRequirement);
   let finalScope = normalizedScope();
   let finalVerdict = null;
-  let stopReason = 'budget_exhausted';
+  let stopReason = REASON.lane_budget_exhausted;
+  // 판정문을 읽지 못한 경우에만 채워진다 — `verifier_verdict_invalid` 의 `{detail}` 인자다.
+  // 봉투 문구를 만드는 쪽(`src/engine.mjs` 의 terminalParams)이 이 값을 그대로 넘긴다.
+  let stopDetail = null;
   let terminalClass = 'rejected';
   let laneRecovery = null;
   let lastSealedParent = spec.baseline?.commit ?? null;
   let latestTerminalSeal = null;
   let totalUsage = emptyUsage();
 
-  for (let ordinal = 1; ordinal <= spec.budget; ordinal += 1) {
+  // ★ 재개된 레인은 자기 서수 1 이 아니라 원본이 봉인한 마지막 서수의 **다음**부터 쓴다(WS3 §3).
+  //   예산은 상한 그대로다: 재사용된 서수만큼 이 실행이 쓸 수 있는 시도가 줄어든다(WS0 §1.2).
+  // ★★ `retryOf` 는 **서수 규칙 그대로**다 — 1 이면 `null`, 아니면 앞 서수의 이름(불변식 9:
+  //   0.2.2 리더가 요구하는 값이 정확히 그것이다, `run-manifest.mjs expectedRetryOf`). 재개된
+  //   레인의 첫 attempt 가 가리키는 앞 서수의 작업은 원본 실행에 있고 이 매니페스트에는 없다.
+  const startOrdinal = Number.isInteger(spec.startOrdinal) && spec.startOrdinal >= 1 ? spec.startOrdinal : 1;
+  let retryOf = startOrdinal > 1 ? attemptId(spec, startOrdinal - 1) : null;
+  for (let ordinal = startOrdinal; ordinal <= spec.budget; ordinal += 1) {
     const id = attemptId(spec, ordinal);
     if (!beforeDeadline(spec, deps) || deps.isAborted?.() === true) {
-      stopReason = 'deadline_exceeded';
+      stopReason = haltCode(deps);
       terminalClass = 'blocked';
       break;
     }
@@ -417,7 +516,7 @@ export async function runCandidateLane(spec, deps) {
       allocation = null;
     }
     if (!allocation || allocation.blocked === true || allocation.ok === false) {
-      stopReason = 'allocation_checkpoint_failed';
+      stopReason = REASON.artifact_allocation_checkpoint_failed;
       terminalClass = 'blocked';
       break;
     }
@@ -425,11 +524,11 @@ export async function runCandidateLane(spec, deps) {
     let writerUsage = emptyUsage();
     let verifierUsage = emptyUsage();
     if (!beforeDeadline(spec, deps)) {
-      const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: 'timeout', writerUsage, verifierUsage, result: 'blocked', feedback: ledger });
+      const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: REASON.provider_deadline_exceeded, writerUsage, verifierUsage, result: 'blocked', feedback: ledger });
       const written = await writeTerminal(deps, attempts, attempt);
-      stopReason = 'deadline_exceeded';
+      stopReason = haltCode(deps);
       terminalClass = 'blocked';
-      if (!written) stopReason = 'attempt_artifact_failed';
+      if (!written) stopReason = REASON.artifact_attempt_write_failed;
       break;
     }
     writerUsage = startUsage(writerUsage);
@@ -437,27 +536,30 @@ export async function runCandidateLane(spec, deps) {
     try {
       writer = await deps.callWriter({
         runId: spec.runId, laneId: spec.laneId, attemptId: id, ordinal, retryOf,
-        binding: deepClone(binding), task: spec.task, plan: spec.plan, feedback: deepClone(ledger),
+        binding: cloneData(binding), task: spec.task, plan: spec.plan, feedback: cloneData(ledger),
       });
       if (writer?.callStarted === false) writerUsage = cancelUsage(writerUsage);
       else writerUsage = settleUsage(writerUsage, writer?.usage);
     } catch {
       writerUsage.incomplete = true;
-      writer = { status: 'effect_unknown' };
+      writer = { status: REASON.provider_outcome_unknown };
     }
     totalUsage = addUsage(totalUsage, writerUsage);
-    let writerResult = OPERATIONAL_RESULTS.has(writer?.status) ? writer.status : writer?.status === 'sealed' ? 'sealed' : 'effect_unknown';
-    if (!beforeDeadline(spec, deps) && writerResult === 'sealed') writerResult = 'effect_unknown';
+    let writerResult = OPERATIONAL_RESULTS.has(writer?.status) ? writer.status : writer?.status === 'sealed' ? 'sealed' : REASON.provider_outcome_unknown;
+    if (!beforeDeadline(spec, deps) && writerResult === 'sealed') writerResult = REASON.provider_outcome_unknown;
     if (writerResult !== 'sealed' || !beforeDeadline(spec, deps)) {
-      const result = writerResult === 'effect_unknown' ? 'effect_unknown'
-        : !beforeDeadline(spec, deps) ? 'timeout' : writerResult;
+      const result = writerResult === REASON.provider_outcome_unknown ? REASON.provider_outcome_unknown
+        : !beforeDeadline(spec, deps) ? REASON.provider_deadline_exceeded : writerResult;
       const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: result, writerUsage, verifierUsage, result: 'blocked', feedback: ledger });
       const written = await writeTerminal(deps, attempts, attempt);
-      stopReason = written ? (result === 'effect_unknown' ? result : !beforeDeadline(spec, deps) ? 'deadline_exceeded' : result) : 'attempt_artifact_failed';
+      stopReason = written
+        ? (result === REASON.provider_outcome_unknown ? result
+          : !beforeDeadline(spec, deps) ? haltCode(deps) : result)
+        : REASON.artifact_attempt_write_failed;
       terminalClass = 'blocked';
-      if (result === 'effect_unknown') {
+      if (result === REASON.provider_outcome_unknown) {
         try { await deps.quarantineWorktree({ path: spec.authoringWorktree.path, attemptId: id, lastSealedParent }); } catch { /* recovery remains exact */ }
-        laneRecovery = recovery('effect_unknown', spec, id, lastSealedParent);
+        laneRecovery = recovery(REASON.provider_outcome_unknown, spec, id, lastSealedParent);
       }
       break;
     }
@@ -473,30 +575,30 @@ export async function runCandidateLane(spec, deps) {
     }
     if (!beforeDeadline(spec, deps)) {
       if (seal?.ok === true && seal.sealed && !Array.isArray(seal.sealed.evidenceIds)) {
-        const sealed = deepFreeze({ ...deepClone(seal.sealed), evidenceIds: [] });
+        const sealed = deepFreeze({ ...cloneData(seal.sealed), evidenceIds: [] });
         lastSealedParent = sealed.commit;
         const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: 'sealed', sealed, writerUsage, verifierUsage, result: 'blocked', feedback: ledger });
         const written = await writeTerminal(deps, attempts, attempt);
         if (written) latestTerminalSeal = { attemptId: id, sealed };
-        stopReason = written ? 'deadline_exceeded' : 'attempt_artifact_failed';
+        stopReason = written ? haltCode(deps) : REASON.artifact_attempt_write_failed;
         terminalClass = 'blocked';
         break;
       }
-      const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: 'timeout', writerUsage, verifierUsage, result: 'blocked', feedback: ledger });
+      const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: REASON.provider_deadline_exceeded, writerUsage, verifierUsage, result: 'blocked', feedback: ledger });
       const written = await writeTerminal(deps, attempts, attempt);
-      stopReason = written ? 'deadline_exceeded' : 'attempt_artifact_failed';
+      stopReason = written ? haltCode(deps) : REASON.artifact_attempt_write_failed;
       terminalClass = 'blocked';
       break;
     }
     if (!seal?.ok || !seal.sealed || Array.isArray(seal.sealed.evidenceIds)) {
-      const writerFailure = seal?.writerResult === 'snapshot_failed' ? 'snapshot_failed' : 'seal_failed';
+      const writerFailure = seal?.writerResult === REASON.git_snapshot_failed ? REASON.git_snapshot_failed : REASON.git_seal_failed;
       const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: writerFailure, writerUsage, verifierUsage, result: 'blocked', feedback: ledger });
       const written = await writeTerminal(deps, attempts, attempt);
-      stopReason = written ? writerFailure : 'attempt_artifact_failed';
+      stopReason = written ? writerFailure : REASON.artifact_attempt_write_failed;
       terminalClass = 'blocked';
       break;
     }
-    const sealedCore = deepFreeze(deepClone(seal.sealed));
+    const sealedCore = deepFreeze(cloneData(seal.sealed));
     lastSealedParent = sealedCore.commit;
 
     let evaluation;
@@ -524,7 +626,7 @@ export async function runCandidateLane(spec, deps) {
       const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: 'sealed', sealed: sealed ?? { ...sealedCore, evidenceIds: [] }, writerUsage, verifierUsage, result: 'blocked', feedback: ledger });
       const written = await writeTerminal(deps, attempts, attempt);
       if (written) latestTerminalSeal = { attemptId: id, sealed: attempt.sealed };
-      stopReason = written ? 'deadline_exceeded' : 'attempt_artifact_failed';
+      stopReason = written ? haltCode(deps) : REASON.artifact_attempt_write_failed;
       terminalClass = 'blocked';
       break;
     }
@@ -532,24 +634,50 @@ export async function runCandidateLane(spec, deps) {
       const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: 'sealed', sealed: sealed ?? { ...sealedCore, evidenceIds: [] }, writerUsage, verifierUsage, result: 'blocked', feedback: ledger });
       const written = await writeTerminal(deps, attempts, attempt);
       if (written) latestTerminalSeal = { attemptId: id, sealed: attempt.sealed };
-      stopReason = written ? cleanupPending ? 'evidence_cleanup_unproven' : evaluation?.operationalFailure?.code ?? 'evidence_authority_mismatch' : 'attempt_artifact_failed';
+      stopReason = written
+        ? cleanupPending ? REASON.evidence_cleanup_unproven
+          : evaluation?.operationalFailure?.code ?? REASON.evidence_authority_mismatch
+        : REASON.artifact_attempt_write_failed;
       terminalClass = 'blocked';
       const leakingEvidence = cleanupPending ? evaluation.cleanup.find((entry) => entry.status === 'reaper_pending') : null;
-      laneRecovery = leakingEvidence ? deepFreeze({ code: 'evidence_cleanup_unproven', path: leakingEvidence.path, lastSealedParent, attemptId: id }) : recovery(
-        stopReason === 'attempt_artifact_failed' ? 'attempt_artifact_failed' : 'evidence_cleanup_unproven',
+      laneRecovery = leakingEvidence ? deepFreeze({ code: REASON.evidence_cleanup_unproven, path: leakingEvidence.path, lastSealedParent, attemptId: id }) : recovery(
+        stopReason === REASON.artifact_attempt_write_failed ? REASON.artifact_attempt_write_failed : REASON.evidence_cleanup_unproven,
         spec, id, lastSealedParent,
       );
       break;
     }
 
-    finalTests = deepClone(evaluation.tests ?? defaultTests());
-    finalProof = deepClone(evaluation.regressionProof ?? defaultProof(spec.proofRequirement));
-    finalScope = normalizedScope(deepClone(evaluation.scope));
-    if (finalScope.flagged === true) {
+    // ★ 복사에 실패하면 **기본값**으로 닫는다. `evaluateAttempt` 는 주입 가능한 이음매라
+    //   `tests` 가 Date·getter·순환을 물고 올 수 있고, 그때 `cloneData` 는 `undefined` 를 낸다.
+    //   그것을 그대로 흘리면 `summary.tests` 가 통째로 사라져 한참 뒤 엔진의 요약 복사에서
+    //   터졌다(실측). 기본값은 "테스트를 못 돌렸다"(`execution: not_run`·`trusted: false`)와
+    //   "증명 없음"이라 **닫는 쪽**이고, 새 reason code 없이 기존 판정이 그대로 처리한다.
+    finalTests = cloneData(evaluation.tests ?? defaultTests()) ?? defaultTests();
+    finalProof = cloneData(evaluation.regressionProof ?? defaultProof(spec.proofRequirement))
+      ?? defaultProof(spec.proofRequirement);
+    // ★★ `scope` 의 복사 실패는 **「생략했다」와 다른 사실이다**(WS5 T1 m1, 이 파일의 ⚠ 가
+    //   가리키던 자리). 예전에는 둘이 한 값으로 접혀 있었다: `cloneData` 가 실패하면
+    //   `undefined` 가 `normalizedScope` 의 `?? {flagged:false,…}` 로 떨어져 **허용**이 됐고,
+    //   그 기본값은 `evaluation.scope` 를 아예 안 준 평가자가 받는 값과 **같은 한 줄**이었다.
+    //   컷이 착지한 지금 그 통과는 허용목록도 승격도 없이 코어 하드가 승인된 것과 같은 결과다.
+    //   고치는 것은 기본값이 아니라 **가르는 것**이다: 안 줬으면 오늘의 기본값(통과)이 맞고,
+    //   줬는데 못 베꼈으면 우리는 그 실행의 범위에 대해 **아무것도 모른다** — 모르는 것은
+    //   승인일 수 없으므로 닫는 쪽 모양(`unreadableScope`)으로 간다.
+    //   ⚠ 그때 봉투는 「flagged · 하드 · 미승인 · 사유 0건」으로 나간다. 사유 0건이 실제 하드
+    //   위반과 구별되는 유일한 표시이고, 전용 어휘를 여기서 만들지 않은 것은 **거부 경로의
+    //   어휘를 T9 이 소유**하기 때문이다(그 태스크가 이 자리를 다시 본다 — 보고서에 적었다).
+    const reportedScope = evaluation.scope;
+    const scopeStated = reportedScope !== undefined && reportedScope !== null;
+    const copiedScope = scopeStated ? cloneData(reportedScope) : undefined;
+    finalScope = scopeStated && copiedScope === undefined ? unreadableScope() : normalizedScope(copiedScope);
+    // ★★ **컷 (2)/셋** (WS5 T4, 스펙 §0 D12). 술어는 `unapprovedScope` 하나가 정하고 이 파일의
+    //   두 자리(여기와 아래 `policyFailure`)가 **같은 것**을 읽는다 — 갈리면 한 자리는 거절하고
+    //   다른 자리는 판정에 안 알리는 실행이 생긴다.
+    if (unapprovedScope(finalScope)) {
       const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: 'sealed', sealed, writerUsage, verifierUsage, result: 'rejected', feedback: ledger });
       const written = await writeTerminal(deps, attempts, attempt);
       if (written) latestTerminalSeal = { attemptId: id, sealed };
-      stopReason = written ? 'policy_failure' : 'attempt_artifact_failed';
+      stopReason = written ? REASON.scope_policy_failure : REASON.artifact_attempt_write_failed;
       terminalClass = written ? 'rejected' : 'blocked';
       break;
     }
@@ -562,7 +690,7 @@ export async function runCandidateLane(spec, deps) {
       const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: 'sealed', sealed, writerUsage, verifierUsage, result: 'rejected', feedback: ledger });
       const written = await writeTerminal(deps, attempts, attempt);
       if (written) latestTerminalSeal = { attemptId: id, sealed };
-      stopReason = written ? 'issue_limit_exceeded' : 'attempt_artifact_failed';
+      stopReason = written ? REASON.verifier_issue_limit_exceeded : REASON.artifact_attempt_write_failed;
       terminalClass = 'rejected';
       break;
     }
@@ -583,7 +711,7 @@ export async function runCandidateLane(spec, deps) {
       verifierUsage = startUsage(verifierUsage);
       try {
         verifierResult = await deps.callVerifier({
-          expected: deepClone(expected), binding: deepClone(binding), feedback: deepClone(ledger),
+          expected: cloneData(expected), binding: cloneData(binding), feedback: cloneData(ledger),
           // ★★ verifier 는 **우리가** 돌린 실행 결과를 알아야 한다(설계 §12.-1: 테스트 결과를
           //   델리게이트가 지어낼 수 없게 하려고 오케스트레이터가 돌린다). 판정 스키마가
           //   `evidenceIds` 를 되돌려 적으라고 요구하는데 그 증거가 무엇을 말했는지 안 보여주면
@@ -629,13 +757,37 @@ export async function runCandidateLane(spec, deps) {
     totalUsage = addUsage(totalUsage, verifierUsage);
     if (!beforeDeadline(spec, deps) || parsed?.ok !== true) {
       const mutated = parsed?.mutation === true;
-      const verifierOperational = parsed?.operational === true;
+      // ★★ 파서가 거절한 경우에만 `detail` 이 있다(`src/verdict.mjs invalid()` — 그 함수의 모든
+      //   갈래가 문자열을 채운다). 없는 경우는 **판정문이 아예 오지 않은 것**이다:
+      //   `callVerifier` 가 던지면 `parsed` 는 undefined 로 남는다.
+      const parserDetail = typeof parsed?.detail === 'string' && parsed.detail !== '' ? parsed.detail : null;
+      // ★★ 던진 호출은 「판정문을 못 읽었다」가 아니라 **검증자 호출의 운영 실패**다. 예전에는 이
+      //   자리가 그것까지 `verifier_verdict_invalid` 로 적었고, 그 코드의 문구는 `{detail}` 을
+      //   요구하는데 detail 이 없어 문구 정본이 던졌다 — 봉투는 사실이 하나도 없는 폴백 문장과
+      //   `envelope_render_degraded` 알림으로 강등됐고, 그러고도 틀린 말을 했다. 엔진은 벤더 예외를
+      //   이미 `verifier_operational_failure` 로 부른다(그 길은 `operationalFailure: true` 로 온다) —
+      //   한 사건은 한 이름을 가져야 하므로 주입된 `callVerifier` 가 던지는 길도 같은 코드다.
+      //   그 결과 `verifier_verdict_invalid` 는 **detail 이 있을 때만** 도달한다.
+      // ★ `parsed?.ok !== true` 를 함께 요구한다: 이 분기는 판정이 **성립했는데** 데드라인이
+      //   지난 경우로도 들어온다(위 조건의 왼쪽). 그때까지 운영 실패로 부르면 레인이 회복
+      //   경로를 달고 워크트리가 리퍼에게 넘어간다 — 데드라인은 그런 사건이 아니다.
+      const verifierOperational = parsed?.operational === true ||
+        parsed?.ok !== true && !mutated && parserDetail === null;
       const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: 'sealed', sealed, writerUsage, verifierUsage, result: mutated ? 'rejected' : 'blocked', feedback: ledger });
       const written = await writeTerminal(deps, attempts, attempt);
       if (written) latestTerminalSeal = { attemptId: id, sealed };
-      stopReason = written ? (!beforeDeadline(spec, deps) ? 'deadline_exceeded' : mutated ? 'verifier_mutation' : verifierOperational ? 'verifier_operational_failure' : 'unverified') : 'attempt_artifact_failed';
+      // ★★ 판정문을 못 읽은 경우의 코드는 **하나**이고(`verifier_verdict_invalid`) 어느 검사가
+      //   걸렀는지는 `parsed.detail` 이 나른다(WS2 §2.2-3). 예전에는 이 자리가 `parsed` 를 읽지
+      //   않고 전부 `unverified` 한 토큰으로 접었다 — 두 번 물어보고도 실패한 이유를 사용자가
+      //   읽을 수 있는 자리가 어디에도 없었다.
+      stopReason = written
+        ? (!beforeDeadline(spec, deps) ? haltCode(deps)
+          : mutated ? REASON.verifier_mutation
+            : verifierOperational ? REASON.verifier_operational_failure : REASON.verifier_verdict_invalid)
+        : REASON.artifact_attempt_write_failed;
+      if (stopReason === REASON.verifier_verdict_invalid) stopDetail = parserDetail;
       terminalClass = mutated ? 'rejected' : 'blocked';
-      if (verifierOperational) laneRecovery = recovery('effect_unknown', spec, id, lastSealedParent);
+      if (verifierOperational) laneRecovery = recovery(REASON.provider_outcome_unknown, spec, id, lastSealedParent);
       break;
     }
 
@@ -646,7 +798,7 @@ export async function runCandidateLane(spec, deps) {
       const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: 'sealed', sealed, writerUsage, verifierUsage, result: 'rejected', feedback: ledger });
       const written = await writeTerminal(deps, attempts, attempt);
       if (written) latestTerminalSeal = { attemptId: id, sealed };
-      stopReason = written ? 'issue_limit_exceeded' : 'attempt_artifact_failed';
+      stopReason = written ? REASON.verifier_issue_limit_exceeded : REASON.artifact_attempt_write_failed;
       terminalClass = 'rejected';
       break;
     }
@@ -661,14 +813,15 @@ export async function runCandidateLane(spec, deps) {
       machine: machineState(evaluation),
       proof: proofState(evaluation, spec.proofRequirement),
       verifier: parsed,
-      policyFailure: finalScope.flagged === true,
+      // 위 컷과 **같은 술어**다(WS5 T4). 승인된 플래그는 판정에 정책 실패로 안 실린다.
+      policyFailure: unapprovedScope(finalScope),
       budgetRemaining: ordinal < spec.budget,
       stagnated: previousFingerprint === fingerprint,
       openIssueCount: ledger.openIds.length,
     });
     previousFingerprint = fingerprint;
     const result = decision.action === 'accept' ? 'accepted'
-      : decision.action === 'stagnate' ? 'stagnated'
+      : decision.action === 'stagnate' ? REASON.lane_stagnated
         : decision.action === 'reject' ? 'rejected' : decision.action;
     const attempt = normalizedAttempt({
       spec, binding, ordinal, retryOf, writerResult: 'sealed', sealed,
@@ -677,13 +830,14 @@ export async function runCandidateLane(spec, deps) {
     });
     const written = await writeTerminal(deps, attempts, attempt);
     if (!written) {
-      stopReason = 'attempt_artifact_failed';
+      stopReason = REASON.artifact_attempt_write_failed;
       terminalClass = 'blocked';
-      laneRecovery = recovery('attempt_artifact_failed', spec, id, lastSealedParent);
+      laneRecovery = recovery(REASON.artifact_attempt_write_failed, spec, id, lastSealedParent);
       break;
     }
     latestTerminalSeal = { attemptId: id, sealed };
     stopReason = decision.reason;
+    stopDetail = null;
     terminalClass = decision.terminalClass ?? 'rejected';
     if (decision.action !== 'repair') break;
     retryOf = id;
@@ -695,10 +849,10 @@ export async function runCandidateLane(spec, deps) {
       const persisted = await deps.persistCandidatePatch({
         laneId: spec.laneId,
         sourceAttemptId: latestTerminalSeal.attemptId,
-        sealed: deepClone(latestTerminalSeal.sealed),
+        sealed: cloneData(latestTerminalSeal.sealed),
       });
-      const exactPersisted = exactDataObject(persisted, ['sourceAttemptId', 'ref', 'empty', 'files']);
-      const ref = exactDataObject(persisted?.ref, ['kind', 'candidateId', 'path', 'sha256', 'bytes', 'expiresAt']);
+      const exactPersisted = exactObject(persisted, ['sourceAttemptId', 'ref', 'empty', 'files']).value ?? null;
+      const ref = exactObject(persisted?.ref, ['kind', 'candidateId', 'path', 'sha256', 'bytes', 'expiresAt']).value ?? null;
       const validFiles = canonicalStrings(persisted?.files, { max: 10_000 }) && persisted.files.every((path) =>
         path.length > 0 && path.length <= 1_024 && !isAbsolute(path) && !path.includes('\\') &&
         !path.split('/').some((part) => part === '' || part === '.' || part === '..'));
@@ -712,24 +866,24 @@ export async function runCandidateLane(spec, deps) {
           !validFiles || persisted.empty && persisted.files.length !== 0) {
         throw new Error('candidate artifact failed');
       }
-      patch = deepClone(persisted);
+      patch = cloneData(persisted);
     } catch {
       terminalClass = 'blocked';
-      stopReason = 'candidate_artifact_failed';
-      laneRecovery = recovery('candidate_artifact_failed', spec, latestTerminalSeal.attemptId, lastSealedParent);
+      stopReason = REASON.artifact_candidate_write_failed;
+      laneRecovery = recovery(REASON.artifact_candidate_write_failed, spec, latestTerminalSeal.attemptId, lastSealedParent);
     }
   }
 
   if (attempts.artifactFailure) {
-    stopReason = 'attempt_artifact_failed';
+    stopReason = REASON.artifact_attempt_write_failed;
     terminalClass = 'blocked';
-    laneRecovery = recovery('attempt_artifact_failed', spec, attempts.artifactFailure.attemptId, lastSealedParent);
+    laneRecovery = recovery(REASON.artifact_attempt_write_failed, spec, attempts.artifactFailure.attemptId, lastSealedParent);
   }
   const sortedAttempts = [...attempts].sort((left, right) => left.ordinal - right.ordinal);
   const usage = totalUsage;
   const summary = {
     candidateId: spec.laneId,
-    binding: deepClone(binding),
+    binding: cloneData(binding),
     terminalClass,
     patch,
     tests: finalTests,
@@ -739,6 +893,7 @@ export async function runCandidateLane(spec, deps) {
     scope: finalScope,
     attempts: sortedAttempts,
     stopReason,
+    stopDetail,
     crossVerificationCompleted: finalVerdict !== null,
     usage,
     judgeView: null,
@@ -747,10 +902,10 @@ export async function runCandidateLane(spec, deps) {
   if (typeof deps.buildJudgeView === 'function') {
     try {
       const judgeView = deps.buildJudgeView({
-        candidate: deepFreeze(deepClone(summary)),
+        candidate: deepFreeze(cloneData(summary)),
         candidateId: spec.laneId,
         sourceAttemptId: patch?.sourceAttemptId ?? null,
-        finalLedger: deepFreeze(deepClone(ledger)),
+        finalLedger: deepFreeze(cloneData(ledger)),
       });
       if (judgeView !== null) {
         if (!validJudgeView(judgeView)) throw new Error('invalid judge view');

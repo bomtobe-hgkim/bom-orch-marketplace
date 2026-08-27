@@ -1,13 +1,62 @@
-import { spawn } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
-import { lstat, open, readdir, readFile, rm, stat } from 'node:fs/promises';
+import { lstat, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { timeoutSignal } from './deadline.mjs';
-import { runGit } from './git.mjs';
+// ★ 「셸 없이 npm 을 띄우는 법」의 정본은 이제 `src/deps-provision.mjs` 다(WS4a 태스크 5).
+//   러너의 npm 폴백과 의존성 제공기가 **같은 하나**를 알아야 한다 — 정본이 둘이면 한쪽만
+//   배치(Windows/POSIX 두 갈래)를 배우는 날이 오고, 그 호스트에서 폴백이 통째로 죽는다.
+//   재수출하는 이유는 이 이름의 기존 수입부(테스트 · 아래 한 호출부)를 한 자리로 유지하기
+//   위해서다. 방향은 한쪽이다: test-runner → deps-provision, 반대는 없다.
+import { findNpmCli } from './deps-provision.mjs';
 import { buildChildEnv } from './providers/child-env.mjs';
-import { resolveBinary } from './providers/resolve-binary.mjs';
 import { canonical } from './real-path.mjs';
+// ★ 테스트 명령의 유도와 고정 항목 읽기는 `src/test-discovery.mjs` 다(WS4a 태스크 6).
+//   대조가 유도와 **같은 함수**를 써야 정상 워크트리가 위조로 잡히지 않으므로, 되읽는 넷도
+//   저쪽에서 온다. 방향은 한쪽이다: test-runner → test-discovery.
+import {
+  PYTEST_BOOTSTRAP,
+  PYTEST_ENV,
+  contentDigest,
+  defaultResolveTool,
+  deriveTestCommand,
+  extractIniSection,
+  newDerivation,
+  readDefinitionValue,
+  readPinValue,
+} from './test-discovery.mjs';
+// ★ 증거 파서·어댑터·소유 이벤트 파일의 정본은 `src/test-evidence.mjs` 다(WS4a 태스크 6).
+//   방향은 한쪽이다: test-runner → test-evidence. 그쪽은 이 파일을 수입하지 않는다 — 계획을
+//   만들고 자식을 띄우는 것은 여기고, 그 자식이 남긴 바이트를 읽는 것은 저쪽이다.
+import {
+  ADAPTER_EVIDENCE_POLICY,
+  DEFAULT_JUNIT_WITNESS_POLICY,
+  DEFAULT_NODE_WITNESS_POLICY,
+  DEFAULT_PYTEST_WITNESS_POLICY,
+  MISSING_DEP_SIGNS,
+  SHA256_PATTERN,
+  UNOWNED_JUNIT_WITNESS_POLICY,
+  cleanupOwnedEvidence,
+  createOwnedEventFile,
+  eventFileUnchanged,
+  insertNodeReporter,
+  pathUnderRoot,
+  persistableRecord,
+  prepareDeclaredResults,
+  readDeclaredResults,
+  readOwnedEvidence,
+  resolveTestAssetUrl,
+  safeRelativeSourcePath,
+} from './test-evidence.mjs';
+// ★ 자식을 띄우고 그 출력을 상한 안에서 모으는 기계는 `src/test-spawn.mjs` 다(WS4a 태스크 6).
+//   방향은 한쪽이다: test-runner → test-spawn. 저쪽은 무엇을 돌릴지 모른다 — 이 파일이 고정값을
+//   대조하고 환경을 짓고 나서야 검증된 넷을 넘긴다.
+import { DEFAULT_TIMEOUT_MS, WINDOWS, spawnAndCollect } from './test-spawn.mjs';
+import { deepFreeze } from './util/freeze.mjs';
+import { hashJson, sha256 } from './util/hash.mjs';
+import { hasExactKeys } from './util/objects.mjs';
+import { clipCounted, compareUtf8 } from './util/strings.mjs';
+import { REASON } from './reason-codes.mjs';
+import { fail, renderNotice } from './reason-text.mjs';
+import { errorText } from './util/errors.mjs';
 
 /**
  * 테스트를 **오케스트레이터가 직접 돌린다.**
@@ -62,731 +111,30 @@ import { canonical } from './real-path.mjs';
  * 테스트를 돌린다는 것은 델리게이트가 쓴 코드를 실행한다는 뜻이다. 실행되는 코드가 무엇을
  * 하는지는 이 모듈의 통제 밖이고, 성립하는 경계는 여전히 "워크트리 안에서 돈다" 하나뿐이다
  * (`src/worktree.mjs` 의 같은 문단). 이 모듈이 더하는 것은 **결과의 출처**뿐이다.
+ *
+ * ## 나간 것과 남은 것 (WS4a 태스크 6, 실측)
+ *
+ * 세 잎으로 나갔다: 명령 유도와 고정 항목 읽기는 `src/test-discovery.mjs`(944), 자식을 띄우고
+ * 출력을 상한 안에서 모으는 기계는 `src/test-spawn.mjs`(352), 어댑터 증거의 파서·분류기는
+ * `src/test-evidence.mjs`(1,068 — 그 아래 `src/xml-subset.mjs`(254)가 한 겹 더 있다)다. 여기 남은 것은 **계획**(policy v2 의 동결·지문·실행 파일과
+ * 런처의 재검증)과 **거부**(스폰 직전의 고정값 대조)와 그 둘을 잇는 실행 하나다 — 2,698 → 1,274
+ * (태스크 6 이 1,069 에 착지시킨 뒤 태스크 7·그 수정 라운드·최종 수정 파동이 설정 소비와 이음매 셋을 더했다).
+ *
+ * ## 프로젝트 설정 네 키의 소비 (WS4a 태스크 7)
+ *
+ * `.bom-orch.json` 의 `tests.reporter`·`resultsPath`·`timeoutMs`·`cwd` 를 **여기서** 소비한다.
+ * 넷 중 `reporter` 하나만 계획 객체에 닿고(`adapterId` 는 `planFingerprint` 의 입력이다 — 다른
+ * 어댑터는 다른 계획이다), 나머지 셋은 얼어붙은 계획의 **사설 런타임**(`baselineConfig`)을 타고
+ * `runFrozenTests` 로 간다. 계획 객체에 실을 수 없는 이유는 알림과 같다: 키 집합이 정확히
+ * `PLAN_KEYS` 여야 하고 그중 지문 말고는 전부 지문의 입력이라, 상한 한 줄이 지문을 바꾸면
+ * 재개의 계획 관문이 같은 프로젝트를 다른 계획이라고 말한다.
+ *
+ * ★ 실측 폐포: **28개 모듈 / 12,062줄**(자기 자신 1,274 포함). 세 잎 중 어느 것도 이 파일을
+ *   수입하지 않고, 저장소 모듈(`run-*`)도 `engine` 도 없다 — 방향은 한쪽이다(WS5 T3 이 정본 export 로 `test-discovery` 를 73줄, 그 수정 파도가 다시 66줄 늘렸고, 받는 쪽이 `patch-scope` 라 모듈 수는 그대로다). T3 재심 N1–N3 수정 파도: `test-discovery` 가 다시 25줄 늘어 9,979 -> 10,004(모듈 수는 그대로 — 늘어난 것은 주석뿐이다).
  */
 
-/**
- * 자식 출력의 상한(문자). 상한이 걸리는 자리는 둘이다: 여기서 100,000자로 자르고, MCP
- * 결과로 나갈 때 봉투가 `src/envelope.mjs` 의 `MAX_CONTENT_CHARS`(10,000자)로 한 번 더
- * 자른다.
- *
- * 두 값을 다르게 두는 이유: 러너의 소비자는 MCP 클라이언트만이 아니다. 검증·학습 단계가
- * 실패 로그를 읽어야 하고, 그 용도에는 10,000자가 너무 짧다. 대신 **MCP 로 내보내는
- * 호출부는 이 값을 그대로 실으면 안 된다** — 봉투가 꼬리부터 잘라내므로, 필요한 구간을
- * 호출부가 직접 골라야 한다.
- */
-export const MAX_OUTPUT_CHARS = 100_000;
-
-/**
- * pytest 를 **cwd 를 임포트 경로 맨 뒤에 두고** 띄우는 부트스트랩.
- *
- * ## 왜 `-m pytest` 가 아닌가 (실측, 진짜 pytest 9.1.1 / CPython 3.14.6)
- *
- * `python -m pytest` 는 cwd 를 `sys.path[0]` 에 넣는다. 그러면 워크트리 루트의 임포트
- * 이름 공간 **전체**가 도구 해석 경로가 된다 — `pytest/` 디렉터리 · `_pytest/` ·
- * `pluggy.py` · `iniconfig.py` · `py.py` 중 아무거나 하나만 놓으면 실패하는 스위트가
- * `exit 0` 이 됐고, 스위트는 수집조차 되지 않았다. 이름을 열거해서 막는 길은 늘 뒤처진다.
- *
- * ## 왜 `PYTHONSAFEPATH=1` 단독이 아닌가 (실측)
- *
- * 그것만 쓰면 cwd 가 `sys.path` 에서 **빠져** 평범한 flat-layout 프로젝트가 깨진다:
- * 루트 `mypkg.py` + `tests/test_a.py` 의 `from mypkg import add` 가 `1 passed` 에서
- * `exit 2 / collection error` 가 된다(루트 `conftest.py` 가 있으면 pytest 가 그 basedir 를
- * 넣어 주어 우연히 살아난다 — 없는 배치가 깨진다).
- *
- * ## 이 처방
- *
- * `PYTHONSAFEPATH=1` 로 cwd 를 앞에서 빼고, 부트스트랩이 **맨 뒤에** 다시 붙인다.
- * site-packages 가 앞서므로 설치된 진짜 pytest/pluggy 가 이기고, cwd 는 여전히
- * `sys.path` 에 있어 flat-layout 의 `import mypkg` 가 산다. 실측:
- *
- *     하이재킹 6종(pytest/ · _pytest/ · pluggy.py · iniconfig.py · py.py · pytest.py)
- *       -> 전부 `1 failed` exit 1 — 진짜 스위트가 돈다
- *     정상 4종(flat 모듈 · flat 패키지 · src-layout · conftest 픽스처)
- *       -> 전부 `1 passed` exit 0
- *     종료 코드 보존: 0 / 1 / 4(잘못된 인자) / 5(테스트 0개) 그대로
- *
- * 한 줄이고 argv 원소 하나로 넘어간다 — `shell:false` 계약과 무관하다.
- *
- * ⚠ 남는 틈: cwd 가 뒤에라도 남으므로 site-packages 에 **없는** 이름은 여전히 워크트리에서
- *   임포트될 수 있다. pytest 자신은 그런 이름을 임포트하지 않지만 서드파티 플러그인이
- *   그럴 수 있다.
- */
-export const PYTEST_BOOTSTRAP =
-  'import sys,os; sys.path.append(os.getcwd()); import pytest; raise SystemExit(pytest.main(sys.argv[1:]))';
-
-/** 위 부트스트랩의 나머지 절반. allowlist 밖의 계산값이라 `extra` 로 넘긴다. */
-/**
- * ★ `PYTHONDONTWRITEBYTECODE` 가 필요한 이유(실측): 플러그인은 복사되지 않고
- *   `PYTHONPATH=<repo>/src/test-reporters` 로 **제자리에서** import 된다. 그러면 Python 이
- *   그 옆에 `__pycache__/pytest_events.cpython-*.pyc` 를 쓴다 — 소스 트리에 빌드 산출물이
- *   생기고, `src/**` 를 통째로 복사하는 마켓플레이스 exporter 가 **그 .pyc 를 두 호스트
- *   플러그인 루트에 그대로 배포한다**(실측: 내보낸 파일 목록에 두 건이 나왔다).
- *   테스트를 한 번 돌린 기계에서 릴리스를 만들면 특정 Python·pytest 버전에 묶인 바이트코드가
- *   패키지에 섞인다.
- */
-const PYTEST_ENV = Object.freeze({ PYTHONSAFEPATH: '1', PYTHONDONTWRITEBYTECODE: '1' });
-
-/**
- * 이 csproj 이 **테스트 프로젝트**라는 양성 증거.
- *
- * 실측: 테스트 프로젝트가 아닌 루트 csproj 에 `dotnet test` 를 돌리면 컴파일이 깨져
- * 있어도 아무것도 하지 않고 `exit 0` 이다 — 적대자 없이 `passed:true / verified` 가
- * 나간다. 루트에 앱/라이브러리, 테스트는 `tests/*.Tests.csproj` 가 .NET 저장소의 표준
- * 배치라 드문 일이 아니고, 그 부류 전체에서 §7 의 실행 기반 보상이 상수 "통과"가 된다.
- *
- * 증거가 없으면 이 후보를 건너뛴다 — "추측해서 엉뚱한 프로젝트를 돌리느니 null 이 낫다"는
- * `deriveTestCommand` 의 기존 방침 그대로다.
- */
-const CSPROJ_TEST_EVIDENCE =
-  /<IsTestProject>\s*true|Microsoft\.NET\.Test\.Sdk|Microsoft\.Testing\.Platform|Include\s*=\s*"(?:xunit|nunit|mstest)/i;
-
-/** 기본 시간 상한. 테스트 스위트는 길다 — `runGit` 의 30초 기준으로는 못 잰다. */
-const DEFAULT_TIMEOUT_MS = 600_000;
-
-/**
- * kill 뒤 `close` 를 기다리는 유예. 이 시간을 넘기면 자식의 생사와 무관하게 결과를 낸다.
- *
- * `kill()` 은 부탁이지 보장이 아니고, 특히 `node --run` 은 스크립트의 명령을 손자로
- * 띄운다 — 자식만 죽고 손자가 우리 파이프의 쓰기 끝을 쥐고 있으면 `close` 가 영영 오지
- * 않는다.
- *
- * ⚠ **남는 위험**: 직접 자식은 `onSpawn` 훅으로 배선 계층에 넘어가 리퍼 원장에 오르고
- *   (`src/engine.mjs`), 그쪽이 데드라인에 트리 킬을 건다. 그래도 **reparent 된 손자**는
- *   남는다 — `taskkill /T` 도 POSIX 그룹 신호도 살아 있는 트리만 훑기 때문이다
- *   (`src/reaper.mjs` 의 같은 문단). 즉 하드 데드라인이 발동하면 델리게이트가 쓴 코드를
- *   돌리던 손자가 우리 권한으로 워크트리 안에 남을 수 있고(실측: 봉투가 나간 뒤 +8초에도
- *   살아 있었다), 워크트리 제거도 그 프로세스가 파일을 쥐고 있으면 걸린다. 봉투는 최소한
- *   그 사실을 `notes` 로 알린다.
- */
-const KILL_GRACE_MS = 3_000;
-
-/**
- * `exit` 은 왔는데 `close` 가 안 올 때 파이프를 더 기다리는 유예.
- *
- * 자식이 스스로 끝났다면 종료 코드는 이미 우리 손에 있다. 그때까지 도착하지 않은 출력만
- * 기다리면 되고, 만료되면 **그 종료 코드로** 결과를 낸다. 이것이 없으면 배경 프로세스를
- * 남긴 스위트(watcher·dev 서버)에서 `close` 가 영영 오지 않아, 통과한 스위트가 기본
- * 설정으로 603초 뒤에 `passed:false / timedOut:true` 로 보고됐다(실측).
- *
- * 출력이 계속 도착하는 동안에는 다시 센다 — 큰 출력을 드레인하는 중에 끊으면 안 된다.
- */
-const DRAIN_GRACE_MS = 3_000;
-
-/**
- * `exit` 뒤 드레인에 쓸 수 있는 **절대 상한**. 갱신되지 않는다.
- *
- * 갱신만 있으면 계속 찍는 배경 프로세스에서 유예가 영영 늘어나 데드라인 전체를 쓴다
- * (실측: 200ms 마다 찍는 손자에서 timeoutMs 8000 + KILL_GRACE 3000 = 11,020ms, 기본
- * 설정이면 603초). 그리고 그 경로는 `hung` 으로 나가 **통과한 스위트가 unverified** 가
- * 된다. 종료 코드는 이미 확정이므로 여기서 끊어 잃는 것은 꼬리 출력뿐이다.
- */
-const DRAIN_MAX_MS = 10_000;
-
-/** `--run` 프로브의 시간 상한. 실측으로 즉시 끝나지만 매달리게 둘 수는 없다. */
-const PROBE_TIMEOUT_MS = 10_000;
-
-const WINDOWS = process.platform === 'win32';
-
-const GENERIC_RECOVERY = '오류 로그를 확인하거나 다시 시도하세요.';
-
-/** `src/git.mjs`·`src/worktree.mjs` 의 내부 실패 봉투와 같은 모양. */
-function blocked(error, recovery) {
-  return { blocked: true, error, recovery: recovery && recovery !== '' ? recovery : GENERIC_RECOVERY };
-}
-
-// ── 정의 추출 (유도와 대조가 같은 함수를 쓴다) ────────────────────────────
-
-/**
- * `Makefile` 에서 한 타깃의 블록(타깃 줄 + 레시피 줄)을 뽑는다. 없으면 null.
- *
- * 블록만 뽑는 이유: 파일 전체를 고정하면 무관한 타깃 편집이 위조로 잡힌다.
- */
-function extractMakeTarget(text, target) {
-  const lines = String(text).split(/\r?\n/);
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    // `.PHONY: test` 는 선언이지 타깃이 아니다.
-    if (line.startsWith('.')) continue;
-    // `CFLAGS := -O2` 같은 대입은 타깃이 아니다 — `:=` 를 부정 전방탐색으로 뺀다.
-    const match = /^([^\s:=][^:=]*)\s*:(?!=)/.exec(line);
-    if (!match) continue;
-    if (!match[1].trim().split(/\s+/).includes(target)) continue;
-
-    const block = [line.trimEnd()];
-    const pending = [];
-    for (let j = i + 1; j < lines.length; j += 1) {
-      const next = lines[j];
-      if (next.startsWith('\t')) {
-        block.push(...pending, next.trimEnd());
-        pending.length = 0;
-        continue;
-      }
-      // 레시피 중간의 빈 줄은 타깃을 끝내지 않는다. 뒤에 레시피가 더 오면 살린다.
-      if (next.trim() === '') {
-        pending.push('');
-        continue;
-      }
-      break;
-    }
-    return block.join('\n');
-  }
-  return null;
-}
-
-/** ini/toml 파일에서 한 구획을 뽑는다(머리글 줄 포함). 없으면 null. */
-function extractIniSection(text, header) {
-  const lines = String(text).split(/\r?\n/);
-  const start = lines.findIndex((line) => line.trim() === header);
-  if (start < 0) return null;
-
-  const out = [lines[start].trim()];
-  for (let i = start + 1; i < lines.length; i += 1) {
-    if (/^\s*\[/.test(lines[i])) break;
-    out.push(lines[i].trimEnd());
-  }
-  while (out.length > 0 && out[out.length - 1] === '') out.pop();
-  return out.join('\n');
-}
-
-const PYTEST_SECTION = '[tool.pytest.ini_options]';
-const NPM_TEST_SCRIPT = 'test';
-
-/**
- * 줄끝을 LF 로 맞춘다.
- *
- * 고정은 프로젝트의 **작업 사본**을 읽고 대조는 워크트리의 **새 체크아웃**을 읽는다.
- * `.editorconfig` 가 LF 인 저장소를 Git for Windows 기본(`core.autocrlf=true`)으로 쓰면
- * 두 쪽 바이트가 다르다 — 정규화하지 않으면 정상 프로젝트가 영구 거부되고 봉투가 눈으로
- * 똑같은 두 값을 놓고 "델리게이트가 바꿨습니다"라고 말한다(실측). `extractMakeTarget` ·
- * `extractIniSection` 은 이미 줄 단위로 잘라 붙이므로 같은 처리를 해 왔다.
- */
-const normalizeEol = (text) => text.replace(/\r\n/g, '\n');
-
-async function readTextFile(root, name) {
-  try {
-    return normalizeEol(await readFile(join(root, name), 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-/** `package.json` 의 한 스크립트. 없거나 공백뿐이거나 JSON 이 깨졌으면 null. */
-async function readNpmScript(root, name) {
-  const text = await readTextFile(root, 'package.json');
-  if (text === null) return null;
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return null;
-  }
-  const script = parsed?.scripts?.[name];
-  if (typeof script !== 'string' || script.trim() === '') return null;
-  return script;
-}
-
-const readNpmTestScript = (root) => readNpmScript(root, NPM_TEST_SCRIPT);
-
-/** 루트에서 이 확장자로 끝나는 파일 이름들(정렬). 디렉터리는 세지 않는다. */
-async function rootFilesBySuffix(root, suffix) {
-  try {
-    const entries = await readdir(root, { withFileTypes: true });
-    return entries.filter((e) => e.isFile() && e.name.toLowerCase().endsWith(suffix)).map((e) => e.name).sort();
-  } catch {
-    return [];
-  }
-}
-
-/**
- * 고정해 둔 **주 정의**를 워크트리에서 다시 읽는다. 유도할 때와 같은 추출 함수를 쓴다 —
- * 두 곳이 갈리면 정상 워크트리가 위조로 잡히거나 그 반대가 된다.
- *
- * @returns 문자열(읽었다) 또는 null(읽지 못했다 — 파일이 없거나 정의가 사라졌다)
- */
-async function readDefinitionValue(root, definition) {
-  const { file, kind } = definition;
-  if (kind === 'npm-script') return readNpmScript(root, definition.script ?? NPM_TEST_SCRIPT);
-
-  const text = await readTextFile(root, file);
-  if (text === null) return null;
-  if (kind === 'file-text') return text;
-  if (kind === 'make-target') return extractMakeTarget(text, NPM_TEST_SCRIPT);
-  if (kind === 'ini-section') return extractIniSection(text, PYTEST_SECTION);
-  return null;
-}
-
-// ── ★★ 고정 대상: 열거가 아니라 **관계**를 고정한다 ────────────────────────
-//
-// 규칙은 하나다: **워크트리의 고정 항목은 프로젝트의 것과 내용이 같거나 아예 없어야 한다.**
-//
-// 앞선 라운드는 "그 도구가 읽는 입력 전체"라는 축을 잡고 **이름 열거**로 좁혔고, 세 갈래
-// 전부에서 열거가 뒤처졌다(전부 실측 재현, 전부 `match`/`verified`/`passed:true`):
-//
-//   · `node_modules/.bin` 은 **이름만** 봤다. 델리게이트는 추측할 필요가 없다 —
-//     `scripts.test` 가 부를 이름을 그대로 알려 주고(`"test":"jest"` → `jest.cmd`),
-//     그 이름은 의존성이 설치된 프로젝트라면 반드시 고정 집합 안에 있다.
-//   · 파이썬은 `pytest.py` 하나만 막았다. cwd 가 `sys.path[0]` 이라는 사실이 여는 것은
-//     이름 하나가 아니라 루트의 임포트 이름 공간 전체다(`pytest/` · `_pytest/` ·
-//     `pluggy.py` · `iniconfig.py` · `py.py` 가 전부 뚫렸다). 그 축은 열거가 아니라
-//     **임포트 순서**로 닫았다(PYTEST_BOOTSTRAP 주석 참조).
-//   · MSBuild 는 `Directory.Build.rsp`(명령줄 자체를 바꾼다)와 `*.slnx`(dotnet 이 아예
-//     다른 프로젝트를 돌린다)가 빠져 있었다. rsp 축은 `-noAutoResponse` 로 채널을 닫았다.
-//
-// **값이 `null` 일 수 있다는 것이 두 번째 요점이다** — "프로젝트에는 없었다"도 고정값이라
-// 워크트리에 새로 생기면 거부된다.
-//
-// ## 무엇을 비교하는가
-//
-//   package.json : scripts.test(주) · scripts.pretest · scripts.posttest · .npmrc ·
-//                  node_modules/.bin 의 **각 항목 내용**
-//   csproj       : 그 csproj 전체 텍스트(주) · Directory.Build.props/.targets ·
-//                  Directory.Packages.props · nuget.config · NuGet.config ·
-//                  Directory.Build.rsp · MSBuild.rsp · dotnet.config · global.json ·
-//                  루트의 *.sln / *.slnx / *.slnf / *.csproj **각각의 내용**
-//   Makefile     : test 타깃 블록(주) · GNUmakefile/Makefile/makefile 전체 텍스트
-//   pytest       : pytest.ini 또는 [tool.pytest.ini_options](주) · 나머지 설정 파일
-//                  (pytest.ini · pyproject.toml · tox.ini · setup.cfg) · conftest.py
-//
-// ## 이 목록 밖에 남는 것 (닫지 않았다)
-//
-//   · **조상 디렉터리의 `node_modules/.bin`.** 실측 정정: `node --run` 은 cwd 것 하나가
-//     아니라 조상들의 `.bin` 을 전부 순서대로 PATH 앞에 붙인다. 워크트리 밖이라 델리게이트가
-//     쓸 수 없지만 우리 고정 대상도 아니다.
-//   · 하위 디렉터리의 `conftest.py` · `Directory.Build.props` · csproj — 루트만 본다.
-//     하위까지 훑으면 델리게이트가 쓰는 것이 정상인 파일들과 뒤섞인다. `*.slnx` 가 하위
-//     프로젝트를 가리키면 그 조합이 실행 경로를 바꾸지만, slnx 자체는 고정된다.
-//   · `include` 지시자가 끌어오는 파일, MSBuild 의 `<Import>` 대상, npm 의 사용자·전역
-//     설정 — 이름을 미리 알 수 없다.
-//   · **줄끝 차이는 무시한다**(아래 `contentDigest`). 그래서 줄끝만 바꾸는 변경은 못 잡는다.
-//     설정 파일의 의미가 줄끝으로 바뀌지는 않는다.
-//   · **추적되지 않는 파일의 삭제.** 아래 `tracked` 참조 — git 이 답을 주지 못하면
-//     "이식되지 않았다"로 본다.
-//   · 스위트 자신이 임포트하는 코드. 그건 델리게이트가 쓰는 것이 정상이고, 이 모듈이
-//     맨 위에서 범위 밖이라고 적은 축이다.
-
-/**
- * 내용 지문. 줄끝을 LF 로 맞춘 뒤 sha256 한다.
- *
- * 왜 줄끝을 맞추는가(실측): 고정은 프로젝트의 **작업 사본**을 읽고 대조는 워크트리의
- * **새 체크아웃**을 읽는다. `.editorconfig` 가 LF 인 저장소를 Git for Windows 기본
- * (`core.autocrlf=true`)으로 쓰면 두 쪽 바이트가 다르다. 그대로 비교했더니 지원 대상
- * 픽스처 다섯 중 넷이 막혔고, 봉투는 눈으로 완전히 같은 두 값을 나란히 놓고 "델리게이트가
- * 바꿨습니다"라고 말했다.
- *
- * 왜 내용 자체가 아니라 지문인가: 이 값은 봉투를 타고 MCP 결과로 나간다. `.npmrc` ·
- * `nuget.config` 에는 인증 토큰이 들어가고, 실제로 프로젝트의 토큰이 원문으로 실렸다.
- */
-function contentDigest(buffer) {
-  const normalized = Buffer.from(buffer.toString('binary').replace(/\r\n/g, '\n'), 'binary');
-  return {
-    digest: createHash('sha256').update(normalized).digest('hex'),
-    bytes: buffer.length,
-    lines: normalized.toString('binary').split('\n').length,
-  };
-}
-
-/** 파일 하나의 지문. 없으면 null. 디렉터리·심링크는 읽지 않는다(아래 kindOf 참조). */
-async function fileDigest(root, name) {
-  try {
-    return contentDigest(await readFile(join(root, name)));
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 한 디렉터리 안의 `{ 이름: 지문 }`. 디렉터리가 없으면 빈 객체.
- *
- * ★ 심링크·정션·디렉터리는 지문 대신 그 사실을 값으로 남긴다. `readFile` 은 링크를 따라
- *   가므로 내용만 비교하면 "같은 파일을 가리키는 링크"와 "그 내용을 가진 진짜 파일"을
- *   구분하지 못한다. 대상은 워크트리 밖일 수 있다.
- */
-async function dirDigests(root, relative, suffix) {
-  const out = {};
-  let entries;
-  try {
-    entries = await readdir(join(root, relative), { withFileTypes: true });
-  } catch {
-    return out;
-  }
-  for (const entry of entries.sort((a, b) => (a.name < b.name ? -1 : 1))) {
-    // 확장자로 좁힌 고정은 그 확장자만 읽는다 — 루트 전체를 해시하면 델리게이트가 쓴
-    // 큰 산출물까지 매 실행 두 번씩 읽게 된다.
-    if (typeof suffix === 'string' && !entry.name.toLowerCase().endsWith(suffix)) continue;
-    if (entry.isSymbolicLink()) out[entry.name] = { digest: 'symlink', bytes: 0, lines: 0 };
-    else if (entry.isDirectory()) out[entry.name] = { digest: 'directory', bytes: 0, lines: 0 };
-    else out[entry.name] = (await fileDigest(root, join(relative, entry.name))) ?? { digest: 'unreadable', bytes: 0, lines: 0 };
-  }
-  return out;
-}
-
-const npmScriptPin = (name) => ({ kind: 'npm-script', file: 'package.json', key: `scripts.${name}`, script: name });
-const filePin = (name) => ({ kind: 'file-digest', file: name, key: name });
-const suffixPin = (suffix) => ({ kind: 'dir-digests', file: '.', suffix, key: `루트의 *${suffix}` });
-
-/** 고정 항목 하나를 한 트리에서 읽는다. `null` 은 "없다"이고, 그것도 고정값이다. */
-async function readPinValue(root, entry) {
-  if (entry.kind === 'npm-script') return readNpmScript(root, entry.script ?? NPM_TEST_SCRIPT);
-  if (entry.kind === 'file-digest') return fileDigest(root, entry.file);
-  if (entry.kind === 'dir-digests') return dirDigests(root, entry.file, entry.suffix);
-  return null;
-}
-
-/**
- * 각 항목의 **프로젝트 쪽 값**을 읽어 `extras` 를 만든다.
- *
- * `tracked` 는 "이 파일이 워크트리에 반드시 이식되나"다. git 이 추적하는 파일은 워크트리에
- * 반드시 있으므로 없어졌다면 델리게이트가 지운 것이다. 추적되지 않는 파일(`.npmrc` 를
- * gitignore 하는 것은 npm 자신이 권하는 관행이다)은 **설계대로** 워크트리에 없다 —
- * 그것을 위조로 읽으면 그런 저장소는 델리게이트가 무엇을 하든 100% 거부된다.
- * git 이 답을 주지 못하면(저장소가 아니거나 git 이 없으면) `null` — 모르면 거부하지 않는다.
- */
-async function pinExtras(projectPath, entries, deps = {}) {
-  const pinned = await Promise.all(
-    entries.map(async (entry) => ({ ...entry, value: await readPinValue(projectPath, entry) })),
-  );
-  const names = pinned.filter((e) => e.kind === 'file-digest' && e.value !== null).map((e) => e.file);
-  const tracked = names.length === 0 ? new Set() : await (deps.trackedPaths ?? trackedPaths)(projectPath, names);
-  return pinned.map((entry) =>
-    entry.kind === 'file-digest' && entry.value !== null
-      ? { ...entry, tracked: tracked === null ? null : tracked.has(entry.file) }
-      : entry,
-  );
-}
-
-/** 프로젝트에서 git 이 추적하는 경로들. 모르면 null. 절대 throw 하지 않는다. */
-async function trackedPaths(projectPath, names) {
-  const result = await runGit({ args: ['ls-files', '-z', '--', ...names], cwd: projectPath, timeoutMs: 15_000 });
-  if (!result.ok) return null;
-  return new Set(result.stdout.split('\0').filter((name) => name !== ''));
-}
-
-const NPM_EXTRAS = [
-  npmScriptPin('pretest'),
-  npmScriptPin('posttest'),
-  filePin('.npmrc'),
-  // ★ `node --run` 도 `npm run` 도 `node_modules/.bin` 을 PATH **앞**에 붙인다. 자식 env 의
-  //   NoDefaultCurrentDirectoryInExePath 는 cwd 만 닫을 뿐 이쪽은 못 막는다(실측:
-  //   `.bin\node.cmd` 를 심으니 그것이 이겼다). 이름이 아니라 **내용**을 본다 — 이름만 보면
-  //   `scripts.test` 가 부르는 그 이름을 덮어쓰는 것이 구조적으로 통과한다.
-  { kind: 'dir-digests', file: join('node_modules', '.bin'), key: 'node_modules/.bin' },
-];
-
-const CSPROJ_EXTRAS = [
-  filePin('Directory.Build.props'),
-  filePin('Directory.Build.targets'),
-  filePin('Directory.Packages.props'),
-  filePin('nuget.config'),
-  filePin('NuGet.config'),
-  filePin('global.json'),
-  // MSBuild 는 작업 디렉터리의 자동 응답 파일을 **명령줄에 그대로 붙인다.** 실측: 한 줄
-  // (`-p:IsTestProject=false`)이 실패하는 스위트를 exit 0 으로 뒤집었다. 아래 스폰 인자의
-  // `-noAutoResponse` 가 이 채널을 닫지만, 워크트리에 새로 생긴 rsp 는 사용자에게 알린다.
-  filePin('Directory.Build.rsp'),
-  filePin('MSBuild.rsp'),
-  // .NET 10 의 `dotnet test` 는 이 파일로 러너를 고른다.
-  filePin('dotnet.config'),
-  // `dotnet test` 는 cwd 에서 프로젝트/솔루션을 찾는다. 실측 우선순위는 slnx > sln > csproj —
-  // 워크트리에 slnx 하나를 두면 고정한 csproj 은 복원조차 되지 않고 다른 프로젝트가 돈다.
-  ...['.sln', '.slnx', '.slnf', '.csproj'].map(suffixPin),
-];
-
-// GNU make 는 GNUmakefile -> makefile -> Makefile 순으로 **먼저 찾은 것 하나**를 읽는다.
-const MAKE_EXTRAS = ['GNUmakefile', 'makefile', 'Makefile'].map(filePin);
-
-// pytest 는 이 넷 중 처음 발견한 것을 inifile 로 쓰고, conftest.py 를 **경로로 직접**
-// 임포트한다(그래서 임포트 순서로는 못 막고 내용을 고정해야 한다).
-const PYTEST_EXTRAS = ['pytest.ini', 'pyproject.toml', 'tox.ini', 'setup.cfg', 'conftest.py'].map(filePin);
-
-// ── 명령 유도 ─────────────────────────────────────────────────────────────
-
-/** PATH 에서 실행 파일의 절대 경로를 찾는다. 못 찾으면 null(던지지 않는다). */
-function defaultResolveTool(basename) {
-  try {
-    return resolveBinary({ basename });
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 이 노드가 `--run` 을 지원하는지 **실제로 띄워서** 본다.
- *
- * 실측: 지원하면 `--run requires an argument`(종료 9), 지원하지 않으면
- * `bad option: --run`(종료 9)이다. 버전 문자열 대신 이 동작을 본다.
- *
- * ⚠ `process.allowedNodeEnvironmentFlags.has('--run')` 은 지원하는 v24.18.0 에서도
- *   false 다(실측). 그 집합은 NODE_OPTIONS 에 쓸 수 있는 플래그만 담는다.
- *
- * @returns `{ supported, decisive }`. `decisive` 는 "자식이 끝까지 돌아 답을 봤나"다 —
- *   스폰 실패·타임아웃은 `supported:false` 지만 확정이 아니다. 둘을 뭉개면 한 번의
- *   프로브 사고가 이 프로세스 수명 내내 런처를 바꾼다(아래 캐시).
- */
-function probeNodeRun(execPath) {
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn(execPath, ['--run'], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
-    } catch {
-      resolve({ supported: false, decisive: false });
-      return;
-    }
-
-    let stderr = '';
-    let settled = false;
-    const settle = (value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(value);
-    };
-    const timer = setTimeout(() => {
-      try {
-        child.kill();
-      } catch {
-        // 이미 죽었으면 할 일이 없다.
-      }
-      settle({ supported: false, decisive: false });
-    }, PROBE_TIMEOUT_MS);
-
-    try {
-      child.stderr.setEncoding('utf8');
-      child.stderr.on('data', (chunk) => {
-        stderr += chunk;
-      });
-      child.on('error', () => settle({ supported: false, decisive: false }));
-      child.on('close', () => settle({ supported: !/bad option/i.test(stderr), decisive: true }));
-    } catch {
-      try {
-        child.kill();
-      } catch {
-        // 이미 죽었으면 할 일이 없다.
-      }
-      settle({ supported: false, decisive: false });
-    }
-  });
-}
-
-/**
- * 프로브 결과는 실행 파일마다 한 번만 잰다. 서버가 도는 동안 execPath 는 바뀌지 않는다.
- *
- * ★ **확정 판정만 캐시한다.** 폴백 런처(`npm-cli.js`)는 npm 을 거치므로 `node --run` 이
- *   아예 읽지 않는 것들(`pretest`/`posttest`, `.npmrc`)을 읽는다 — 고정 대조가 그것들을
- *   함께 보긴 하지만, 프로브가 한 번 삐끗했다고 런처를 프로세스 수명 내내 바꾸는 것은
- *   조용하고 되돌릴 수 없는 기본값이다.
- */
-const runSupportCache = new Map();
-
-async function supportsNodeRun(execPath, deps = {}) {
-  if (runSupportCache.has(execPath)) return runSupportCache.get(execPath);
-  const { supported, decisive } = await (deps.probeNodeRun ?? probeNodeRun)(execPath);
-  if (decisive) runSupportCache.set(execPath, supported);
-  return supported;
-}
-
-/**
- * npm 셈이 감싸고 있는 `npm-cli.js`. 없으면 null.
- *
- * 실측: `spawn('npm', ['--version'], { shell:false })` 는 ENOENT 이고
- * `resolveLaunch({ basename: 'npm' })` 는 cli_shim_only 를 던진다 — npm 셈은 벤더 CLI 셈과
- * 형태가 달라 `resolveThroughShim` 도 풀지 못한다. 대신 노드 옆에 함께 깔리는 스크립트를
- * 직접 가리킨다: `<node 디렉터리>/node_modules/npm/bin/npm-cli.js`(실측으로 존재하고
- * `node <그 경로> --version` -> 11.16.0).
- */
-async function findNpmCli(execPath) {
-  const candidate = join(dirname(execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
-  try {
-    return (await stat(candidate)).isFile() ? candidate : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * npm 스크립트를 **셸 없이** 띄우는 방법을 고른다.
- *
- * ① `node --run <script>` — npm 을 아예 거치지 않는다(Node 22+).
- * ② `node <npm-cli.js> run <script>` — ①을 못 쓸 때.
- *
- * 둘 다 `process.execPath` 를 스폰하므로 절대 경로다. 이름으로 스폰하면 Windows 의 libuv 가
- * 자식의 cwd(= 대상 저장소)를 PATH 보다 먼저 뒤진다(계획 2 Task 1).
- *
- * ⚠ ①은 종료 코드를 잃는다. 실측: 스크립트가 3 으로 끝나도 `node --run` 은 **1** 을 낸다
- *   (`node ran.mjs` 직접은 3, `npm run test` 도 3). 0 인지 아닌지는 그대로라 `passed` 는
- *   멀쩡하지만, `exitCode` 를 스위트의 정확한 종료 코드로 읽으면 안 된다.
- */
-async function npmScriptLaunch(execPath, deps) {
-  const supports = deps.supportsNodeRun ?? supportsNodeRun;
-  if (await supports(execPath, deps)) {
-    return { command: execPath, args: ['--run', NPM_TEST_SCRIPT], launcher: 'node --run', exitCodeExact: false };
-  }
-
-  const npmCli = await (deps.npmCliPath ?? findNpmCli)(execPath);
-  if (npmCli !== null && npmCli !== undefined) {
-    return { command: execPath, args: [npmCli, 'run', NPM_TEST_SCRIPT], launcher: 'npm-cli.js', exitCodeExact: true };
-  }
-  return {
-    command: null,
-    args: [],
-    launcher: null,
-    exitCodeExact: false,
-    resolveError:
-      '이 노드는 --run 을 지원하지 않고 npm-cli.js 도 찾지 못했습니다 — package.json 의 test 스크립트를 셸 없이 띄울 방법이 없습니다.',
-  };
-}
-
-function toolEntry({ source, definition, tool, label = tool, args, resolveTool, childEnvExtra }) {
-  const command = resolveTool(tool);
-  return {
-    source,
-    command: command ?? null,
-    args,
-    // 이 도구에만 필요한 계산된 자식 환경 변수. allowlist 를 우회하므로 여기서만 정한다.
-    ...(childEnvExtra ? { childEnvExtra } : {}),
-    // 실행 파일을 우리가 직접 스폰하므로 종료 코드가 그대로 온다.
-    launcher: command ? 'direct' : null,
-    exitCodeExact: Boolean(command),
-    resolveError: command ? null : `${label} 을(를) PATH 에서 찾지 못했습니다.`,
-    definition,
-  };
-}
-
-/**
- * 테스트 명령을 유도한다. **사용자 프로젝트에서만** 유도한다 — 워크트리에서 다시 유도하면
- * 이 모듈의 존재 이유가 사라진다(맨 위 주석).
- *
- * 순서: `package.json` 의 `scripts.test` -> 루트의 `*.csproj` -> `Makefile` 의 `test`
- * 타깃 -> `pytest.ini`/`pyproject.toml`. 못 찾으면 **null** — 추측하지 않는다.
- *
- * ⚠ `*.csproj` 는 **루트만** 본다. 솔루션 파일이나 하위 디렉터리의 프로젝트는 다루지 않고,
- *   루트에 둘 이상 있으면 어느 것인지 모르므로 고르지 않는다. 추측해서 엉뚱한 프로젝트를
- *   돌리느니 다음 후보로 넘어가거나 null 을 내는 편이 낫다.
- *
- * @returns `{ source, command, args, launcher, exitCodeExact, resolveError, definition }`
- *   또는 null. 결과를 그대로 `runTests` 에 펼쳐 넘기면 된다.
- *   `command` 가 null 이면 정의는 찾았지만 띄울 방법이 없다는 뜻이고 `resolveError` 에
- *   사유가 있다. `definition` 은 `runTests` 가 워크트리와 대조할 고정값이고, 그 안의
- *   `extras` 가 같은 도구가 함께 읽는 입력들이다(위 §고정 대상 참조).
- *   `exitCodeExact` 는 "종료 코드를 스위트의 값으로 읽어도 되나"다 — `node --run` 경로만
- *   false 다(그 경로는 비0 종료 코드를 전부 1 로 접는다).
- */
-export async function deriveTestCommand(projectPath, deps = {}) {
-  try {
-    if (typeof projectPath !== 'string' || projectPath === '' || !isAbsolute(projectPath)) return null;
-    const resolveTool = deps.resolveTool ?? defaultResolveTool;
-    const execPath = deps.execPath ?? process.execPath;
-
-    const script = await readNpmTestScript(projectPath);
-    if (script !== null) {
-      const launch = await npmScriptLaunch(execPath, deps);
-      return {
-        source: 'package.json',
-        command: launch.command,
-        args: launch.args,
-        launcher: launch.launcher,
-        exitCodeExact: launch.exitCodeExact,
-        resolveError: launch.resolveError ?? null,
-        definition: {
-          file: 'package.json',
-          kind: 'npm-script',
-          key: 'scripts.test',
-          script: NPM_TEST_SCRIPT,
-          value: script,
-          extras: await pinExtras(projectPath, NPM_EXTRAS),
-        },
-      };
-    }
-
-    const csproj = await rootFilesBySuffix(projectPath, '.csproj');
-    if (csproj.length === 1) {
-      const text = await readTextFile(projectPath, csproj[0]);
-      if (text !== null && CSPROJ_TEST_EVIDENCE.test(text)) {
-        return toolEntry({
-          source: 'csproj',
-          tool: 'dotnet',
-          // `-noAutoResponse` 는 MSBuild 가 작업 디렉터리의 응답 파일을 명령줄에 붙이는
-          // 채널을 닫는다(실측: 공격 픽스처가 exit 0 -> exit 1 로 되돌아오고 깨끗한
-          // 프로젝트는 그대로 돈다).
-          args: ['test', '-noAutoResponse'],
-          resolveTool,
-          definition: {
-            file: csproj[0],
-            kind: 'file-text',
-            key: csproj[0],
-            value: text,
-            extras: await pinExtras(projectPath, CSPROJ_EXTRAS),
-          },
-        });
-      }
-    }
-
-    for (const name of ['Makefile', 'makefile']) {
-      const text = await readTextFile(projectPath, name);
-      if (text === null) continue;
-      const target = extractMakeTarget(text, NPM_TEST_SCRIPT);
-      if (target === null) break;
-      return toolEntry({
-        source: 'Makefile',
-        tool: 'make',
-        args: [NPM_TEST_SCRIPT],
-        resolveTool,
-        definition: {
-          file: name,
-          kind: 'make-target',
-          key: 'test 타깃',
-          value: target,
-          extras: await pinExtras(projectPath, MAKE_EXTRAS),
-        },
-      });
-    }
-
-    const pytestIni = await readTextFile(projectPath, 'pytest.ini');
-    if (pytestIni !== null) {
-      return toolEntry({
-        source: 'pytest.ini',
-        tool: 'python',
-        label: 'python/python3',
-        args: ['-c', PYTEST_BOOTSTRAP],
-        childEnvExtra: PYTEST_ENV,
-        resolveTool: (name) => resolveTool(name) ?? resolveTool('python3'),
-        definition: {
-          file: 'pytest.ini',
-          kind: 'file-text',
-          key: 'pytest.ini',
-          value: pytestIni,
-          extras: await pinExtras(projectPath, PYTEST_EXTRAS),
-        },
-      });
-    }
-
-    const pyproject = await readTextFile(projectPath, 'pyproject.toml');
-    if (pyproject !== null) {
-      const section = extractIniSection(pyproject, PYTEST_SECTION);
-      if (section !== null) {
-        return toolEntry({
-          source: 'pyproject.toml',
-          tool: 'python',
-          label: 'python/python3',
-          args: ['-c', PYTEST_BOOTSTRAP],
-          childEnvExtra: PYTEST_ENV,
-          resolveTool: (name) => resolveTool(name) ?? resolveTool('python3'),
-          definition: {
-            file: 'pyproject.toml',
-            kind: 'ini-section',
-            key: PYTEST_SECTION,
-            value: section,
-            extras: await pinExtras(projectPath, PYTEST_EXTRAS),
-          },
-        });
-      }
-    }
-
-    return null;
-  } catch {
-    // 유도는 부가 정보 수집이다. 여기서 던지면 호출부가 봉투 대신 거부된 프로미스를 받는다.
-    return null;
-  }
-}
+/** 정본은 `src/deps-provision.mjs` 다(위 import 의 WHY). 이 이름의 수입부는 여기 그대로 둔다. */
+export { findNpmCli };
 
 // ── 워크트리 디렉터리 확인 ────────────────────────────────────────────────
 
@@ -798,305 +146,67 @@ async function isDirectory(path) {
   }
 }
 
-// ── 출력 상한 ─────────────────────────────────────────────────────────────
+/** 워크트리 자신이거나 그 아래인가. `..` 한 조각이면 밖이다(`safeRelativeSourcePath` 와 같은 규율). */
+function insideWorktree(worktree, path) {
+  if (path === worktree) return true;
+  const rel = relative(worktree, path);
+  return rel !== '' && !isAbsolute(rel) && !rel.split(/[\\/]/).includes('..');
+}
 
 /**
- * 앞뒤를 남기고 가운데를 버리는 수집기. **메모리도 상한 안에 머문다** — 다 모은 뒤
- * 자르는 구현은 폭주하는 스위트의 출력을 그대로 힙에 쌓는다.
+ * 프로젝트가 선언한 실행 디렉터리(`tests.cwd`)를 워크트리 안의 절대 경로로 편다.
  *
- * 꼬리를 버리지 않는 이유: 테스트 요약과 실패 목록은 끝에 나온다. 머리를 남기는 이유:
- * 무엇이 돌았는지와 첫 실패가 거기 있다.
+ * 없거나 `.` 이면 워크트리 루트다. 밖을 가리키거나 **없는 디렉터리**면 null 이고, 그때 실행은
+ * 스폰 전에 막힌다 — 사용자가 `packages/api` 라고 적었는데 루트에서 돌리면 그 실행의 증거는
+ * 사용자가 물은 것과 다른 것에 대한 증거가 된다. 디렉터리를 만들어 주지도 않는다: 워크트리에
+ * 우리가 쓰지 않은 자리를 짓는 것은 이 모듈의 일이 아니다.
  *
- * 자르는 자리는 **코드 유닛이 아니라 문자 경계**다. 서로게이트 쌍 한가운데를 자르면 짝
- * 없는 서로게이트가 남고, JSON 으로는 살아남지만 UTF-8 바이트로 쓰는 소비자(로그 파일,
- * 비 JS 소비자)에서 U+FFFD 로 뭉개지거나 인코딩 오류가 된다(실측: 이모지 출력에서
- * `isWellFormed()` 가 false). `outputChars` 는 원래 코드 유닛 수 그대로 둔다.
+ * ★★ 글자만 보는 포함은 포함이 아니다. `insideWorktree` 는 `..` 조각을 잡지만 **중간 조각의
+ *   심링크**는 못 본다 — `packages -> D:\elsewhere` 하나면 `packages/api` 는 글자로는 깨끗한
+ *   상대 경로이고 `isDirectory` 는 심링크를 **따라가서** true 를 낸다. 그러면 자식이 워크트리
+ *   밖에서 돌고, 그 실행의 증거는 우리가 격리했다고 말한 트리에 대한 증거가 아니다. 그래서
+ *   양쪽을 `canonical` 로 편 뒤 같은 판정을 한 번 더 한다(`src/test-evidence.mjs` 의
+ *   `insideCanonicalWorktree` 와 같은 규율이고, 이유도 같다).
+ *
+ * ★★ **루트를 가리키는 철자는 하나가 아니다.** 이른 반환이 `''`·`'.'` 만 알던 동안 `'./'` 는
+ *   그 셋을 지나 `join(root, './')` 로 갔고, `join` 은 뒤 구분자를 남기므로 `insideWorktree` 의
+ *   두 갈래가 **둘 다** 거짓이 됐다(경로 !== 워크트리, `relative()` === `''`) — 스키마가 받는
+ *   값 하나가 그 프로젝트의 **모든** 테스트 실행을 죽였고, `'.'` 은 멀쩡히 도는 채였다. 그래서
+ *   자리 정규화를 `resolve` 에 맡기고(`join` 과 달리 뒤 구분자를 걷는다) 「편 결과가 루트면
+ *   루트다」를 한 줄로 말한다 — 철자를 열거하는 대신.
  */
-function endsWithHighSurrogate(text) {
-  const code = text.charCodeAt(text.length - 1);
-  return code >= 0xd800 && code <= 0xdbff;
+async function resolveDeclaredCwd(worktreePath, declared, deps = {}) {
+  if (declared === undefined || declared === null || declared === '' || declared === '.') return worktreePath;
+  if (typeof declared !== 'string' || declared.includes('\\') || isAbsolute(declared)) return null;
+  const path = resolve(worktreePath, declared);
+  if (path === resolve(worktreePath)) return worktreePath;
+  if (!insideWorktree(worktreePath, path) || !(await isDirectory(path))) return null;
+  const canonicalize = deps.canonicalCwd ?? canonical;
+  const root = await canonicalize(worktreePath);
+  const real = await canonicalize(path);
+  if (typeof root !== 'string' || typeof real !== 'string' || !insideWorktree(root, real) || root === real) return null;
+  return path;
 }
 
-function startsWithLowSurrogate(text) {
-  const code = text.charCodeAt(0);
-  return code >= 0xdc00 && code <= 0xdfff;
-}
-
-function createOutputCap(limit) {
-  const headLimit = Math.max(1, Math.floor(limit * 0.3));
-  const tailLimit = Math.max(1, limit - headLimit);
-  let head = '';
-  let tail = '';
-  let total = 0;
-
-  return {
-    push(chunk) {
-      const text = typeof chunk === 'string' ? chunk : String(chunk ?? '');
-      if (text === '') return;
-      total += text.length;
-      if (head.length < headLimit) head += text.slice(0, headLimit - head.length);
-      tail += text;
-      if (tail.length > tailLimit) tail = tail.slice(tail.length - tailLimit);
-    },
-    result() {
-      if (total <= headLimit + tailLimit) {
-        // 상한 아래에서는 head 와 tail 이 겹친다. 겹친 만큼만 떼면 원문이 그대로 돌아온다.
-        const overlap = head.length + tail.length - total;
-        return { text: head + tail.slice(overlap), chars: total, truncated: false };
-      }
-      // 끝이 high surrogate 면 짝을 잃은 것이고, 시작이 low surrogate 면 짝이 앞에 남았다.
-      const safeHead = endsWithHighSurrogate(head) ? head.slice(0, -1) : head;
-      const safeTail = startsWithLowSurrogate(tail) ? tail.slice(1) : tail;
-      const dropped = total - safeHead.length - safeTail.length;
-      return {
-        text: `${safeHead}\n… [출력 ${total}자 중 가운데 ${dropped}자가 잘렸습니다] …\n${safeTail}`,
-        chars: total,
-        truncated: true,
-      };
-    },
-  };
+/**
+ * 이 실행에 걸리는 상한. 프로젝트가 적은 값과 호출부가 넘긴 값 중 **작은 쪽**이 이긴다 —
+ * 프로젝트의 선언이 실행의 남은 예산을 늘릴 수는 없고(그 예산은 마감이 정한다), 반대로 실행의
+ * 여유가 프로젝트의 선언을 넘길 수도 없다(그러면 적어 둔 상한이 아무것도 아니게 된다).
+ */
+function boundedTestTimeout(...values) {
+  const usable = values.filter((value) => Number.isFinite(value) && value > 0);
+  return usable.length === 0 ? undefined : Math.min(...usable);
 }
 
 // ── 실행 ──────────────────────────────────────────────────────────────────
 
 /**
- * 의존성이 없어 못 돌린 흔적. 로케일에 의존하지 않는 런타임 메시지 위주다.
- *
- * ⚠ 휴리스틱이다. 이 목록은 `confidence` 를 **내리기만** 하고 절대 올리지 않으므로,
- *   못 잡으면 거짓 초록은 만들지 않는다. 반대로 셸이 내는 "명령을 찾을 수 없음" 은
- *   로케일마다 달라서(이 기계는 한국어) 영어 표현만으로는 못 잡는다 — 사실만 적는다.
- *
- * ⚠ 남는 틈: **"도구가 부팅에 실패했다"와 "스위트가 진짜 실패했다"를 봉투가 구분하지
- *   못한다.** 이 목록에 없는 부팅 실패는 `passed:false / confidence:'verified'` 로 나가고,
- *   §7 의 보상 계층에는 거짓 붉음도 거짓 초록과 똑같이 오염이다(델리게이트가 무엇을 하든
- *   벌점이 고정되면 보상 신호가 상수가 된다). 러너별로 "한 개라도 수집·실행됐다"는 증거를
- *   찾는 방법이 있지만, 그건 러너마다 다른 새 휴리스틱이고 위조된 자식이 그럴듯한 요약을
- *   찍으면 그만이라 여기서 몰래 정하지 않는다.
- */
-const MISSING_DEP_SIGNS = [
-  'ERR_MODULE_NOT_FOUND',
-  'Cannot find module',
-  'Cannot find package',
-  'ModuleNotFoundError',
-  'No module named',
-  'not recognized as an internal or external command',
-  'command not found',
-];
-
-function spawnFailure(extra) {
-  return {
-    ran: false,
-    exitCode: null,
-    signalName: null,
-    timedOut: false,
-    aborted: false,
-    hung: false,
-    lingering: false,
-    spawnError: null,
-    output: '',
-    outputChars: 0,
-    truncated: false,
-    ...extra,
-  };
-}
-
-/**
- * 자식을 띄우고 stdout·stderr 를 **도착 순서대로** 한 버퍼에 모은다. 절대 throw 하지 않는다.
- *
- * 두 스트림을 합치는 이유: 사람이 터미널에서 보는 것이 그 순서이고, 테스트 러너는 진행과
- * 실패를 두 스트림에 나눠 쓴다. 둘 다 반드시 드레인한다 — 읽지 않으면 파이프 버퍼가 차서
- * 자식이 멈춘다.
- */
-async function spawnAndCollect({ command, args, cwd, env, signal, timeoutMs, onSpawn }) {
-  const cap = createOutputCap(MAX_OUTPUT_CHARS);
-
-  // 이미 끊긴 신호로 프로세스를 띄우면 곧바로 죽일 자식을 굳이 만드는 셈이다.
-  if (signal?.aborted) return spawnFailure({ aborted: true });
-
-  // ★ 스폰 **앞**에서 만든다. 스폰과 보호 try 사이에 한 줄도 두지 않는 것이 "스폰 이후의
-  //   셋업이 던져 자식이 고아로 남는다"를 닫는 유일한 방법이다(계획 1 에서 두 번, 여기서
-  //   세 번째로 낸 부류 — 실측으로 재현했다: timeoutMs 5000/3 -> 봉투는 blocked 인데
-  //   테스트 자식은 살아서 워크트리에 계속 썼다).
-  const deadline = timeoutSignal(timeoutMs);
-
-  let child;
-  try {
-    child = spawn(command, args, {
-      cwd,
-      env, // ★ 교체다. buildChildEnv 가 만든 것이 자식 환경의 전부다.
-      shell: false,
-      windowsHide: true,
-      // stdin 은 열지 않는다. 입력을 기다리는 스위트가 영영 멈추는 대신 즉시 EOF 를 본다.
-      stdio: ['ignore', 'pipe', 'pipe'],
-      // POSIX 에서만: 자식이 자기 프로세스 그룹을 이끌어야 리퍼가 손자까지 끊을 수 있다.
-      ...(WINDOWS ? {} : { detached: true }),
-    });
-  } catch (error) {
-    return spawnFailure({ spawnError: error });
-  }
-
-  // ★ 'error' 리스너를 **던질 수 있는 어떤 코드보다 먼저** 붙인다. 셋업이 던져 아래
-  //   보호 catch 로 빠지면 그 뒤에 자식의 'error'(ENOENT 등)가 리스너 없이 터지고,
-  //   봉투가 정상 반환된 **다음에** 프로세스가 uncaught 로 죽는다 — stdio 로 물린 MCP
-  //   서버에서는 세션이 통째로 끊긴다(실측: 봉투는 blocked:false 로 나오고 shell exit=1).
-  //   `settle` 은 아직 없으므로 사유를 담아 두었다가 준비되면 넘긴다.
-  let earlyError = null;
-  let settleOutcome = null;
-  child.on('error', (error) => {
-    if (settleOutcome !== null) settleOutcome({ spawnError: error });
-    else earlyError = error;
-  });
-
-  let stopReason = null;
-  let finished = false;
-  let hardTimer = null;
-  let hardSettle = null;
-  let drainTimer = null;
-  let drainSettle = null;
-  let drainDeadline = null;
-
-  const stop = (reason) => {
-    if (finished) return;
-    if (stopReason === null) stopReason = reason;
-    try {
-      child.kill();
-    } catch {
-      // 이미 죽었으면 할 일이 없다.
-    }
-    // ★ kill 뒤에도 `close` 가 안 오면 결과를 못 낸다. 반드시 나가게 못을 박는다.
-    if (hardTimer === null) hardTimer = setTimeout(() => hardSettle?.(), KILL_GRACE_MS);
-  };
-
-  // 자식이 스스로 끝났는데 파이프가 안 닫혔다. 도착 중인 출력만 기다렸다가 나간다.
-  //
-  // ★ 유예에 **절대 상한**이 있다. 갱신만 하면 계속 찍는 배경 프로세스에서 유예가 영영
-  //   갱신돼 데드라인 전체를 쓴다(실측: 조용한 손자는 3.1초, 200ms 마다 찍는 손자는
-  //   timeoutMs 8000 + KILL_GRACE 3000 = 11,020ms, 기본 설정이면 603초 — 그리고 `hung`
-  //   으로 나가 통과한 스위트가 unverified 가 된다). 종료 코드는 이미 확정이므로 상한을
-  //   넘겨서 잃는 것은 꼬리 출력뿐이다.
-  const bumpDrain = () => {
-    if (finished || drainSettle === null) return;
-    clearTimeout(drainTimer);
-    const remaining = drainDeadline - Date.now();
-    if (remaining <= 0) {
-      drainSettle();
-      return;
-    }
-    drainTimer = setTimeout(() => drainSettle?.(), Math.min(DRAIN_GRACE_MS, remaining));
-  };
-
-  const onData = (chunk) => {
-    cap.push(chunk);
-    if (drainTimer !== null) bumpDrain();
-  };
-
-  const onAbort = () => stop('aborted');
-  const onDeadline = () => stop('timedOut');
-
-  // ★ 스폰 **이후**의 셋업이 던지면 자식이 아무에게도 안 잡힌 채 남는다(계획 1 에서 두 번
-  //   낸 버그). 여기부터 통째로 감싸고, 실패하면 자식을 먼저 끊는다.
-  try {
-    // ★ 자식을 배선 계층에 넘긴다(리퍼 원장 등록·트리 킬 대상 등록). 스폰 **이후**라
-    //   여기서 던지면 자식이 아무에게도 안 잡힌 채 남는다 — 그래서 이 try 안이고,
-    //   아래 catch 가 자식을 먼저 끊는다.
-    //
-    //   결과를 기다리지 않는다: 원장 쓰기는 프로세스 시작 시각 프로브(powershell/ps)를
-    //   태우므로 수백 ms 가 걸리는데, 그동안 stdout 리스너를 안 붙이면 자식이 파이프
-    //   버퍼에서 멈춘다. 거부는 삼킨다 — 원장은 최선의 노력이고, 실패했다고 이미 도는
-    //   스위트를 죽이면 안 된다.
-    if (typeof onSpawn === 'function') {
-      const tracked = onSpawn(child);
-      if (tracked && typeof tracked.catch === 'function') tracked.catch(() => {});
-    }
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', onData);
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', onData);
-    signal?.addEventListener('abort', onAbort, { once: true });
-    deadline?.addEventListener('abort', onDeadline, { once: true });
-  } catch (error) {
-    stop('setupFailed');
-    try {
-      signal?.removeEventListener?.('abort', onAbort);
-      deadline?.removeEventListener?.('abort', onDeadline);
-    } catch {
-      // 뗄 수 없으면 그냥 둔다.
-    }
-    clearTimeout(hardTimer);
-    return spawnFailure({ spawnError: error });
-  }
-
-  const outcome = await new Promise((resolve) => {
-    let settled = false;
-    const settle = (value) => {
-      if (settled) return;
-      settled = true;
-      finished = true;
-      clearTimeout(hardTimer);
-      clearTimeout(drainTimer);
-      resolve(value);
-    };
-    hardSettle = () => settle({ hung: true });
-    drainSettle = () => settle({ lingering: true });
-    settleOutcome = settle;
-    if (earlyError !== null) settle({ spawnError: earlyError });
-    // ★ 'exit' 과 'close' 를 **둘 다** 듣는다. 'close' 는 파이프가 다 비워진 뒤라 출력을
-    //   잃지 않지만, 손자가 쓰기 끝을 쥐고 있으면 영영 오지 않는다. 그때 'exit' 이 이미
-    //   준 종료 코드를 버리면 통과한 스위트가 실패로 나간다.
-    child.on('exit', () => {
-      drainDeadline = Date.now() + DRAIN_MAX_MS;
-      drainTimer = setTimeout(() => drainSettle?.(), Math.min(DRAIN_GRACE_MS, DRAIN_MAX_MS));
-    });
-    child.on('close', () => settle({}));
-  });
-
-  try {
-    signal?.removeEventListener?.('abort', onAbort);
-    deadline?.removeEventListener?.('abort', onDeadline);
-  } catch {
-    // 뗄 수 없으면 그냥 둔다. 이 실행의 결과와는 무관하다.
-  }
-  // 손자가 파이프의 쓰기 끝을 쥔 채 남아 있으면 우리 쪽 읽기 끝이 이벤트 루프를 붙잡는다.
-  child.stdout?.destroy();
-  child.stderr?.destroy();
-
-  const spawnError = outcome.spawnError ?? null;
-  const hung = outcome.hung === true;
-  // 'exit' 이 왔으면 child.exitCode 는 값이 있고, 신호로 죽었거나 아직 살아 있으면 null 이다.
-  // 알고 있는 것을 버리지 않는다 — `lingering` 은 "결과를 모른다"가 아니다.
-  const exitCode = spawnError !== null ? null : child.exitCode;
-
-  // ★ stop() 을 불렀다는 것과 실제로 끊었다는 것은 다르다. 데드라인이 자식의 소요 시간에
-  //   가까우면 kill 을 보낸 직후 자식이 스스로 exit 0 으로 나갈 수 있다. exit 0 은
-  //   "스스로 정상 종료했다"는 뜻이므로 그때는 우리가 끊은 것이 아니다.
-  const cutShort = spawnError === null && exitCode !== 0;
-  const collected = cap.result();
-
-  return {
-    ran: spawnError === null,
-    exitCode,
-    signalName: child.signalCode ?? null,
-    timedOut: stopReason === 'timedOut' && cutShort,
-    aborted: stopReason === 'aborted' && cutShort,
-    hung,
-    // 자식은 끝났는데 파이프를 쥔 손자가 남았다. `hung`("결과를 못 받았다")과 다른 사실이다.
-    lingering: outcome.lingering === true,
-    spawnError,
-    output: collected.text,
-    outputChars: collected.chars,
-    truncated: collected.truncated,
-  };
-}
-
-/**
- * 봉투에 실을 **명령 한 줄**. 길면 자른다.
- *
+ * 봉투에 실을 **명령 한 줄**의 상한. 자르는 것은 공용 `clipCounted` 다(사본이었던 `forMessage`
+ * 는 WS2 가 걷었다 — 꼬리표가 영어로 바뀌고 비문자열은 `''` 이 된다. 여기 오는 값은
+ * `scripts.test` 명령 문자열이라 두 갈래 모두 실제 입력에서는 같은 바이트를 낸다).
  * ★ 파일 본문에는 쓰지 마라. 아래 `textDigestSummary` 를 써라 — 왜인지는 그쪽 주석에 있다.
  */
-function forMessage(value) {
-  const text = typeof value === 'string' ? value : String(value ?? '');
-  return text.length > 400 ? `${text.slice(0, 400)} …(${text.length}자 중 앞 400자)` : text;
-}
+const MESSAGE_COMMAND_CHARS = 400;
 
 /**
  * 지문의 사람 읽을 요약. **내용은 절대 싣지 않는다** — 이 문자열은 봉투를 타고 MCP 결과로
@@ -1104,18 +214,18 @@ function forMessage(value) {
  * 그대로 실렸다). 어느 항목이 어떻게 달라졌는지는 지문으로 충분히 말할 수 있다.
  */
 function digestSummary(value) {
-  if (!value || typeof value !== 'object') return '없음';
-  if (value.digest === 'symlink') return '심볼릭 링크/정션 (내용을 대조할 수 없습니다)';
-  if (value.digest === 'directory') return '디렉터리';
-  if (value.digest === 'unreadable') return '읽을 수 없음';
-  return `sha256:${value.digest.slice(0, 12)}… (${value.bytes}바이트, ${value.lines}줄)`;
+  if (!value || typeof value !== 'object') return 'absent';
+  if (value.digest === 'symlink') return 'symlink';
+  if (value.digest === 'directory') return 'directory';
+  if (value.digest === 'unreadable') return 'unreadable';
+  return `sha256:${value.digest.slice(0, 12)}… (${value.bytes} bytes, ${value.lines} lines)`;
 }
 
 /**
  * 문자열 하나의 지문 요약 (계획 2 이월 4).
  *
  * ★ 왜 필요한가 (실측, 커밋 c1f24cd 의 테스트가 재현한다): **주 정의**가 어긋났을 때
- *   봉투는 `forMessage` 로 고정값과 현재값을 각각 앞 400자까지 원문으로 실었다. 그런데
+ *   봉투는 `clipCounted` 로 고정값과 현재값을 각각 앞 400자까지 원문으로 실었다. 그런데
  *   `npm-script` 를 뺀 나머지 정의(`file-text` = csproj·pytest.ini, `make-target`,
  *   `ini-section`)는 값이 **파일 본문 전체**다 — csproj 의 `<NuGetPackageSourceApiKey>`
  *   처럼 인증 토큰이 앞쪽 400자 안에 그대로 들어간다. `checkExtras` 는 같은 이유로 이미
@@ -1131,6 +241,25 @@ function textDigestSummary(value) {
 const sameDigest = (a, b) => (a?.digest ?? null) === (b?.digest ?? null);
 
 /**
+ * 어긋남 하나의 **평평한** 기술. `project`·`worktree` 는 지문 요약이거나(파일 본문) 잘린 명령
+ * 문자열이다(`npm-script` 한 갈래) — 어느 쪽도 파일 **내용**이 아니다: `.npmrc`·`nuget.config`
+ * 에는 인증 토큰이 들어 있고, 그것이 봉투로 나간 실측이 이 규율의 출처다.
+ */
+function drifted(file, key, project, worktree) {
+  return { reasonCode: REASON.test_pinned_definition_drift, drift: { file: file ?? '.', key, project, worktree } };
+}
+
+/**
+ * 어긋남의 **문장 인자** — 이름 둘만 나간다.
+ *
+ * ★ `project`/`worktree` 는 값 쪽(지문 요약이거나 clip 된 명령)이라 문장에 넣지 않는다. 문장은
+ *   사람이 고칠 자리를 가리키는 것이고, 그 자리는 「어느 파일의 어느 항목」이다.
+ */
+function driftParams({ drift }) {
+  return { file: drift.file, key: drift.key };
+}
+
+/**
  * `extras` 를 워크트리에서 다시 읽어 고정값과 대조한다.
  *
  * 규칙은 하나다: **워크트리의 항목은 프로젝트의 것과 같거나 아예 없어야 한다.**
@@ -1143,7 +272,11 @@ const sameDigest = (a, b) => (a?.digest ?? null) === (b?.digest ?? null);
  * 배열이 아니면(고정값을 손으로 만든 호출부) 조용히 넘어간다 — 주 정의 대조는 이미 끝났고,
  * 여기서 던지면 그 호출부가 봉투 대신 예외를 받는다.
  *
- * @returns `{ error }` 또는 `{ notes }`
+ * ★ WS2 Task 15: 어긋남을 **문장**이 아니라 `{ reasonCode, drift }` 로 낸다. 문구는
+ *   `src/reason-text.mjs` 가 정본이고, 여기서 나가는 것은 어느 파일이 어떻게 달라졌는지의
+ *   **평평한 사실**뿐이다(불변식 4와 같은 규율 — 원문은 절대 싣지 않고 지문만 싣는다).
+ *
+ * @returns `{ reasonCode, drift }` 또는 `{ notes }`
  */
 async function checkExtras(worktree, extras) {
   const notes = [];
@@ -1157,13 +290,7 @@ async function checkExtras(worktree, extras) {
       const pinned = entry.value && typeof entry.value === 'object' ? entry.value : {};
       for (const [name, value] of Object.entries(current ?? {})) {
         if (sameDigest(pinned[name], value)) continue;
-        const where = typeof entry.suffix === 'string' ? '워크트리 루트의' : `워크트리의 ${entry.key} 에 있는`;
-        return {
-          error:
-            `${where} ${name} 이(가) 프로젝트의 것과 다릅니다.\n` +
-            `프로젝트: ${digestSummary(pinned[name])}\n워크트리: ${digestSummary(value)}\n` +
-            '이 자리에 놓인 파일은 우리가 부르려던 명령을 대신하거나 그 도구가 읽는 입력을 바꿉니다.',
-        };
+        return drifted(entry.file ?? '.', name, digestSummary(pinned[name]), digestSummary(value));
       }
       continue;
     }
@@ -1172,42 +299,19 @@ async function checkExtras(worktree, extras) {
       const pinned = entry.value ?? null;
       if (current === null) {
         if (pinned === null) continue;
-        if (entry.tracked === true) {
-          return {
-            error:
-              `워크트리에서 ${entry.key} 가 사라졌습니다 — 프로젝트에서 git 이 추적하는 파일이라 ` +
-              '워크트리에도 있어야 합니다.',
-          };
-        }
-        notes.push(
-          `${entry.key} 가 워크트리에 없습니다 — 프로젝트에는 있지만 git 이 추적하지 않아 ` +
-            '워크트리로 이식되지 않은 것으로 봤습니다. 그 파일이 실행에 영향을 준다면 이 실행은 프로젝트와 다른 조건입니다.',
-        );
+        if (entry.tracked === true) return drifted(entry.file, entry.key, digestSummary(pinned), 'absent');
+        notes.push(renderNotice('test_file_absent_from_worktree', { path: entry.key }));
         continue;
       }
       if (sameDigest(pinned, current)) continue;
-      return {
-        error:
-          pinned === null
-            ? `델리게이트가 ${entry.key} 를 새로 만들었습니다 — 프로젝트에는 없던 것입니다.\n워크트리: ${digestSummary(current)}`
-            : `델리게이트가 ${entry.key} 를 바꿨습니다.\n프로젝트: ${digestSummary(pinned)}\n워크트리: ${digestSummary(current)}`,
-      };
+      return drifted(entry.file, entry.key, digestSummary(pinned), digestSummary(current));
     }
 
     // npm-script: scripts.test 명령의 실행 계약을 진단해야 하므로 이 좁은 예외만 원문을 싣는다.
     const pinned = entry.value ?? null;
     if (current === pinned) continue;
-    if (pinned === null) {
-      return {
-        error:
-          `델리게이트가 ${entry.key} 를 새로 만들었습니다 — 프로젝트에는 없던 것입니다.\n` +
-          `현재값: ${forMessage(current)}`,
-      };
-    }
-    if (current === null) return { error: `워크트리에서 ${entry.key} 가 사라졌습니다 — 프로젝트에는 있었습니다.` };
-    return {
-      error: `델리게이트가 ${entry.key} 를 바꿨습니다.\n고정값: ${forMessage(pinned)}\n현재값: ${forMessage(current)}`,
-    };
+    const show = (value) => (value === null ? 'absent' : clipCounted(value, MESSAGE_COMMAND_CHARS));
+    return drifted(entry.file, entry.key, show(pinned), show(current));
   }
   return { notes };
 }
@@ -1224,9 +328,7 @@ async function checkExtras(worktree, extras) {
  *   있다(자격증명 파일에 절대 경로로 닿았고, `USERPROFILE` 을 돌려도 libuv 가 되돌려 놓는
  *   `HOMEDRIVE`+`HOMEPATH` 로 진짜 홈이 복원됐다).
  */
-export const USER_PRIVILEGE_NOTE =
-  '이 스위트는 사용자 권한으로 실행됐고 홈 디렉터리 전체를 읽을 수 있었습니다 — ' +
-  '자격증명 파일을 포함합니다. 이 러너에는 그것을 막을 경로가 없습니다(설계 §5.8 S1).';
+export const USER_PRIVILEGE_NOTE = renderNotice('test_ran_with_user_privileges', {});
 
 /**
  * 고정된 명령의 첫 토큰이 **자식 환경에서는 풀리지 않는** 형태인지 본다. 맞으면 사유 문장.
@@ -1257,12 +359,7 @@ async function cwdLookupWarning(worktree, definition) {
     if (await isFile(join(worktree, 'node_modules', '.bin', token + ext))) return null;
   }
 
-  return (
-    `테스트 명령이 워크트리 루트의 ${inRoot.join(' / ')} 을(를) 맨이름 "${token}" 으로 부릅니다. ` +
-    '이 러너의 자식 환경은 실행 파일 탐색에서 cwd 를 빼므로(워크트리에 놓인 동명 실행 파일이 ' +
-    `우리가 고른 명령을 대신하는 것을 막는다) 그 이름은 풀리지 않습니다 — ".\\${token}" 처럼 ` +
-    '경로 구분자를 붙이면 그대로 돕니다.'
-  );
+  return renderNotice('test_command_bare_name_unresolved', { path: inRoot.join(' / '), token });
 }
 
 async function isFile(path) {
@@ -1300,45 +397,37 @@ export async function runTests(spec) {
     const args = options.args ?? [];
 
     if (typeof worktree !== 'string' || worktree === '' || !isAbsolute(worktree)) {
-      return blocked(
-        `워크트리 경로가 절대 경로가 아닙니다: ${JSON.stringify(worktree)}`,
-        '워크트리의 절대 경로를 주세요. 상대 경로는 이 프로세스의 cwd 기준으로 풀려 엉뚱한 디렉터리에서 돕니다.',
-      );
+      return fail(REASON.evidence_worktree_invalid);
     }
-    if (!(await isDirectory(worktree))) {
-      return blocked(`워크트리 디렉터리가 없습니다: ${worktree}`, '워크트리를 먼저 만든 뒤 테스트를 돌리세요.');
-    }
+    if (!(await isDirectory(worktree))) return fail(REASON.evidence_worktree_invalid);
     if (typeof command !== 'string' || command === '' || !isAbsolute(command)) {
       // ★ "도구를 못 찾았다"와 "경로가 상대다"는 원인도 사용자의 행동도 다르다.
-      //   `deriveTestCommand` 는 전자를 이미 `resolveError` 로 알려 준다 — 그것을 버리면
+      //   `deriveTestCommand` 는 전자를 이미 `unresolvedTool` 로 알려 준다 — 그것을 버리면
       //   봉투가 사용자가 이미 한 일을 시키는 막다른 길이 된다(make/python/dotnet 이 없는
       //   기계에서는 이것이 기본 경로다).
-      const resolveError = options.resolveError;
-      if (typeof resolveError === 'string' && resolveError !== '') {
-        return blocked(
-          resolveError,
-          '그 도구를 설치하거나 PATH 에 넣은 뒤 deriveTestCommand 부터 다시 하세요. 이 러너는 도구를 대신 ' +
-            '고르지 않습니다 — 추측한 도구로 낸 결과는 검증에 쓸 수 없습니다.',
-        );
+      const unresolvedTool = options.unresolvedTool;
+      if (typeof unresolvedTool === 'string' && unresolvedTool !== '') {
+        // ★ 어느 도구인지는 문장이 아니라 **평평한 필드**로 나른다.
+        return fail(REASON.test_command_unavailable, {}, { unresolvedTool });
       }
-      return blocked(
-        `실행 파일이 절대 경로가 아닙니다: ${JSON.stringify(command)}`,
-        'deriveTestCommand 가 낸 command 를 그대로 넘기세요. 이름으로 스폰하면 Windows 의 libuv 가 ' +
-          '자식의 cwd(= 워크트리)를 PATH 보다 먼저 뒤져, 워크트리에 놓인 같은 이름의 실행 파일이 돕니다.',
-      );
+      return fail(REASON.test_plan_invalid);
     }
-    if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) {
-      return blocked('args 는 문자열 배열이어야 합니다.', 'deriveTestCommand 가 낸 args 를 그대로 넘기세요.');
-    }
+    if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) return fail(REASON.test_plan_invalid);
     // ★ 다른 인자는 전부 검증하는데 signal 만 안 했다. `AbortController` 를 넘기는 흔한
     //   배선 실수에서 셋업이 던지고, 봉투가 나간 **뒤에** 자식의 'error' 가 uncaught 로
     //   프로세스를 죽였다(실측). 'error' 리스너를 먼저 붙여 그 죽음은 닫았지만, 잘못된
     //   인자를 스폰까지 끌고 갈 이유는 없다.
     if (signal !== undefined && signal !== null && typeof signal.addEventListener !== 'function') {
-      return blocked(
-        'signal 은 AbortSignal 이어야 합니다 — addEventListener 가 없습니다.',
-        'AbortController 자체가 아니라 그 controller.signal 을 넘기세요.',
-      );
+      return fail(REASON.test_abort_signal_invalid);
+    }
+    // ★★ 자식의 cwd 와 **고정값을 되읽는 자리**는 다른 값이다. `tests.cwd` 를 적은 프로젝트는
+    //   하위 디렉터리에서 테스트를 돌리지만, 그 명령을 정의하는 파일(`package.json` ·
+    //   `pytest.ini` · csproj)은 여전히 저장소 루트의 것이다 — 아래 대조는 그래서 `worktree` 를
+    //   쓰고 스폰만 `spawnCwd` 를 쓴다. 둘을 하나로 뭉치면 하위 디렉터리 프로젝트의 고정 대조가
+    //   통째로 「읽지 못했다」가 되어 정상 실행이 영구 거부된다.
+    const spawnCwd = typeof options.cwd === 'string' && options.cwd !== '' ? options.cwd : worktree;
+    if (!isAbsolute(spawnCwd) || !insideWorktree(worktree, spawnCwd) || !(await isDirectory(spawnCwd))) {
+      return fail(REASON.test_plan_invalid);
     }
 
     // 정수가 아닌 값은 `src/deadline.mjs` 의 `timeoutSignal` 이 내림한다 — 그 한 곳이
@@ -1354,54 +443,28 @@ export async function runTests(spec) {
     //    권한과 환경으로 이미 돈 뒤다. 이 검사가 실행 앞에 있다는 것 자체가 §12.-1 의
     //    보증이다.
     if (!definition || typeof definition !== 'object' || typeof definition.value !== 'string') {
-      return {
-        ...blocked(
-          '고정된 테스트 명령 정의가 없어 워크트리의 명령이 그대로인지 확인할 수 없습니다.',
-          'deriveTestCommand 의 결과를 definition 까지 포함해 그대로 넘기세요. 확인하지 못한 명령은 실행하지 않습니다.',
-        ),
-        definitionCheck: 'missing',
-      };
+      return fail(REASON.test_plan_invalid, {}, { definitionCheck: 'missing' });
     }
 
     const current = await readDefinitionValue(worktree, definition);
     if (current === null) {
-      return {
-        ...blocked(
-          `워크트리에서 ${definition.file} 의 ${definition.key} 를 읽지 못해 고정값과 같은지 확인할 수 없습니다.`,
-          '워크트리에 그 파일이 있는지 확인하세요. 확인하지 못한 명령은 실행하지 않습니다.',
-        ),
-        definitionCheck: 'unreadable',
-      };
+      const drift = drifted(definition.file, definition.key, textDigestSummary(definition.value), 'unreadable');
+      return fail(drift.reasonCode, driftParams(drift), { definitionCheck: 'unreadable', drift: drift.drift });
     }
     if (current !== definition.value) {
       // ★ `npm-script` 만 원문을 싣는다 — scripts.test 실행 계약을 사람이 확인할 수 있게
       //   하는 좁은 예외다(`checkExtras` 의 같은 갈래와 같은 근거). 나머지 정의는 값이
       //   파일 본문 전체라 지문만 싣는다.
-      const show = definition.kind === 'npm-script' ? forMessage : textDigestSummary;
-      return {
-        ...blocked(
-          `델리게이트가 테스트 명령을 바꿨습니다 — 워크트리의 ${definition.file} 에서 ${definition.key} 가 ` +
-            `고정값과 다릅니다.\n고정값: ${show(definition.value)}\n현재값: ${show(current)}`,
-          '실행하지 않고 멈췄습니다. 바뀐 명령으로 낸 결과는 델리게이트가 고른 명령의 결과라 검증에 쓸 수 없습니다. ' +
-            '변경 내역을 확인하고, 그 변경이 정당하다면 사용자가 확인한 뒤 프로젝트 쪽 정의를 갱신하고 다시 유도하세요.',
-        ),
-        definitionCheck: 'changed',
-      };
+      const show = definition.kind === 'npm-script' ? (value) => clipCounted(value, MESSAGE_COMMAND_CHARS) : textDigestSummary;
+      const drift = drifted(definition.file, definition.key, show(definition.value), show(current));
+      return fail(drift.reasonCode, driftParams(drift), { definitionCheck: 'changed', drift: drift.drift });
     }
 
     // ── ★★ 같은 도구가 함께 읽는 입력들. 값이 null 인 항목은 "프로젝트에 없었다"가
     //    고정값이라, 워크트리에 새로 생기면 여기서 걸린다(위 §고정 대상 참조).
     const extras = await checkExtras(worktree, definition.extras);
-    if (extras.error !== undefined) {
-      return {
-        ...blocked(
-          extras.error,
-          '실행하지 않고 멈췄습니다. 고정한 테스트 명령은 그대로지만 같은 도구가 함께 읽는 입력이 달라졌고, ' +
-            '그 입력은 우리가 돌리는 명령을 바꿉니다. 변경 내역을 확인하고, 그 변경이 정당하다면 사용자가 ' +
-            '확인한 뒤 프로젝트 쪽에 반영하고 다시 유도하세요.',
-        ),
-        definitionCheck: 'changed',
-      };
+    if (extras.reasonCode !== undefined) {
+      return fail(extras.reasonCode, driftParams(extras), { definitionCheck: 'changed', drift: extras.drift });
     }
     notes.push(...extras.notes);
 
@@ -1428,7 +491,7 @@ export async function runTests(spec) {
     const run = await spawnAndCollect({
       command,
       args,
-      cwd: worktree,
+      cwd: spawnCwd,
       env: childEnv,
       signal,
       timeoutMs,
@@ -1442,23 +505,13 @@ export async function runTests(spec) {
     if (!run.ran) {
       confidence = 'unverified';
       // spawnError 는 Error 객체라 JSON 직렬화에서 `{}` 가 된다. 사유를 문자열로도 남긴다.
-      notes.push(`테스트 명령을 띄우지 못했습니다: ${run.spawnError}`);
+      notes.push(renderNotice('test_command_spawn_failed', { detail: errorText(run.spawnError) }));
     }
     if (run.timedOut || run.aborted || run.hung) confidence = 'unverified';
 
     // ★ 남은 프로세스는 사실로 알린다. 회수 경로가 없다(KILL_GRACE_MS 주석의 잔여 위험).
-    if (run.lingering) {
-      notes.push(
-        '스위트는 끝났는데 출력 파이프를 쥔 배경 프로세스가 남아 있습니다 — 종료 코드는 스위트의 것이 ' +
-          '맞지만, 그 프로세스는 워크트리 안에서 계속 돌고 이 러너에는 그것을 회수할 경로가 없습니다.',
-      );
-    }
-    if (run.hung) {
-      notes.push(
-        '끊은 뒤에도 출력 파이프가 닫히지 않아 결과를 기다리지 않고 나왔습니다 — 워크트리 안에 프로세스가 ' +
-          '남아 있을 수 있고, 이 러너에는 그것을 회수할 경로가 없습니다.',
-      );
-    }
+    if (run.lingering) notes.push(renderNotice('test_background_process_lingering', {}));
+    if (run.hung) notes.push(renderNotice('test_output_pipe_unclosed', {}));
 
     // 우리가 cwd 를 탐색에서 뺐기 때문에 못 푼 명령은 "테스트 실패"가 아니다. 로케일
     // 문자열에 기대지 않는 결정적 판정이라 MISSING_DEP_SIGNS 와 달리 확실하다.
@@ -1470,11 +523,9 @@ export async function runTests(spec) {
       const hasNodeModules = source === 'package.json' ? await isDirectory(join(worktree, 'node_modules')) : true;
       if (source !== 'package.json' || !hasNodeModules) {
         confidence = 'unverified';
-        notes.push(
-          source === 'package.json'
-            ? '워크트리에 node_modules 가 없어 의존성을 찾지 못했습니다 — 이 러너는 의존성을 설치하지도 링크하지도 않습니다.'
-            : '의존성을 찾지 못해 실패했습니다 — 이 러너는 의존성을 설치하지도 링크하지도 않습니다.',
-        );
+        notes.push(renderNotice(
+          source === 'package.json' ? 'test_node_modules_absent' : 'test_dependencies_missing', {},
+        ));
       }
     }
 
@@ -1509,26 +560,15 @@ export async function runTests(spec) {
       durationMs,
     };
   } catch (error) {
-    return blocked(
-      `테스트 러너가 예상치 못한 오류로 멈췄습니다: ${error}`,
-      '워크트리 경로와 deriveTestCommand 의 결과를 확인한 뒤 다시 시도하세요.',
-    );
+    // 던진 것을 버리지 않는다 — 이웃한 스폰 실패 알림과 같은 규율이다(평평한 `detail` 하나).
+    return fail(REASON.test_frozen_execution_failed, { detail: errorText(error) });
   }
 }
 
 // ── Policy v2: immutable plans and trusted test evidence ──────────────────
 
 const FROZEN_PLAN_RUNTIME = new WeakMap();
-const ADAPTER_EVIDENCE_POLICY = new WeakMap();
-const TEST_RECORD_WITNESS_AUTHORITY = new WeakMap();
-const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const MAX_ADAPTER_BYTES = 8 * 1024 * 1024;
-const MAX_ADAPTER_EVENTS = 20_000;
-const MAX_ADAPTER_LINE_CHARS = 16_384;
-const MAX_DIAGNOSTICS = 8;
-const MAX_DIAGNOSTIC_CHARS = 240;
 const TEST_MODES = new Set(['b0', 'br', 'c']);
-const ADAPTER_IDS = new Set(['node-events-v1', 'pytest-events-v1', 'dotnet-trx-v1']);
 const PLAN_KEYS = [
   'schemaVersion',
   'source',
@@ -1541,35 +581,6 @@ const PLAN_KEYS = [
   'environmentFingerprint',
   'regressionWitnessTrusted',
 ];
-
-const TEST_ASSET_LAYOUT =
-  typeof __BOM_ORCH_TEST_ASSET_LAYOUT__ === 'string' ? __BOM_ORCH_TEST_ASSET_LAYOUT__ : 'source';
-
-export function resolveTestAssetUrl({ moduleUrl = import.meta.url, layout = TEST_ASSET_LAYOUT, asset } = {}) {
-  const names = layout === 'source'
-    ? { node: './test-reporters/node-events.mjs', pytest: './test-reporters/pytest_events.py' }
-    : layout === 'dist'
-      ? { node: './node-test-reporter.mjs', pytest: './pytest_events.py' }
-      : null;
-  if (names === null || !Object.hasOwn(names, asset)) {
-    throw new TypeError('unknown test asset layout or asset');
-  }
-  return new URL(names[asset], moduleUrl);
-}
-
-function sha256(value) {
-  return createHash('sha256').update(value).digest('hex');
-}
-
-function hashJson(value) {
-  return sha256(Buffer.from(JSON.stringify(value), 'utf8'));
-}
-
-function deepFreeze(value) {
-  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
-  for (const child of Object.values(value)) deepFreeze(child);
-  return Object.freeze(value);
-}
 
 function currentNodeMajorMinor(version = process.versions.node) {
   const match = /^(\d+)\.(\d+)/.exec(String(version ?? ''));
@@ -1618,7 +629,7 @@ function publicDefinitionPins(definition) {
     grouped.set(path, current);
   }
   return [...grouped.entries()]
-    .sort(([a], [b]) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+    .sort(([a], [b]) => compareUtf8(a, b))
     .map(([path, values]) => ({ path, sha256: hashJson(values) }));
 }
 
@@ -1638,9 +649,6 @@ function tokenizeLiteralNodeScript(script) {
   )) return null;
   return args;
 }
-
-const DEFAULT_NODE_WITNESS_POLICY = deepFreeze({ kind: 'node', trusted: true, roots: ['test', 'tests'] });
-const DEFAULT_PYTEST_WITNESS_POLICY = deepFreeze({ kind: 'pytest', trusted: true, roots: ['test', 'tests'] });
 
 function validWitnessRoot(value) {
   if (typeof value !== 'string' || value === '' || value.length > 512 || value.includes('\0') || value.includes('\\') ||
@@ -1714,8 +722,80 @@ async function freezeControllerArgv(derived, deps = {}) {
   return { argv, launchers };
 }
 
-async function adapterPlan(derived, deps = {}) {
+/**
+ * `tests.reporter` -> the adapter that run REQUIRES (WS4a 태스크 7, 결정 6). 스키마의 enum 이
+ * 정본이고 이 표는 그것을 어댑터 이름으로 옮기는 자리다. `none` 이 `null` 로 가는 것은 값이
+ * 없어서가 아니라 **자동 판정을 끄는 것이 사용자가 고른 것**이기 때문이다.
+ */
+const CONFIG_REPORTER_ADAPTERS = new Map([
+  ['junit-xml', 'junit-xml-v1'],
+  ['node-events', 'node-events-v1'],
+  ['pytest-events', 'pytest-events-v1'],
+  ['dotnet-trx', 'dotnet-trx-v1'],
+  ['none', null],
+]);
+
+function declaredReporter(config) {
+  const reporter = config?.tests?.reporter;
+  return typeof reporter === 'string' && CONFIG_REPORTER_ADAPTERS.has(reporter) ? reporter : null;
+}
+
+/**
+ * 리포터를 **주입하지 않는** argv. 컨트롤러가 인자를 더하지 않는 두 경우가 같은 모양을 쓴다:
+ * 알아보지 못한 명령과, 프로젝트가 스스로 JUnit XML 을 내는 경우(`junit-xml` 은 우리가 인자를
+ * 더할 수 없다 — nextest·Gradle 은 CLI 플래그가 아예 없고, 그래서 스키마가 `resultsPath` 를
+ * 필수로 걸었다).
+ */
+async function uninstrumentedArgv(derived, deps) {
+  return derived.source === 'package.json'
+    ? freezeControllerArgv(derived, deps)
+    : { argv: [...derived.args], launchers: [] };
+}
+
+const noAdapter = (frozen) => ({
+  adapterId: null,
+  argv: frozen.argv,
+  regressionWitnessTrusted: false,
+  launchers: frozen.launchers,
+  witnessPolicy: null,
+});
+
+/**
+ * 어느 어댑터로 이 명령을 돌릴 것인가. **선언이 자동 판정을 이긴다** — 사용자가 `reporter` 를
+ * 적었다면 그것이 이 실행이 요구하는 증거다.
+ *
+ * ★ 셋(`node-events`·`pytest-events`·`dotnet-trx`)은 컨트롤러가 인자를 **주입해서** 만든다.
+ *   유도된 명령이 그것을 낼 수 없으면(pytest 프로젝트에 `node-events` 를 적은 경우) 우리는
+ *   그 요구를 들어줄 수 없다. 그때 다른 어댑터로 조용히 대체하면 사용자가 고르지 않은 증거가
+ *   그 이름으로 나가므로, 어댑터를 **끄고** 알림 한 줄로 무엇이 왜 안 걸렸는지 말한다.
+ */
+async function adapterPlan(derived, deps = {}, derivation = null) {
   if (derived === null) return { adapterId: null, argv: [], regressionWitnessTrusted: false, launchers: [], witnessPolicy: null };
+  const reporter = declaredReporter(derivation?.config ?? null);
+  if (reporter === 'junit-xml') {
+    const frozen = await uninstrumentedArgv(derived, deps);
+    return {
+      adapterId: 'junit-xml-v1',
+      argv: frozen.argv,
+      // ★★ 실측으로 거짓이 되지 않는 값을 고른다. 이 어댑터는 등급 A·B 에서 진짜 소스 결속
+      //   증인을 내지만, `REGRESSION_WITNESS_ADAPTERS`(`src/regression-proof.mjs`)는
+      //   `node-events-v1`·`pytest-events-v1` 둘뿐이라 그 증인이 회귀 증명에 **쓰이지 않는다**.
+      //   ★ 태스크 11 이 이 값을 켜 보고 되돌렸다: 목록을 넓히고 여기를 true 로 해도 분리는
+      //     여전히 멈춘다(`classifyFrozenTestPath` 에 junit 갈래가 없어 전부 helper — 그쪽 WHY).
+      //     지킬 수 없는 약속을 계획이 공시하지 않는 것이 이 false 의 뜻이다.
+      regressionWitnessTrusted: false,
+      launchers: frozen.launchers,
+      witnessPolicy: DEFAULT_JUNIT_WITNESS_POLICY,
+    };
+  }
+  if (reporter === 'none') return noAdapter(await uninstrumentedArgv(derived, deps));
+  const automatic = await automaticAdapterPlan(derived, deps);
+  if (reporter === null || CONFIG_REPORTER_ADAPTERS.get(reporter) === automatic.adapterId) return automatic;
+  derivation?.notices.push(renderNotice('project_config_reporter_unavailable', { reporter }));
+  return noAdapter(await uninstrumentedArgv(derived, deps));
+}
+
+async function automaticAdapterPlan(derived, deps = {}) {
   if (derived.source === 'package.json') {
     const args = tokenizeLiteralNodeScript(derived.definition?.value);
     if (args !== null && derived.command === process.execPath) {
@@ -1727,14 +807,7 @@ async function adapterPlan(derived, deps = {}) {
         witnessPolicy: DEFAULT_NODE_WITNESS_POLICY,
       };
     }
-    const frozen = await freezeControllerArgv(derived, deps);
-    return {
-      adapterId: null,
-      argv: frozen.argv,
-      regressionWitnessTrusted: false,
-      launchers: frozen.launchers,
-      witnessPolicy: null,
-    };
+    return noAdapter(await freezeControllerArgv(derived, deps));
   }
   if (derived.source === 'pytest.ini' || derived.source === 'pyproject.toml') {
     const witnessPolicy = pytestWitnessPolicy(derived.source, derived.definition?.value);
@@ -1755,7 +828,7 @@ async function adapterPlan(derived, deps = {}) {
       witnessPolicy: null,
     };
   }
-  return { adapterId: null, argv: [...derived.args], regressionWitnessTrusted: false, launchers: [], witnessPolicy: null };
+  return noAdapter({ argv: [...derived.args], launchers: [] });
 }
 
 function resolveExecutableAgain(path, deps = {}) {
@@ -1802,8 +875,12 @@ function exactPlanWithoutFingerprint(input) {
 
 /** Freeze the legacy-derived command as a whitelist-only, fingerprinted policy-v2 plan. */
 export async function deriveFrozenTestPlan(projectPath, deps = {}) {
-  const derived = await deriveTestCommand(projectPath, deps);
-  const recognized = await adapterPlan(derived, deps);
+  const derivation = newDerivation();
+  const derived = await deriveTestCommand(projectPath, deps, derivation);
+  // 사용자가 쓴 설정을 읽지 못한 실행은 계획을 만들지 않는다 — 엔진의 `isBlocked` 가 이
+  // 모양을 그대로 읽어 크레딧을 쓰기 전에 닫는다(`src/engine.mjs` 의 frozen test plan 단계).
+  if (derived !== null && derived.blocked === true) return derived;
+  const recognized = await adapterPlan(derived, deps, derivation);
   const identity = derived?.command ? await executableIdentity(derived.command, deps) : null;
   const executable = identity?.public ?? null;
   const launcherFacts = recognized.launchers.map(({ token, executable: launcher }) => ({ token, executable: launcher }));
@@ -1830,7 +907,13 @@ export async function deriveFrozenTestPlan(projectPath, deps = {}) {
     regressionWitnessTrusted: core.regressionWitnessTrusted,
   });
   FROZEN_PLAN_RUNTIME.set(plan, deepFreeze({
-    derived,
+    // ★ `deriveTestCommand` 는 자기 경계에서 알림을 한 번 얹었지만, `adapterPlan` 은 그 뒤에
+    //   돈다 — 선언된 리포터를 못 들어주는 사실은 어댑터를 고르는 자리에서만 알 수 있다.
+    //   그래서 같은 규칙을 여기서 한 번 더 적용한다(있을 때만, 항목 자체는 그대로).
+    derived: derived === null || derivation.notices.length === 0 ? derived : { ...derived, notices: [...derivation.notices] },
+    // ★ 파생 결과가 **null 이어도** 남는다(테스트 명령을 하나도 못 찾은 프로젝트). 설정은
+    //   읽혔는데 명령만 없는 실행이 있고, 그때도 `provisionDeps` 는 사용자가 쓴 사실이다.
+    baselineConfig: derivation.config,
     executablePath: identity?.path ?? null,
     executable: identity?.public ?? null,
     launchers: recognized.launchers,
@@ -1839,13 +922,8 @@ export async function deriveFrozenTestPlan(projectPath, deps = {}) {
   return plan;
 }
 
-function exactKeys(value, keys) {
-  return value && typeof value === 'object' &&
-    Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
-}
-
 function validFrozenPlan(plan) {
-  if (!exactKeys(plan, PLAN_KEYS) || !Object.isFrozen(plan) || plan.schemaVersion !== 1 ||
+  if (!hasExactKeys(plan, PLAN_KEYS) || !Object.isFrozen(plan) || plan.schemaVersion !== 1 ||
       plan.cwdPolicy !== 'evidence-worktree' || !SHA256_PATTERN.test(plan.planFingerprint) ||
       !SHA256_PATTERN.test(plan.environmentFingerprint) || !Array.isArray(plan.argv) ||
       plan.argv.some((arg) => typeof arg !== 'string') || !Array.isArray(plan.pinnedDefinitions)) return false;
@@ -1853,89 +931,34 @@ function validFrozenPlan(plan) {
   return hashJson(core) === plan.planFingerprint;
 }
 
-function safeRelativeSourcePath(value, worktreePath = null) {
-  if (typeof value !== 'string' || value === '' || value.length > 4_096 || /[\u0000-\u001f\u007f\uFFFD]/.test(value)) return null;
-  let path = value;
-  if (path.startsWith('file:')) {
-    try { path = fileURLToPath(path); } catch { return null; }
-  }
-  if (isAbsolute(path)) {
-    if (worktreePath === null) return null;
-    const rel = relative(worktreePath, path);
-    if (rel === '' || isAbsolute(rel) || rel.split(/[\\/]/).includes('..')) return null;
-    path = rel.replaceAll('\\', '/');
-  }
-  // ★★ 어댑터는 **상대** 경로를 OS 구분자로 낸다 — Windows 의 pytest 는
-  //   `tests\test_math.py` 를 보고한다. 아래 검사는 역슬래시가 하나라도 있으면 거부하므로,
-  //   그 플랫폼에서는 pytest 증거가 **통째로** 무효가 됐다(실측: 같은 스트림에서 구분자만
-  //   바꾸면 witness 1개·digest 있음 → witness 0개·digest null). 그러면 Python 저장소는
-  //   Windows 에서 영영 `verified` 에도 회귀 증명에도 닿지 못한다.
-  //
-  // ★ 정규화는 **win32 에서만** 한다. POSIX 에서 `\` 는 적법한 파일명 문자라, 거기서
-  //   바꿔치면 없던 경로 구획을 만들어 내고 witness ID 가 다른 파일을 가리키게 된다.
-  //   절대 경로 분기는 이미 같은 정규화를 하고 있었다 — 상대 경로만 빠져 있었다.
-  if (process.platform === 'win32') path = path.replaceAll('\\', '/');
-  if (/^[A-Za-z]:|^[/\\]|\\/.test(path)) return null;
-  const parts = path.normalize('NFC').split('/');
-  if (parts.some((part) => part === '' || part === '.' || part === '..')) return null;
-  return parts.join('/');
+/**
+ * 이 계획을 파생하며 쌓인 알림들. 계획 객체에는 실을 자리가 없다 — 키 집합이 정확히
+ * `PLAN_KEYS` 여야 하고(`validFrozenPlan` 의 `hasExactKeys`) 그중 지문 말고는 전부
+ * `planFingerprint` 의 입력이라, 알림 한 줄이 지문을 바꾸면 재개의 계획 관문이 같은
+ * 프로젝트를 다른 계획이라고 말한다. 그래서 파생 결과와 함께
+ * 사설 런타임에 두고, 엔진이 여기서 꺼내 종료 봉투의 알림 채널로 옮긴다
+ * (`plannerNotices` → `baseNotices` → `joinNotices`).
+ */
+export function frozenTestPlanNotices(plan) {
+  const notices = FROZEN_PLAN_RUNTIME.get(plan)?.derived?.notices;
+  return Array.isArray(notices) ? [...notices] : [];
 }
 
-function parseJsonLines(bytes) {
-  if (typeof bytes !== 'string' || bytes === '' || bytes.length > MAX_ADAPTER_BYTES || !bytes.endsWith('\n')) return null;
-  const lines = bytes.slice(0, -1).split('\n');
-  if (lines.length === 0 || lines.length > MAX_ADAPTER_EVENTS || lines.some((line) => line === '' || line.length > MAX_ADAPTER_LINE_CHARS)) return null;
-  try {
-    return lines.map((line) => JSON.parse(line));
-  } catch {
-    return null;
-  }
-}
-
-function exactObject(value, keys) {
-  return value && typeof value === 'object' && !Array.isArray(value) &&
-    Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
-}
-
-function normalizeFullTestName(value) {
-  if (typeof value !== 'string' || value === '' || value.length > 4_096 || /[\u0000-\u001f\u007f\uFFFD]/.test(value)) return null;
-  return value.normalize('NFC');
-}
-
-function witnessId(adapterId, path, fullName) {
-  return sha256(Buffer.from(`${adapterId}\0${path}\0${fullName}`, 'utf8'));
-}
-
-function invalidEvidence(kind = 'collection') {
-  return {
-    trusted: false,
-    complete: false,
-    witnessIds: [],
-    failureFingerprints: [],
-    failureKind: kind,
-    observedOutcome: 'unknown',
-    terminalExitCode: null,
-    witnessAuthority: [],
-  };
-}
-
-function pathUnderRoot(path, root) {
-  return path === root || path.startsWith(`${root}/`);
-}
-
-function pathAllowedByPolicy(adapterId, path, policy) {
-  if (policy?.trusted === false) return false;
-  const basenameValue = path.split('/').at(-1);
-  if (adapterId === 'node-events-v1') {
-    const roots = policy?.kind === 'node' ? policy.roots : DEFAULT_NODE_WITNESS_POLICY.roots;
-    return roots.some((root) => pathUnderRoot(path, root)) || /\.(?:test|spec)\.[^.]+$/i.test(basenameValue);
-  }
-  if (adapterId === 'pytest-events-v1') {
-    const roots = policy?.kind === 'pytest' ? policy.roots : DEFAULT_PYTEST_WITNESS_POLICY.roots;
-    return roots.some((root) => pathUnderRoot(path, root)) &&
-      (/^test_.+\.py$/i.test(basenameValue) || /^.+_test\.py$/i.test(basenameValue));
-  }
-  return false;
+/**
+ * 이 계획을 파생하며 **baseline 커밋에서 읽은** 프로젝트 설정. 없으면 null.
+ *
+ * 소비자는 `src/engine.mjs` 하나이고, 읽는 것은 `tests.provisionDeps` 뿐이다(WS4a 태스크 5).
+ * 계획 객체에 실을 수 없는 이유는 알림과 같다 — 키 집합이 정확히 `PLAN_KEYS` 여야 하고 그중
+ * 지문 말고는 전부 `planFingerprint` 의 입력이라, 설정 한 줄이 지문을 바꾸면 재개의 계획
+ * 관문이 같은 프로젝트를 다른 계획이라고 말한다.
+ *
+ * ★★ **이 채널이 "워크트리 사본을 읽지 않는다" 를 지키는 방식이다.** 값은 `readProjectConfig`
+ *   가 `deps.projectConfigCommit` 커밋 오브젝트에서 읽은 그 값이고, 워크트리 파일을 여는 경로는
+ *   이 파일 어디에도 없다(`verifyDefinition` 의 대조 하나만 예외이고 그것은 **거부**에만 쓴다).
+ *   주입된 계획에는 사설 런타임이 아예 없으므로 null 이 나온다 — 설정을 도입하기 전의 동작이다.
+ */
+export function frozenTestPlanConfig(plan) {
+  return FROZEN_PLAN_RUNTIME.get(plan)?.baselineConfig ?? null;
 }
 
 /** Classify one normalized path using only the private witness policy frozen with the original plan. */
@@ -1957,415 +980,6 @@ export function classifyFrozenTestPath(plan, path) {
     return ordinary ? 'test' : underRoot ? 'helper' : 'outside';
   }
   return 'helper';
-}
-
-function sameNodeRecord(entry, event, path, name) {
-  return entry.path === path && entry.name === name && entry.kind === event.kind && entry.line === event.line &&
-    entry.column === event.column && entry.nesting === event.nesting;
-}
-
-function parseNodeEvidence(bytes, worktreePath = null, witnessPolicy = DEFAULT_NODE_WITNESS_POLICY) {
-  const events = parseJsonLines(bytes);
-  if (events === null) return invalidEvidence();
-  const stack = [];
-  const witnesses = [];
-  const failureFingerprints = [];
-  const witnessAuthority = [];
-  let failureKind = 'unknown';
-  let terminal = null;
-  let completedCount = 0;
-  let failedCount = 0;
-  for (let index = 0; index < events.length; index += 1) {
-    const event = events[index];
-    if (event?.type === 'terminal') {
-      if (terminal !== null || index !== events.length - 1 || !exactObject(event, ['type', 'count']) ||
-          !Number.isInteger(event.count) || event.count < 0) return invalidEvidence();
-      terminal = event;
-      continue;
-    }
-    const keys = ['type', 'kind', 'name', 'file', 'line', 'column', 'nesting', 'failureType'];
-    if (!exactObject(event, keys) || !['enqueue', 'pass', 'fail'].includes(event.type) ||
-        !['test', 'suite'].includes(event.kind) ||
-        typeof event.name !== 'string' || event.name === '' || event.name.length > 1_024 || event.name.includes(' > ') ||
-        !Number.isInteger(event.line) || event.line < 1 || !Number.isInteger(event.column) || event.column < 0 ||
-        !Number.isInteger(event.nesting) || event.nesting < 0 || event.nesting > 64 ||
-        (event.failureType !== null && typeof event.failureType !== 'string')) return invalidEvidence();
-    const path = safeRelativeSourcePath(event.file, worktreePath);
-    const name = normalizeFullTestName(event.name);
-    if (path === null || name === null) return invalidEvidence();
-    if (event.type === 'enqueue') {
-      if (event.failureType !== null || event.nesting !== stack.length ||
-          (stack.length > 0 && (stack.at(-1).path !== path || stack.at(-1).kind !== 'suite'))) return invalidEvidence();
-      for (const parent of stack) parent.hasChild = true;
-      const fullName = [...stack.map((entry) => entry.name), name].join(' > ');
-      if (normalizeFullTestName(fullName) === null) return invalidEvidence();
-      stack.push({
-        path,
-        kind: event.kind,
-        name,
-        fullName,
-        line: event.line,
-        column: event.column,
-        nesting: event.nesting,
-        hasChild: false,
-        descendantFailed: false,
-      });
-      continue;
-    }
-    const current = stack.at(-1);
-    if (!current || event.nesting !== stack.length - 1 || !sameNodeRecord(current, event, path, name)) return invalidEvidence();
-    stack.pop();
-    completedCount += 1;
-    if (current.kind === 'suite') {
-      if (current.descendantFailed) {
-        if (event.type !== 'fail' || event.failureType !== 'subtestsFailed') return invalidEvidence('infrastructure');
-        for (const parent of stack) parent.descendantFailed = true;
-      } else if (event.type === 'fail') {
-        failureKind = 'infrastructure';
-        failedCount += 1;
-        for (const parent of stack) parent.descendantFailed = true;
-      } else if (event.failureType !== null) {
-        return invalidEvidence('infrastructure');
-      }
-      continue;
-    }
-    if (current.hasChild) return invalidEvidence('infrastructure');
-    if (event.type === 'fail') {
-      if (event.failureType !== 'testCodeFailure') return invalidEvidence('infrastructure');
-      failureKind = 'assertion';
-      failedCount += 1;
-      for (const parent of stack) parent.descendantFailed = true;
-    } else if (event.failureType !== null) {
-      // ★★ `skip`/`todo` 는 **몸통이 안 돌았다**는 directive 이지 스트림이 깨졌다는 신호가
-      //   아니다. 이 자리에서 스트림 전체를 무효로 만들면 출력 digest 가 사라져
-      //   `trusted:false` 가 되고, 테스트 하나만 skip 해 둔 저장소는 `verified` 에도
-      //   회귀 증명에도 영영 닿지 못한다. 그 항목만 증인에서 빼면 충분하다 — 돌지 않은
-      //   테스트는 어떤 파일도 덮었다고 주장하지 않으므로 위조 위험이 늘지 않고,
-      //   설계 §9.4 의 「C 에서 대상 test 가 skip 되어 green 이 됨」도 그 증인이 **없는** 것
-      //   으로 그대로 걸린다. 그 밖의 모르는 directive 는 여전히 치명적이다.
-      if (event.failureType !== 'skip' && event.failureType !== 'todo') return invalidEvidence();
-      continue;
-    }
-    if (!pathAllowedByPolicy('node-events-v1', path, witnessPolicy)) continue;
-    const id = witnessId('node-events-v1', path, current.fullName);
-    if (witnesses.includes(id)) return invalidEvidence();
-    witnesses.push(id);
-    witnessAuthority.push({
-      adapterId: 'node-events-v1',
-      path,
-      fullName: current.fullName,
-      outcome: event.type === 'fail' ? 'fail' : 'pass',
-      witnessId: id,
-    });
-    if (event.type === 'fail') failureFingerprints.push(sha256(Buffer.from(`assertion\0${id}`, 'utf8')));
-  }
-  if (terminal === null || stack.length !== 0 || terminal.count !== completedCount) return invalidEvidence();
-  return {
-    trusted: true,
-    complete: true,
-    witnessIds: witnesses.sort(),
-    failureFingerprints: failureFingerprints.sort(),
-    failureKind,
-    observedOutcome: failedCount > 0 ? 'fail' : 'pass',
-    terminalExitCode: null,
-    witnessAuthority,
-  };
-}
-
-function parsePytestIdentity(event, worktreePath) {
-  const path = safeRelativeSourcePath(event.path, worktreePath);
-  if (path === null) return null;
-  const nodeid = normalizeFullTestName(event.nodeid.replaceAll('\\', '/'));
-  if (nodeid === null || !nodeid.startsWith(`${path}::`)) return null;
-  const fullName = normalizeFullTestName(nodeid.slice(path.length + 2));
-  return fullName === null ? null : { path, nodeid, fullName };
-}
-
-function parsePytestEvidence(bytes, worktreePath = null, witnessPolicy = DEFAULT_PYTEST_WITNESS_POLICY) {
-  const events = parseJsonLines(bytes);
-  if (events === null) return invalidEvidence();
-  const collected = new Map();
-  const phases = new Map();
-  const witnesses = [];
-  const failures = [];
-  const witnessAuthority = [];
-  let session = null;
-  for (let index = 0; index < events.length; index += 1) {
-    const event = events[index];
-    const keys = ['type', 'nodeid', 'path', 'line', 'outcome', 'when', 'wasxfail'];
-    if (!exactObject(event, keys)) return invalidEvidence();
-    if (event.type === 'session') {
-      if (session !== null || index !== events.length - 1 || event.nodeid !== '' || event.path !== '' ||
-          event.line !== null || event.when !== 'session' || event.wasxfail !== false || !/^[0-9]+$/.test(event.outcome)) return invalidEvidence();
-      session = event;
-      continue;
-    }
-    if (typeof event.nodeid !== 'string' || event.nodeid === '' || event.nodeid.length > 4_096 ||
-        !Number.isInteger(event.line) || event.line < 1 || typeof event.outcome !== 'string' || typeof event.wasxfail !== 'boolean') return invalidEvidence();
-    const identity = parsePytestIdentity(event, worktreePath);
-    if (identity === null) return invalidEvidence();
-    const key = identity.nodeid;
-    if (event.type === 'collect') {
-      if (event.outcome !== 'collected' || event.when !== 'collection' || event.wasxfail || collected.has(key)) return invalidEvidence();
-      collected.set(key, { ...identity, line: event.line });
-    } else if (event.type === 'test') {
-      const source = collected.get(key);
-      if (!source || source.path !== identity.path || source.line !== event.line || !['setup', 'call', 'teardown'].includes(event.when) ||
-          !['passed', 'failed', 'skipped'].includes(event.outcome)) return invalidEvidence();
-      const current = phases.get(key) ?? new Map();
-      if (current.has(event.when)) return invalidEvidence();
-      current.set(event.when, event);
-      phases.set(key, current);
-    } else return invalidEvidence();
-  }
-  if (session === null || collected.size === 0 || phases.size !== collected.size) return invalidEvidence();
-  for (const [key, source] of collected) {
-    const current = phases.get(key);
-    if (!current || current.size !== 3 || !current.has('setup') || !current.has('call') || !current.has('teardown')) return invalidEvidence();
-    const setup = current.get('setup');
-    const call = current.get('call');
-    const teardown = current.get('teardown');
-    // ★★ Node 쪽과 같은 이유로, skip·xfail 은 그 항목만 증인에서 뺀다. 스트림 전체를
-    //   무효로 만들면 `@pytest.mark.skip` 하나가 저장소의 회귀 증명을 통째로 없앤다.
-    if ([setup, call, teardown].some((event) => event.wasxfail || event.outcome === 'skipped')) continue;
-    if (setup.outcome !== 'passed' || teardown.outcome !== 'passed' || !['passed', 'failed'].includes(call.outcome)) return invalidEvidence();
-    if (pathAllowedByPolicy('pytest-events-v1', source.path, witnessPolicy)) {
-      const id = witnessId('pytest-events-v1', source.path, source.fullName);
-      if (witnesses.includes(id)) return invalidEvidence();
-      witnesses.push(id);
-      witnessAuthority.push({
-        adapterId: 'pytest-events-v1',
-        path: source.path,
-        fullName: source.fullName,
-        outcome: call.outcome === 'failed' ? 'fail' : 'pass',
-        witnessId: id,
-      });
-      if (call.outcome === 'failed') failures.push(sha256(Buffer.from(`assertion\0${id}`, 'utf8')));
-    }
-  }
-  const exitCode = Number(session.outcome);
-  const failedCalls = [...phases.values()].filter((current) => current.get('call')?.outcome === 'failed').length;
-  if (![0, 1].includes(exitCode) || (exitCode === 0) !== (failedCalls === 0)) return invalidEvidence();
-  return {
-    trusted: true,
-    complete: true,
-    witnessIds: witnesses.sort(),
-    failureFingerprints: failures.sort(),
-    failureKind: failedCalls > 0 ? 'assertion' : 'unknown',
-    observedOutcome: failedCalls > 0 ? 'fail' : 'pass',
-    terminalExitCode: exitCode,
-    witnessAuthority,
-  };
-}
-
-function parseTrxEvidence(bytes) {
-  if (typeof bytes !== 'string' || bytes === '' || bytes.length > MAX_ADAPTER_BYTES || !/<TestRun\b/.test(bytes) || !/<\/TestRun>\s*$/.test(bytes)) return invalidEvidence();
-  const results = [...bytes.matchAll(/<UnitTestResult\b([^>]*)\/>/g)];
-  const summary = /<ResultSummary\b[^>]*\boutcome="([^"]+)"/.exec(bytes);
-  if (results.length === 0 || summary === null) return invalidEvidence();
-  const failed = [];
-  for (const match of results) {
-    const name = /\btestName="([^"]+)"/.exec(match[1])?.[1];
-    const outcome = /\boutcome="([^"]+)"/.exec(match[1])?.[1];
-    if (!name || name.length > 4_096 || !['Passed', 'Failed'].includes(outcome)) return invalidEvidence();
-    if (outcome === 'Failed') failed.push(sha256(Buffer.from(`dotnet-trx-v1\0${name}`, 'utf8')));
-  }
-  if ((summary[1] === 'Passed') !== (failed.length === 0) || !['Passed', 'Failed'].includes(summary[1])) return invalidEvidence();
-  return {
-    trusted: true,
-    complete: true,
-    witnessIds: [],
-    failureFingerprints: failed.sort(),
-    failureKind: failed.length > 0 ? 'assertion' : 'unknown',
-    observedOutcome: failed.length > 0 ? 'fail' : 'pass',
-    terminalExitCode: null,
-    witnessAuthority: [],
-  };
-}
-
-function parseAdapterEvidence(adapterEvidence) {
-  if (!adapterEvidence || typeof adapterEvidence !== 'object' || !ADAPTER_IDS.has(adapterEvidence.adapterId) ||
-      typeof adapterEvidence.bytes !== 'string') return invalidEvidence('unknown');
-  if (adapterEvidence.adapterId === 'node-events-v1') {
-    return parseNodeEvidence(
-      adapterEvidence.bytes,
-      adapterEvidence.worktreePath ?? null,
-      ADAPTER_EVIDENCE_POLICY.get(adapterEvidence) ?? DEFAULT_NODE_WITNESS_POLICY,
-    );
-  }
-  if (adapterEvidence.adapterId === 'pytest-events-v1') {
-    return parsePytestEvidence(
-      adapterEvidence.bytes,
-      adapterEvidence.worktreePath ?? null,
-      ADAPTER_EVIDENCE_POLICY.get(adapterEvidence) ?? DEFAULT_PYTEST_WITNESS_POLICY,
-    );
-  }
-  return parseTrxEvidence(adapterEvidence.bytes);
-}
-
-function observedOutputDigest(raw, execution, rawComplete, adapterAuthorityComplete) {
-  if (execution !== 'completed' || !rawComplete || !adapterAuthorityComplete || raw?.truncated !== false ||
-      typeof raw.output !== 'string' || raw.outputChars !== raw.output.length) return null;
-  // Legacy capture is head/tail-capped. A digest of it must never masquerade as a full-stream digest.
-  return sha256(Buffer.from(raw.output, 'utf8'));
-}
-
-function classifyWithRequiredAdapter(rawResult, adapterEvidence, requiredAdapterId) {
-  const raw = rawResult && typeof rawResult === 'object' ? rawResult : {};
-  const parsed = parseAdapterEvidence(adapterEvidence);
-  let execution;
-  if (raw.aborted === true) execution = 'aborted';
-  else if (raw.timedOut === true) execution = 'timeout';
-  else if (raw.hung === true) execution = 'hung';
-  else if (raw.lingering === true) execution = 'lingering';
-  else if (raw.spawnError) execution = 'spawn_error';
-  else if (raw.ran === true || typeof raw.exitCode === 'number' || typeof raw.passed === 'boolean') execution = 'completed';
-  else execution = 'not_run';
-
-  const rawComplete = (execution === 'completed' || execution === 'lingering') && raw.ran === true &&
-    typeof raw.passed === 'boolean' && Number.isInteger(raw.exitCode) && raw.exitCode >= 0 &&
-    raw.passed === (raw.exitCode === 0);
-  let outcome = rawComplete ? raw.passed ? 'pass' : 'fail' : 'unknown';
-  const adapterMismatch = rawComplete && parsed.complete && parsed.observedOutcome !== outcome ||
-    rawComplete && parsed.complete && parsed.terminalExitCode !== null && parsed.terminalExitCode !== raw.exitCode;
-  const adapterAuthorityComplete = requiredAdapterId === null ||
-    ADAPTER_IDS.has(requiredAdapterId) && adapterEvidence?.adapterId === requiredAdapterId &&
-      parsed.trusted && parsed.complete && !adapterMismatch;
-  if (adapterMismatch) outcome = 'unknown';
-  let failureKind = 'unknown';
-  if (['spawn_error', 'timeout', 'aborted', 'hung', 'lingering'].includes(execution)) failureKind = 'infrastructure';
-  else if (execution === 'completed' && (!rawComplete || adapterMismatch)) failureKind = 'infrastructure';
-  else if (execution === 'completed' && raw.failureKind === 'infrastructure') failureKind = 'infrastructure';
-  else if (execution === 'completed' && adapterEvidence && !parsed.complete) failureKind = parsed.failureKind;
-  else if (execution === 'completed' && outcome === 'fail') {
-    const output = String(raw.output ?? '');
-    if (adapterEvidence && parsed.failureKind === 'infrastructure') {
-      failureKind = 'infrastructure';
-    } else if (raw.failureKind === 'collection' || (adapterEvidence && parsed.failureKind === 'collection')) {
-      failureKind = 'collection';
-    } else if (raw.failureKind === 'compile' || /\b(?:SyntaxError|Compilation failed|Build FAILED)\b/i.test(output)) {
-      failureKind = 'compile';
-    } else if (raw.failureKind === 'dependency' || MISSING_DEP_SIGNS.some((sign) => output.includes(sign))) {
-      failureKind = 'dependency';
-    } else if (raw.failureKind === 'infrastructure') {
-      failureKind = 'infrastructure';
-    } else if (raw.failureKind === 'assertion' && parsed.trusted && parsed.complete && parsed.witnessIds.length > 0) {
-      failureKind = 'assertion';
-    } else if (parsed.failureKind === 'assertion' && parsed.trusted && parsed.complete) {
-      failureKind = 'assertion';
-    }
-  } else if (execution === 'not_run' && raw.failureKind === 'infrastructure') {
-    failureKind = 'infrastructure';
-  }
-
-  const acceptWitnesses = execution === 'completed' && rawComplete && !adapterMismatch && parsed.trusted && parsed.complete &&
-    (outcome === 'pass' && failureKind === 'unknown' || outcome === 'fail' && failureKind === 'assertion');
-  const witnessIds = acceptWitnesses ? parsed.witnessIds : [];
-  const failureFingerprints = acceptWitnesses ? parsed.failureFingerprints : [];
-  const reproduction = execution === 'completed' && outcome === 'fail' && failureKind === 'assertion' && witnessIds.length > 0;
-  const stability = 'unknown';
-  const classified = {
-    execution,
-    outcome,
-    failureKind,
-    stability,
-    reproduction,
-    witnessIds,
-    failureFingerprints,
-    outputSha256: observedOutputDigest(raw, execution, rawComplete, adapterAuthorityComplete),
-    outputChars: Number.isInteger(raw.outputChars) && raw.outputChars >= 0
-      ? raw.outputChars
-      : typeof raw.output === 'string' ? raw.output.length : 0,
-  };
-  const authority = acceptWitnesses && Array.isArray(parsed.witnessAuthority)
-    ? parsed.witnessAuthority.map((entry) => ({ ...entry }))
-    : [];
-  TEST_RECORD_WITNESS_AUTHORITY.set(classified, deepFreeze(authority));
-  return classified;
-}
-
-/** Classify one raw runner result without retaining raw output or process objects. */
-export function classifyTestExecution(rawResult, adapterEvidence = null) {
-  const requiredAdapterId = adapterEvidence === null ? null : adapterEvidence?.adapterId ?? 'invalid';
-  return classifyWithRequiredAdapter(rawResult, adapterEvidence, requiredAdapterId);
-}
-
-function sameStringList(a, b) {
-  return Array.isArray(a) && Array.isArray(b) && a.length === b.length &&
-    a.every((value, index) => value === b[index]);
-}
-
-function sortedShaList(values) {
-  if (!Array.isArray(values) || values.some((value) => typeof value !== 'string' || !SHA256_PATTERN.test(value))) {
-    return null;
-  }
-  const sorted = [...new Set(values)].sort();
-  return sorted.length === values.length ? sorted : null;
-}
-
-/** Select path-free witness authority for the exact regression-test delta from an original returned record. */
-export function selectTestDeltaWitnesses(record, deltaPaths) {
-  const authority = TEST_RECORD_WITNESS_AUTHORITY.get(record);
-  if (authority === undefined || !Array.isArray(deltaPaths)) return null;
-  const normalizedPaths = deltaPaths.map((path) => safeRelativeSourcePath(path));
-  if (normalizedPaths.some((path, index) => path === null || path !== deltaPaths[index]) ||
-      new Set(normalizedPaths).size !== normalizedPaths.length) return null;
-  const publicWitnesses = sortedShaList(record?.witnessIds);
-  const publicFailures = sortedShaList(record?.failureFingerprints);
-  if (publicWitnesses === null || publicFailures === null) return null;
-  const authorityWitnesses = authority.map((entry) => entry.witnessId).sort();
-  const authorityFailures = authority
-    .filter((entry) => entry.outcome === 'fail')
-    .map((entry) => sha256(Buffer.from(`assertion\0${entry.witnessId}`, 'utf8')))
-    .sort();
-  if (!sameStringList(publicWitnesses, authorityWitnesses) || !sameStringList(publicFailures, authorityFailures)) {
-    return null;
-  }
-  for (const entry of authority) {
-    if (!exactObject(entry, ['adapterId', 'path', 'fullName', 'outcome', 'witnessId']) ||
-        !ADAPTER_IDS.has(entry.adapterId) || !['pass', 'fail'].includes(entry.outcome) ||
-        safeRelativeSourcePath(entry.path) !== entry.path || normalizeFullTestName(entry.fullName) !== entry.fullName ||
-        witnessId(entry.adapterId, entry.path, entry.fullName) !== entry.witnessId) return null;
-  }
-  const selected = authority.filter((entry) => normalizedPaths.includes(entry.path));
-  return deepFreeze({
-    witnessIds: selected.map((entry) => entry.witnessId).sort(),
-    assertionWitnessIds: selected
-      .filter((entry) => entry.outcome === 'fail')
-      .map((entry) => entry.witnessId)
-      .sort(),
-  });
-}
-
-function boundedDiagnostics(values) {
-  return [...new Set(values)]
-    .filter((value) => typeof value === 'string' && value !== '')
-    .slice(0, MAX_DIAGNOSTICS)
-    .map((value) => value.slice(0, MAX_DIAGNOSTIC_CHARS));
-}
-
-function persistableRecord(plan, raw, evidence, diagnostics = []) {
-  const classified = classifyWithRequiredAdapter(raw, evidence, plan?.adapterId ?? null);
-  const record = {
-    ...classified,
-    // ★★ 설계 §5.8 S1. 이 레코드는 `runTests` 의 `notes` 를 **버린다** — 산문은 아티팩트에 못
-    //   들어간다. 그런데 그 `notes` 안에 `USER_PRIVILEGE_NOTE` 하나가 섞여 있었고, 그것이 이
-    //   제품이 S1(비밀 유출)에 대해 하는 **유일한** 대응이다. 그래서 산문 대신 그 신고가 딛고 선
-    //   사실 하나만 남긴다: 우리가 사용자 권한으로 자식을 **실제로 돌렸는가**.
-    //
-    // ★ `execution` 으로는 이걸 못 잰다. 스폰 전 중단과 스폰 후 중단이 둘 다 `'aborted'` 라서,
-    //   그 값으로 판단하면 한 줄도 안 돌린 실행을 "돌았다"고 신고하게 된다.
-    ranWithUserPrivilege: raw?.ran === true,
-    planFingerprint: plan?.planFingerprint && SHA256_PATTERN.test(plan.planFingerprint) ? plan.planFingerprint : sha256('invalid-plan'),
-    environmentFingerprint:
-      plan?.environmentFingerprint && SHA256_PATTERN.test(plan.environmentFingerprint)
-        ? plan.environmentFingerprint
-        : sha256('invalid-environment'),
-    truncated: raw?.truncated === true,
-    diagnostics: boundedDiagnostics(diagnostics),
-  };
-  TEST_RECORD_WITNESS_AUTHORITY.set(record, TEST_RECORD_WITNESS_AUTHORITY.get(classified) ?? deepFreeze([]));
-  return record;
 }
 
 function noRun(plan, code, { aborted = false } = {}) {
@@ -2411,21 +1025,21 @@ async function reconstructFrozenArgv(runtime, plan, executablePath, deps = {}) {
 
 async function inspectFrozenTestPlanEnvironment(plan, deps = {}) {
   const runtime = FROZEN_PLAN_RUNTIME.get(plan);
-  if (!validFrozenPlan(plan) || runtime === undefined) return { ok: false, reasonCode: 'invalid_frozen_plan' };
+  if (!validFrozenPlan(plan) || runtime === undefined) return { ok: false, reasonCode: REASON.test_plan_invalid };
   if (runtime.derived === null || runtime.executablePath === null || runtime.executable === null) {
-    return { ok: false, reasonCode: 'test_command_unavailable' };
+    return { ok: false, reasonCode: REASON.test_command_unavailable };
   }
   try {
     const resolved = await resolveExecutableAgain(runtime.executablePath, deps);
     const identity = await executableIdentity(resolved, deps);
     if (identity === null || identity.path !== runtime.executablePath ||
         !sameExecutable(identity.public, runtime.executable)) {
-      return { ok: false, reasonCode: 'executable_identity_drift' };
+      return { ok: false, reasonCode: REASON.test_executable_drift };
     }
     const reconstructed = await reconstructFrozenArgv(runtime, plan, identity.path, deps);
-    if (reconstructed === null) return { ok: false, reasonCode: 'launcher_identity_drift' };
+    if (reconstructed === null) return { ok: false, reasonCode: REASON.test_launcher_drift };
     if (environmentFingerprint(plan.adapterId, identity.public, reconstructed.facts, deps) !== plan.environmentFingerprint) {
-      return { ok: false, reasonCode: 'environment_fingerprint_drift' };
+      return { ok: false, reasonCode: REASON.test_environment_drift };
     }
     return {
       ok: true,
@@ -2435,7 +1049,7 @@ async function inspectFrozenTestPlanEnvironment(plan, deps = {}) {
       argv: reconstructed.argv,
     };
   } catch {
-    return { ok: false, reasonCode: 'executable_identity_drift' };
+    return { ok: false, reasonCode: REASON.test_executable_drift };
   }
 }
 
@@ -2466,73 +1080,14 @@ async function verifyDefinition(worktreePath, definition) {
   if (!definition || typeof definition !== 'object' || typeof definition.value !== 'string') return false;
   const current = await readDefinitionValue(worktreePath, definition);
   if (current === null || current !== definition.value) return false;
+  // ★★ **`extras.error` 는 이 함수가 만들어진 뒤로 한 번도 존재하지 않은 키다.** `checkExtras`
+  //   는 `{reasonCode, drift}`(WS2 Task 15 가 문장 대신 코드를 내도록 바꾼 모양) 아니면
+  //   `{notes}` 를 내고, 둘 중 어느 것에도 `error` 가 없다 — 그래서 이 줄은 **언제나 참**이었고,
+  //   얼어붙은 계획 경로에서는 extras 드리프트가 한 번도 실행을 막은 적이 없다. `runTests`
+  //   쪽 같은 검사(:466)는 `reasonCode` 를 보고, 대조 테스트도 전부 그쪽에만 붙어 있어서
+  //   이 죽은 가지는 붉어질 자리가 없었다. 두 자리가 **같은 키**를 본다.
   const extras = await checkExtras(worktreePath, definition.extras);
-  return extras.error === undefined;
-}
-
-async function createOwnedEventFile(worktreePath, deps = {}) {
-  const suffix = typeof deps.randomSuffix === 'function' ? deps.randomSuffix() : randomBytes(12).toString('hex');
-  if (!/^[0-9a-f]{24}$/.test(suffix)) throw new Error('invalid event suffix');
-  const path = join(worktreePath, `.bom-orch-test-${suffix}.jsonl`);
-  const handle = await (deps.openEventFile ?? open)(path, 'wx', 0o600);
-  try {
-    await handle.close();
-    const info = await (deps.lstatCreatedEventFile ?? lstat)(path);
-    const real = await (deps.canonicalCreatedEventFile ?? canonical)(path);
-    if (!info.isFile() || info.isSymbolicLink() || real !== path) {
-      return { file: { path, identity: null }, error: 'event_file_creation_unproven' };
-    }
-    return { file: { path, identity: { dev: info.dev, ino: info.ino } }, error: null };
-  } catch {
-    return { file: { path, identity: null }, error: 'event_file_creation_unproven' };
-  }
-}
-
-async function eventFileUnchanged(file, deps = {}) {
-  try {
-    if (file.identity === null) return false;
-    const info = await (deps.lstatEventFile ?? lstat)(file.path);
-    const real = await (deps.canonicalEventFile ?? canonical)(file.path);
-    return info.isFile() && !info.isSymbolicLink() && real === file.path && info.dev === file.identity.dev && info.ino === file.identity.ino;
-  } catch {
-    return false;
-  }
-}
-
-async function readOwnedEvidence(file, deps = {}) {
-  if (!(await eventFileUnchanged(file, deps))) return null;
-  const info = await (deps.statEventFile ?? stat)(file.path);
-  if (!info.isFile() || info.size <= 0 || info.size > MAX_ADAPTER_BYTES) return null;
-  const bytes = await (deps.readEventFile ?? readFile)(file.path, 'utf8');
-  return bytes.length <= MAX_ADAPTER_BYTES ? bytes : null;
-}
-
-async function cleanupOwnedEvidence(file, deps = {}) {
-  if (!(await eventFileUnchanged(file, deps))) return false;
-  try {
-    await (deps.removeEventFile ?? rm)(file.path);
-    try {
-      await (deps.lstatEventFile ?? lstat)(file.path);
-      return false;
-    } catch (error) {
-      return error?.code === 'ENOENT';
-    }
-  } catch {
-    return false;
-  }
-}
-
-function insertNodeReporter(args, reporterPath, eventPath) {
-  const at = args.indexOf('--test');
-  if (at < 0) return null;
-  return [
-    ...args.slice(0, at + 1),
-    '--test-reporter',
-    reporterPath,
-    '--test-reporter-destination',
-    eventPath,
-    ...args.slice(at + 1),
-  ];
+  return extras.reasonCode === undefined;
 }
 
 function executionSpec(runtime, plan, eventFile, runId, reconstructedArgv) {
@@ -2574,34 +1129,59 @@ export async function runFrozenTests(input, deps = {}) {
   const spec = input && typeof input === 'object' ? input : {};
   const plan = spec.plan;
   const runtime = FROZEN_PLAN_RUNTIME.get(plan);
-  if (!validFrozenPlan(plan) || runtime === undefined) return noRun(plan, 'invalid_frozen_plan');
-  if (spec.signal?.aborted) return noRun(plan, 'aborted_before_test', { aborted: true });
+  if (!validFrozenPlan(plan) || runtime === undefined) return noRun(plan, REASON.test_plan_invalid);
+  if (spec.signal?.aborted) return noRun(plan, REASON.test_aborted_before_start, { aborted: true });
   if (spec.signal !== undefined && spec.signal !== null && typeof spec.signal.addEventListener !== 'function') {
-    return noRun(plan, 'invalid_abort_signal');
+    return noRun(plan, REASON.test_abort_signal_invalid);
   }
-  if (deps.testQueue?.isPoisoned?.()) return noRun(plan, 'test_queue_poisoned');
+  if (deps.testQueue?.isPoisoned?.()) return noRun(plan, REASON.test_queue_poisoned);
   const worktree = await verifyWorktreeHandle(spec.worktree, spec.runId, spec.mode);
-  if (worktree === null) return noRun(plan, 'invalid_evidence_worktree');
-  if (runtime.derived === null || runtime.executablePath === null || runtime.executable === null) return noRun(plan, 'test_command_unavailable');
-  if (!(await verifyDefinition(worktree.path, runtime.derived.definition))) return noRun(plan, 'pinned_definition_drift');
+  if (worktree === null) return noRun(plan, REASON.evidence_worktree_invalid);
+  if (runtime.derived === null || runtime.executablePath === null || runtime.executable === null) return noRun(plan, REASON.test_command_unavailable);
+  if (!(await verifyDefinition(worktree.path, runtime.derived.definition))) return noRun(plan, REASON.test_pinned_definition_drift);
   const initialEnvironment = await inspectFrozenTestPlanEnvironment(plan, deps);
   if (initialEnvironment.ok !== true) return noRun(plan, initialEnvironment.reasonCode);
 
+  const declaredTests = runtime.baselineConfig?.tests ?? null;
+  const executionCwd = await resolveDeclaredCwd(worktree.path, declaredTests?.cwd, deps);
+  // ★ 거절된 것은 얼어붙은 계획이 아니라 **사용자가 쓴 설정 한 줄**이다 — 코드도 회복도 그
+  //   가족이어야 한다(문구 쪽 WHY 는 `src/reason-text.mjs` 의 이 코드 옆에 있다).
+  if (executionCwd === null) return noRun(plan, REASON.config_tests_cwd_unusable);
+
   let eventFile = null;
+  let resultsTarget = null;
   let raw = null;
   let evidenceBytes = null;
+  let evidenceDocuments = null;
+  let evidenceOwned = false;
   let preSpawnFailure = null;
   let cleanupProven = true;
   const diagnostics = [];
   try {
-    if (plan.adapterId !== null) {
+    // ★★ 두 갈래로 갈리는 이유는 **경로를 누가 정하는가**다. 세 어댑터는 컨트롤러가 만든 파일의
+    //   경로를 자식에게 인자로 넘긴다. junit-xml 은 그럴 수 없다 — nextest 와 Gradle 에는 출력
+    //   경로를 정하는 CLI 플래그가 아예 없고, 그래서 프로젝트가 `resultsPath` 로 알려 주는 것에
+    //   의존한다. 그 자리에 우리가 미리 파일을 만들 수 있으면 소유가 서고, 못 만들면 「선언은
+    //   됐으나 소유하지 않음」으로 파싱만 한다(증인은 나가지 않는다).
+    // ★★ **`resultsPath` 의 기준 디렉터리는 워크트리 루트다 — `tests.cwd` 가 아니다.** 자식은
+    //   `executionCwd` 에서 도는데 우리가 파일을 만들고 되읽는 자리는 루트라, 두 키를 함께
+    //   적은 프로젝트는 생산자가 `<worktree>/<cwd>/junit.xml` 에 쓰고 우리는 `<worktree>/
+    //   junit.xml` 을 읽는다 — 그 실행은 `evidence_adapter_incomplete` 로 끝난다(fail-closed
+    //   이지만 조용하다). 기준을 루트로 두는 이유는 고정 정의와 같다: 이 실행이 무엇을 읽고
+    //   무엇과 대조하는지는 사용자가 선언한 디렉터리가 아니라 **우리가 격리한 트리**를 기준
+    //   으로 서야 한다. 그 사실을 스키마의 `resultsPath` 설명이 이제 이름으로 말한다 —
+    //   자리를 옮기는 것이 아니라, 어느 자리인지 적는 것이 이 수정 파동의 일이다.
+    if (plan.adapterId === 'junit-xml-v1') {
+      resultsTarget = await prepareDeclaredResults(worktree.path, declaredTests?.resultsPath, deps);
+      eventFile = resultsTarget !== null && resultsTarget.identity !== null ? resultsTarget : null;
+    } else if (plan.adapterId !== null) {
       const created = await createOwnedEventFile(worktree.path, deps);
       eventFile = created.file;
       preSpawnFailure = created.error;
     }
     // Final identity and definition checks sit immediately before the one process-boundary call.
     if (preSpawnFailure === null && !(await verifyDefinition(worktree.path, runtime.derived.definition))) {
-      preSpawnFailure = 'pinned_definition_drift';
+      preSpawnFailure = REASON.test_pinned_definition_drift;
     }
     let finalEnvironment = null;
     if (preSpawnFailure === null) {
@@ -2609,7 +1189,7 @@ export async function runFrozenTests(input, deps = {}) {
       if (finalEnvironment.ok !== true) preSpawnFailure = finalEnvironment.reasonCode;
     }
     if (preSpawnFailure === null && eventFile !== null && !(await eventFileUnchanged(eventFile, deps))) {
-      preSpawnFailure = 'event_file_identity_drift';
+      preSpawnFailure = REASON.test_event_file_identity_drift;
     }
 
     if (preSpawnFailure !== null) {
@@ -2620,15 +1200,27 @@ export async function runFrozenTests(input, deps = {}) {
       raw = await call({
         worktree: worktree.path,
         ...executionSpec(runtime, plan, eventFile, spec.runId, finalEnvironment.argv),
+        cwd: executionCwd,
         signal: spec.signal,
         onSpawn: spec.onSpawn,
-        timeoutMs: spec.timeoutMs,
+        timeoutMs: boundedTestTimeout(spec.timeoutMs, declaredTests?.timeoutMs),
         env: deps.env ?? process.env,
       });
-      if (typeof raw?.evidenceBytes === 'string') evidenceBytes = raw.evidenceBytes;
-      else if (eventFile !== null) evidenceBytes = await readOwnedEvidence(eventFile, deps);
-      if (eventFile !== null && evidenceBytes === null) diagnostics.push('adapter_evidence_incomplete');
-      if (raw?.lingering === true || raw?.hung === true) deps.testQueue?.poison?.('test_process_cleanup_unproven');
+      if (typeof raw?.evidenceBytes === 'string') {
+        evidenceBytes = raw.evidenceBytes;
+        evidenceOwned = true;
+      } else if (resultsTarget !== null) {
+        const read = await readDeclaredResults(resultsTarget, deps);
+        evidenceDocuments = read?.documents ?? null;
+        evidenceOwned = read?.owned === true;
+      } else if (eventFile !== null) {
+        evidenceBytes = await readOwnedEvidence(eventFile, deps);
+        evidenceOwned = evidenceBytes !== null;
+      }
+      if (plan.adapterId !== null && evidenceBytes === null && evidenceDocuments === null) {
+        diagnostics.push(REASON.evidence_adapter_incomplete);
+      }
+      if (raw?.lingering === true || raw?.hung === true) deps.testQueue?.poison?.(REASON.test_process_cleanup_unproven);
     }
   } catch {
     raw = {
@@ -2639,26 +1231,44 @@ export async function runFrozenTests(input, deps = {}) {
       outputChars: 0,
       truncated: false,
     };
-    diagnostics.push('frozen_test_execution_failed');
+    diagnostics.push(REASON.test_frozen_execution_failed);
   } finally {
     if (eventFile !== null && !(await cleanupOwnedEvidence(eventFile, deps))) {
-      cleanupProven = false;
-      diagnostics.push('event_file_cleanup_unproven');
+      // ★★ junit-xml 의 선언된 결과 파일만 여기서 갈린다. 생산자가 임시 파일을 rename 하면
+      //   inode 가 바뀌고 `cleanupOwnedEvidence` 는 그것을 지우지 못한다 — 자기 것이 아니기
+      //   때문이다. 그 사실로 증거를 버리면 temp+rename 을 쓰는 생산자 전부가 증거를 못 내게
+      //   되는데, 결정 7 은 그 경우를 「거부하지 않고 증인 권위만 거둔다」로 못 박았다. 남는
+      //   대가는 워크트리에 생산자의 파일이 하나 남는 것이고, 워크트리는 이 실행과 함께 회수된다.
+      //   나머지 어댑터는 파일이 통째로 우리 것이라 예전 규율 그대로다.
+      if (plan.adapterId === 'junit-xml-v1') evidenceOwned = false;
+      else {
+        cleanupProven = false;
+        diagnostics.push(REASON.test_event_file_cleanup_unproven);
+      }
     }
   }
   if (!cleanupProven) {
     evidenceBytes = null;
+    evidenceDocuments = null;
     raw = { ...raw, failureKind: 'infrastructure' };
   }
-  const evidence = evidenceBytes === null || plan.adapterId === null
+  const evidence = (evidenceBytes === null && evidenceDocuments === null) || plan.adapterId === null
     ? null
     : {
       adapterId: plan.adapterId,
-      bytes: evidenceBytes,
+      ...(evidenceDocuments === null ? { bytes: evidenceBytes } : { documents: evidenceDocuments }),
       worktreePath: worktree.path,
     };
   if (evidence !== null && runtime.witnessPolicy !== null) {
-    ADAPTER_EVIDENCE_POLICY.set(evidence, runtime.witnessPolicy);
+    // ★★ 증인 정책은 여기서 **유도**하고 잎이 **적용**한다(태스크 6 리뷰가 못 박은 이음매).
+    //   junit-xml 에서 그 유도에 하나가 더 붙는다: 결과 파일의 inode 를 우리가 못 지켰으면
+    //   (생산자가 임시 파일을 rename 했거나, 애초에 우리가 만들지 못한 자리였으면) 정책을
+    //   신뢰 없음으로 낮춘다. 파싱은 그대로 돌아 `observedOutcome` 과 지문은 살고, 증인만
+    //   나가지 않는다 — 우리가 만들지 않은 파일은 워크트리의 무엇이든 쓸 수 있었던 파일이다.
+    const policy = plan.adapterId === 'junit-xml-v1' && !evidenceOwned
+      ? UNOWNED_JUNIT_WITNESS_POLICY
+      : runtime.witnessPolicy;
+    ADAPTER_EVIDENCE_POLICY.set(evidence, policy);
   }
   return persistableRecord(plan, raw, evidence, diagnostics);
 }

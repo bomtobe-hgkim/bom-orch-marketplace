@@ -7,9 +7,9 @@ import { runCli } from './run-cli.mjs';
  *   기다린다. stderr 에 "Reading additional input from stdin..." 을 찍고 멈춘다
  *   (실측: 닫지 않으면 2분 타임아웃). claude 와 정반대다.
  *
- * 그래서 codex 는 지시문을 argv 로 보낸다. Windows 명령줄 상한(8191자)에 걸릴 수
- * 있는데, 프롬프트가 그보다 길면 codex 쪽 실행이 실패한다 — Task 20 에서 실제
- * 상한을 재고, 필요하면 `-` 를 써서 stdin 으로 넘기는 경로를 검토한다.
+ * 그래서 codex 는 지시문을 argv 로 보낸다. 상한은 8,191(cmd.exe)이 아니라 CreateProcessW 의 명령줄
+ * **전체** 32,767자이고, 부딪히는 것은 길이가 아니라 **이스케이프된** 명령줄이다(libuv 가 `"` 마다
+ * `\` 를 앞세운다) — 예산·단위·예약분은 `src/preflight.mjs` 에 있다. 넘치면 spawn 이 ENAMETOOLONG.
  */
 export function runCodex(options = {}) {
   return runCli({ ...options, authNames: CODEX_AUTH_NAMES, collect: collectCodexStream, sendStdin: false });

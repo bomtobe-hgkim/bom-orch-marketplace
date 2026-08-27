@@ -5,7 +5,13 @@
  * 이 모듈의 함정 세 개는 전부 실측으로 확인한 것이다 — 아래 주석 참고.
  */
 
-/** 우리가 의미를 아는 최상위 타입. 그 밖은 견디되 기록한다. */
+/**
+ * 우리가 의미를 아는 최상위 타입. 그 밖은 견디되 기록한다.
+ *
+ * ★ `rate_limit_event` 는 이 집합에 **있으면서 핸들러가 없었다** — 드리프트로도 안 잡히고 구조화된
+ *   `rate_limit_info` 는 버려져, 막는 한도가 보이지 않았다(WS2 §3.1). 아는 타입인데 아무도 읽지
+ *   않는 것은 모르는 것보다 나쁘다: 신호가 있다는 착각을 준다.
+ */
 const KNOWN_TYPES = new Set(['system', 'assistant', 'user', 'result', 'rate_limit_event']);
 
 /**
@@ -64,6 +70,35 @@ export function extractUsage(record) {
   };
 }
 
+/** `resetsAt` 를 벽시계 시각으로 옮길 수 있는 창 — epoch **초**로 읽히는 값만. 아래 WHY 참고. */
+const RESET_EPOCH_SECONDS_MIN = 1e9;
+const RESET_EPOCH_SECONDS_MAX = 1e11;
+/** 옮길 수 없는 값의 닫힌 어휘. 벤더의 수를 그대로 내보내지 않는다 — 0 은 시각이 아니다. */
+export const RATE_LIMIT_RESET_UNKNOWN = 'unknown';
+
+/**
+ * `rate_limit_event` 의 수 둘을 **알림 하나가 쓸 모양**으로 접는다(WS4b 태스크 7, 스펙 §0-RL).
+ *
+ * ★ 파서는 여전히 판단하지 않는다. 무엇이 "막힘" 인지는 오류 카탈로그가 정하고(위 `rateLimit` 은
+ *   구조화된 그대로 나간다), 여기서 하는 것은 **모양 정규화**뿐이다.
+ * ★★ (최종 폴리시, 라이브 캡처 2026-08-25) 태스크 7 은 캡처 하나(`0.25`)로는 25%·0.25% 를 못 갈라
+ *   utilization 을 그대로 날랐다. 라이브 캡처가 `0.58`=58% 를 실측했으므로 0..1 분수 창 안의 값은
+ *   `Math.round(x*100)+' percent'` 로 편다(로케일 없음). 창 밖(음수·1 초과)은 척도를 여전히 모르므로
+ *   옛 문구를 원값에 그대로 붙여 정직하게 나른다 — fail-safe, 지우지 않는다.
+ * ★ `resetsAt` 는 그대로다: epoch 초로 읽히는 창 안의 값만 UTC 순간으로, 그 밖은 `RATE_LIMIT_RESET_UNKNOWN`.
+ *   `toISOString` 은 언제나 UTC 라 로케일을 안 탄다.
+ */
+export function rateLimitFacts(rateLimit) {
+  const utilization = rateLimit?.utilization;
+  // 수치가 없으면 접을 것이 없다 — `null` 은 "알림 없음" 이다(대부분의 실행이 여기다).
+  if (!Number.isFinite(utilization)) return null;
+  const resetsAt = rateLimit?.resetsAt;
+  const movable = Number.isFinite(resetsAt) && resetsAt >= RESET_EPOCH_SECONDS_MIN && resetsAt < RESET_EPOCH_SECONDS_MAX;
+  const isFraction = utilization >= 0 && utilization <= 1;
+  const utilizationText = isFraction ? `${Math.round(utilization * 100)} percent` : `${utilization} on the scale that CLI uses`;
+  return { utilization: utilizationText, resetsAt: movable ? new Date(resetsAt * 1000).toISOString() : RATE_LIMIT_RESET_UNKNOWN };
+}
+
 /** 출력이 상한에 잘렸는가. 잘린 답을 성공으로 보고하면 학습이 잘못된 보상을 받는다. */
 export function isTruncated(collected) {
   return collected?.stopReason === 'max_tokens' || collected?.subtype === 'error_max_turns';
@@ -81,6 +116,7 @@ export function collectStream(text) {
   const unknownTypes = new Set();
   const unparsableLines = [];
   let lastResult = null;
+  let rateLimit = null;
 
   for (const line of String(text ?? '').split(/\r?\n/)) {
     if (line.trim() === '') continue;
@@ -101,6 +137,13 @@ export function collectStream(text) {
 
     if (record.type === 'result') {
       lastResult = record;
+      continue;
+    }
+
+    if (record.type === 'rate_limit_event') {
+      // 마지막 것이 지금 상태다 — 벤더는 실행 중에 여러 번 보낸다(캡처: allowed_warning).
+      const info = record.rate_limit_info;
+      if (info !== null && typeof info === 'object' && !Array.isArray(info)) rateLimit = info;
       continue;
     }
 
@@ -144,12 +187,13 @@ export function collectStream(text) {
     text: resultText ?? assistantText.join(''),
     toolUses: toolOrder,
     usage: lastResult ? extractUsage(lastResult) : null,
-    // ★ 계획 2 시점의 사실: 파싱만 하고 **아무도 안 읽는다.** 설계 §5.4 는 "비어 있지
-    //   않으면 그 스텝은 실패" 라는 규칙을 세웠는데 §12.0 이 그 전제를 뒤집었다 — 목록 밖
-    //   명령이 실행되는데도 `permission_denials: []` 인 경우가 실측됐다. 그래서 이 값으로
-    //   스텝을 실패시키지 않는다. 다만 이 필드가 무엇을 말하는지는 아직 쓸모가 있어
-    //   (라이브 스위트가 진단으로 찍는다) 남긴다. 소비할지 말지는 계획 3 이 정한다.
+    // ★ 파싱만 하고 **아무도 안 읽는다.** 설계 §5.4 의 "비어 있지 않으면 그 스텝은 실패" 규칙은
+    //   §12.0 이 뒤집었다 — 목록 밖 명령이 실행되는데도 `permission_denials: []` 인 경우가
+    //   실측됐다. 그래서 이 값으로 스텝을 실패시키지 않고, 라이브 진단용으로만 남긴다.
     permissionDenials: Array.isArray(lastResult?.permission_denials) ? lastResult.permission_denials : [],
+    // ★ 구조화된 그대로 들고 간다. 무엇이 "막힘" 인지는 오류 카탈로그가 정한다 — 파서가 그 판단을
+    //   하면 같은 규칙이 두 곳에 살게 된다.
+    rateLimit,
     stopReason: lastResult?.stop_reason ?? null,
     subtype: lastResult?.subtype ?? null,
     isError: lastResult?.is_error === true,

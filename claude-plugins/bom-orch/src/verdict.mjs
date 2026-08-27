@@ -1,7 +1,12 @@
 import { createHash } from 'node:crypto';
+import { REASON } from './reason-codes.mjs';
+import { deepFreeze } from './util/freeze.mjs';
+import { cloneData, hasExactKeys } from './util/objects.mjs';
+import { boundedText } from './util/strings.mjs';
 
 const MAX_PROVIDER_CONTENT_LENGTH = 2_000;
-const MAX_BLOCKING_ISSUES = 100;
+/** 한 후보의 열린 차단 이슈 상한. `verifier_issue_limit_exceeded` 의 문구가 이 수를 말한다. */
+export const MAX_BLOCKING_ISSUES = 100;
 const MAX_NOTES = 50;
 const MAX_FIELD_LENGTH = 2_000;
 const BLOCKING_CATEGORIES = new Set([
@@ -12,45 +17,53 @@ const BLOCKING_CATEGORIES = new Set([
   'tests',
 ]);
 
-function invalid(code) {
-  return { ok: false, kind: 'invalid', code };
+/**
+ * 판정문을 읽지 못한 모든 경우의 **코드는 하나**다 — `verifier_verdict_invalid`(WS2 §2.2-3).
+ * 어느 검사에서 걸렸는지는 `detail` 로 나르고, 그 값은 문구 정본의 `{detail}` 자리에 그대로 들어간다.
+ *
+ * ★★ 왜 19개가 아니라 하나인가. 이 파서는 판정문을 거절하는 자리마다 서로 다른 이름을 지어
+ *   냈고(`invalid_raw`·`initial_value`·`recheck_replacement_mismatch`…), **아무도 그 이름으로
+ *   분기하지 않았다** — 호출부(`src/candidate-lane.mjs`)는 `parsed.ok` 만 보고 전부 한 결말로
+ *   접었다. 읽는 쪽이 없는 열아홉 이름을 레지스트리에 등재하면 닫힌 어휘가 열아홉 만큼 커지고
+ *   그만큼 아무 소비자도 없는 채로 계약이 된다. 그래서 어휘는 하나, 세부는 인자다.
+ * ★ `detail` 은 **식별자**이지 문장이 아니다(문장은 `src/reason-text.mjs` 가 정본). 값이 밖으로
+ *   나가는 길은 `verifier_verdict_invalid` 의 `{detail}` 하나뿐이고, 그 자리는 "어느 검사가
+ *   걸렀나" 를 말한다.
+ */
+function invalid(detail) {
+  return { ok: false, kind: 'invalid', code: REASON.verifier_verdict_invalid, detail };
 }
 
 function issueLimitExceeded() {
-  return { ok: false, kind: 'issue_limit_exceeded', code: 'issue_limit_exceeded' };
+  return { ok: false, kind: 'issue_limit_exceeded', code: REASON.verifier_issue_limit_exceeded };
 }
 
-function deepClone(value) {
-  if (Array.isArray(value)) return value.map((entry) => deepClone(entry));
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, deepClone(entry)]));
-  }
-  return value;
+/**
+ * 원장 문자열의 정책은 **둘**이다 — 식별자는 엄격, 모델이 쓴 산문은 TAB·LF·CR 까지 허용.
+ *
+ * ★★ 왜 산문만 여는가(WS1 Task 14 후속): 형식 정정 재요청 프롬프트
+ *    (`src/prompts/instructions.mjs` `verifierInstruction({ formatOnly: true })`)는 스키마만 다시 보여줄 뿐
+ *    **제어문자 얘기를 한마디도 하지 않는다.** 그래서 여러 줄 요약이 집 스타일인 verifier 는
+ *    같은 답을 두 번 내고 두 번 다 거부당한 뒤 그 lane 이 `unverified` 로 끝난다 — 고칠 길이
+ *    없는 판정 분실이다. TAB·LF·CR 은 JSON 이 그대로 실어 나르는 공백이고 해시도 안정적이라
+ *    원장에 남아도 뒤따르는 비교를 흔들지 않는다. 나머지(NUL·다른 C0·DEL·C1·U+FFFD·
+ *    짝 없는 서로게이트)는 산문에서도 계속 거부한다.
+ * ★ 식별자는 열지 않는다: `check.id`·`evidenceIds`·`openIssueIds` 는 **정렬·비교·해시의
+ *   키**다. 그 안의 줄바꿈은 사람 눈에 안 보이면서 두 ID 를 다르게 만든다.
+ *   (`contract/envelope.json` 의 verdict 행이 이 두 정책을 적는다.)
+ */
+function boundedIdentifier(value) {
+  return boundedText(value, MAX_FIELD_LENGTH) !== null;
 }
 
-function deepFreeze(value) {
-  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
-    Object.freeze(value);
-    for (const entry of Object.values(value)) deepFreeze(entry);
-  }
-  return value;
+function boundedProse(value) {
+  return boundedText(value, MAX_FIELD_LENGTH, { allowDiffWhitespace: true }) !== null;
 }
 
-function exactKeys(value, keys) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const actual = Object.keys(value).sort();
-  const expected = [...keys].sort();
-  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
-}
-
-function boundedString(value) {
-  return typeof value === 'string' && value.length > 0 && value.length <= MAX_FIELD_LENGTH;
-}
-
-function stringArray(value, maxLength) {
+function stringArray(value, maxLength, entryValid = boundedIdentifier) {
   return Array.isArray(value)
     && value.length <= maxLength
-    && value.every((entry) => boundedString(entry));
+    && value.every((entry) => entryValid(entry));
 }
 
 function uniqueStrings(value) {
@@ -62,23 +75,23 @@ function sameStrings(left, right) {
 }
 
 function validIssue(issue) {
-  return exactKeys(issue, ['category', 'claim', 'evidence', 'requiredFix'])
+  return hasExactKeys(issue, ['category', 'claim', 'evidence', 'requiredFix'])
     && BLOCKING_CATEGORIES.has(issue.category)
-    && boundedString(issue.claim)
-    && boundedString(issue.evidence)
-    && boundedString(issue.requiredFix);
+    && boundedProse(issue.claim)
+    && boundedProse(issue.evidence)
+    && boundedProse(issue.requiredFix);
 }
 
 function validCheck(check) {
   if (!check || typeof check !== 'object' || Array.isArray(check)) return false;
-  if (!boundedString(check.id) || !boundedString(check.status) || !boundedString(check.evidence)) return false;
+  if (!boundedIdentifier(check.id) || !boundedIdentifier(check.status) || !boundedProse(check.evidence)) return false;
   if (check.status === 'superseded') {
-    return exactKeys(check, ['id', 'status', 'evidence', 'replacementIndex'])
+    return hasExactKeys(check, ['id', 'status', 'evidence', 'replacementIndex'])
       && Number.isInteger(check.replacementIndex)
       && check.replacementIndex >= 0;
   }
   return (check.status === 'resolved' || check.status === 'persists')
-    && exactKeys(check, ['id', 'status', 'evidence']);
+    && hasExactKeys(check, ['id', 'status', 'evidence']);
 }
 
 function bindingMatches(value, expected) {
@@ -102,8 +115,8 @@ function validateExpected(expected, phase) {
   return expected
     && typeof expected === 'object'
     && expected.phase === phase
-    && boundedString(expected.candidateId)
-    && boundedString(expected.attemptId)
+    && boundedIdentifier(expected.candidateId)
+    && boundedIdentifier(expected.attemptId)
     && typeof expected.candidatePatchSha256 === 'string'
     && /^[a-f0-9]{64}$/.test(expected.candidatePatchSha256)
     && stringArray(expected.evidenceIds, MAX_BLOCKING_ISSUES)
@@ -151,12 +164,12 @@ export function parseVerifierVerdict(raw, expected) {
 
   if (expected?.phase === 'initial') {
     if (!validateExpected(expected, 'initial')) return invalid('invalid_expected_binding');
-    if (!exactKeys(value, [
+    if (!hasExactKeys(value, [
       'schemaVersion', 'candidateId', 'attemptId', 'candidatePatchSha256', 'evidenceIds',
       'verdict', 'summary', 'issues', 'notes',
     ])) return invalid('initial_schema');
     if (!stringArray(value.evidenceIds, MAX_BLOCKING_ISSUES) || !uniqueStrings(value.evidenceIds)
-      || !boundedString(value.summary) || !stringArray(value.notes, MAX_NOTES)
+      || !boundedProse(value.summary) || !stringArray(value.notes, MAX_NOTES, boundedProse)
       || !Array.isArray(value.issues) || value.issues.length > MAX_BLOCKING_ISSUES
       || !value.issues.every(validIssue)) return invalid('initial_value');
     if (!bindingMatches(value, expected)) return invalid('binding_mismatch');
@@ -168,19 +181,19 @@ export function parseVerifierVerdict(raw, expected) {
       phase: 'initial',
       verdict: value.verdict,
       binding: normalizeBinding(value),
-      issues: deepClone(value.issues),
+      issues: cloneData(value.issues),
       notes: [...value.notes],
     });
   }
 
   if (expected?.phase === 'recheck') {
     if (!validateExpected(expected, 'recheck')) return invalid('invalid_expected_binding');
-    if (!exactKeys(value, [
+    if (!hasExactKeys(value, [
       'schemaVersion', 'candidateId', 'attemptId', 'candidatePatchSha256', 'evidenceIds',
       'verdict', 'checks', 'newIssues', 'notes',
     ])) return invalid('recheck_schema');
     if (!stringArray(value.evidenceIds, MAX_BLOCKING_ISSUES) || !uniqueStrings(value.evidenceIds)
-      || !stringArray(value.notes, MAX_NOTES) || !Array.isArray(value.checks)
+      || !stringArray(value.notes, MAX_NOTES, boundedProse) || !Array.isArray(value.checks)
       || !Array.isArray(value.newIssues) || value.newIssues.length > MAX_BLOCKING_ISSUES
       || !value.newIssues.every(validIssue) || !value.checks.every(validCheck)) return invalid('recheck_value');
     if (!bindingMatches(value, expected)) return invalid('binding_mismatch');
@@ -206,8 +219,8 @@ export function parseVerifierVerdict(raw, expected) {
       phase: 'recheck',
       verdict: value.verdict,
       binding: normalizeBinding(value),
-      checks: deepClone(value.checks),
-      newIssues: deepClone(value.newIssues),
+      checks: cloneData(value.checks),
+      newIssues: cloneData(value.newIssues),
       notes: [...value.notes],
     });
   }
@@ -228,7 +241,7 @@ function sortOpenIds(entries) {
 function freezeLedger(ledger) {
   return deepFreeze({
     laneId: ledger.laneId,
-    entries: deepClone(ledger.entries),
+    entries: cloneData(ledger.entries),
     openIds: [...ledger.openIds].sort(),
     nextVerifierOrdinal: ledger.nextVerifierOrdinal,
     nextMachineOrdinal: ledger.nextMachineOrdinal,
@@ -238,7 +251,7 @@ function freezeLedger(ledger) {
 function cloneLedger(ledger) {
   return {
     laneId: ledger.laneId,
-    entries: deepClone(ledger.entries),
+    entries: cloneData(ledger.entries),
     openIds: [...ledger.openIds],
     nextVerifierOrdinal: ledger.nextVerifierOrdinal,
     nextMachineOrdinal: ledger.nextMachineOrdinal,
@@ -271,7 +284,7 @@ export function createIssueLedger({ laneId, verdict, startOrdinal = 1 }) {
     id: verifierId(prefix, startOrdinal + index),
     namespace: 'verifier',
     status: 'open',
-    issue: deepClone(issue),
+    issue: cloneData(issue),
     observations: [],
   }));
   if (entries.length > MAX_BLOCKING_ISSUES) return issueLimitExceeded();
@@ -300,12 +313,12 @@ export function applyRecheckVerdict(ledger, verdict) {
     id: verifierId(prefix, next.nextVerifierOrdinal + index),
     namespace: 'verifier',
     status: 'open',
-    issue: deepClone(issue),
+    issue: cloneData(issue),
     observations: [],
   }));
   for (const check of verifierChecks) {
     const entry = entriesById.get(check.id);
-    entry.observations.push(deepClone(check));
+    entry.observations.push(cloneData(check));
     if (check.status === 'resolved') entry.status = 'resolved';
     if (check.status === 'superseded') {
       entry.status = 'superseded';

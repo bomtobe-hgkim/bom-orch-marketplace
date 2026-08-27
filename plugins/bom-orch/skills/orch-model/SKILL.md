@@ -1,61 +1,102 @@
 ---
 name: orch-model
-description: 오케스트레이션이 어떤 벤더의 어떤 모델과 effort 를 쓸지 조회하거나 바꿀 때 씁니다.
+description: Read or change which vendor, model and effort this orchestration uses.
 ---
 
-# 모델 설정
+# Model settings
 
-- `orch_models` — 설치된 벤더와 고를 수 있는 모델을 봅니다. `refresh` 를 켜면 캐시를
-  무시하고 CLI 를 다시 조사합니다.
-- `orch_config` — 인자 없이 부르면 현재 설정과 고를 수 있는 값을 함께 봅니다. 이쪽은
-  CLI 를 띄우지 않고 `orch_models` 가 남긴 목록만 읽습니다.
+`orch_models` reports which vendor CLIs are installed and which models each one offers.
+`orch_config` reads or changes which of them this orchestration uses. Every failure code these two
+tools can report is listed, with its recovery line, in `REASON_CODES.md` at the plugin root.
 
-★ **모델 이름은 이 문서에 적지 않습니다.** 적어 두면 새 모델이 나올 때 문서가 먼저
-썩고, 그것을 읽은 모델이 없는 이름을 고릅니다. 목록은 `orch_models` 로 보세요.
+★ **Model names are deliberately absent from this document.** Written down they rot before the code
+does, and a model that reads them picks a name that no longer exists. Take the list from `orch_models`.
 
-## 인자
+## Arguments
 
-| 도구 | 인자 | 필수 | 기본값 | 허용값 |
+| Tool | Argument | Required | Default | Allowed |
 | --- | --- | --- | --- | --- |
-| `orch_models` | `refresh` | 아니오 | `false` | — |
-| `orch_config` | `vendor` | 아니오 | — | `claude`, `codex` |
-| `orch_config` | `tier` | 아니오 | — | `strong`, `fast` |
-| `orch_config` | `model` | 아니오 | — | — |
-| `orch_config` | `effort` | 아니오 | — | — |
+| `orch_models` | `refresh` | optional | `false` | — |
+| `orch_config` | `vendor` | optional | — | `claude`, `codex` |
+| `orch_config` | `tier` | optional | — | `strong`, `fast` |
+| `orch_config` | `model` | optional | — | — |
+| `orch_config` | `effort` | optional | — | — |
+| `orch_config` | `writer` | optional | — | `claude`, `codex`, `` |
+| `orch_config` | `learning` | optional | — | `on`, `off`, `` |
 
-## 바꾸는 법 — `vendor` 와 `tier` 를 **함께** 줍니다
+## What `orch_models` reports for one vendor
 
-`vendor` 와 `tier` 에 `model` 이나 `effort` 를 얹어서 부릅니다. 위 표에서 넷 다
-「필수: 아니오」인 것은 **조회 호출이 인자를 하나도 안 받기 때문**이고, 값을 바꾸는
-호출에서는 `vendor` 와 `tier` 가 **둘 다** 있어야 합니다. 하나라도 빠지면 `invalid` 로
-거부되고 거부 문구가 쓸 수 있는 값을 알려 줍니다.
+| Field | Meaning |
+| --- | --- |
+| `reachable` | whether this vendor's CLI answered at all |
+| `probed` | whether this call launched the CLI. `false` means the answer came from the catalog, or that the probe could not be attempted |
+| `version` | the version string the probe read, or `null`. Probed and reachable answers only |
+| `models` | that vendor's model list, each entry with the efforts it takes. Reachable answers only |
+| `cached` | present, and `true`, only when the answer came from the catalog instead of a probe |
+| `fetchedAt` | when that cached list was fetched. Cached answers only |
+| `error` | why the vendor could not be reached |
+| `recovery` | what to do about that |
+| `discoveryTimeout` | present, and `true`, only when the probe ran out of time |
 
-`vendor` 가 왜 필요한가: 설정 파일의 섹션 이름이 벤더 id 이고 모델 이름은 벤더마다
-다릅니다. `tier` 만으로는 그 값을 어느 섹션에 쓸지 정할 수 없습니다.
+## What `orch_config` reports
 
-`vendor`·`tier` 만 주고 값을 안 주면 그것도 `invalid` 입니다 — 조용한 무연산을 만들지
-않기 위해서입니다. 조회만 하려면 인자 없이 부르세요.
+| Field | Meaning |
+| --- | --- |
+| `current` | the settings in force: `writer` and `learning`, then per vendor each tier's model and that tier's effort |
+| `vendors` | what you may choose, per vendor: the catalog's `models` and its `fetchedAt` |
 
-빈 문자열은 값을 **지웁니다**. 그 벤더·티어가 CLI 자신의 기본값으로 돌아갑니다.
+## Reading
 
-## 무엇이 거부되고 무엇이 통과하는가
+Call `orch_config` with no arguments and it reports the current settings next to the values you may
+choose. It launches no CLI: the current settings come from the settings file, and the values you may
+choose come from the catalog `orch_models` left behind. A read that got the settings file whole
+answers `verified`; one that could not read it in full answers `unverified`.
 
-- **발견된 목록에 없는 모델 이름은 거부되지 않습니다.** 그대로 저장되고, "지금 발견된
-  목록에 없다" 는 notice 만 함께 옵니다. 막으면 안 되는 이유가 있습니다: `claude` 쪽
-  발견 목록에는 별칭만 들어오고 정식 모델 id 는 일부러 걸러집니다. 거부하면 정식 id 를
-  적은 사용자가 그 값을 **영영** 못 쓰게 됩니다. 그러니 notice 가 오면 오타인지만
-  확인하세요.
-- **목록 안에 있는 모델이 지원하지 않는 `effort` 는 거부됩니다.** 이때 설정 파일은 한
-  글자도 안 바뀌고, 거부 문구가 그 모델이 지원하는 값을 알려 줍니다.
-- 목록을 아직 못 얻은 벤더는 `effort` 검사를 건너뜁니다. `orch_models` 를 먼저 부르면
-  목록이 채워집니다.
+`orch_models` answers `verified` only when this call actually probed the CLIs. An answer served
+from the catalog cache is `unverified` and says so in a notice — pass `refresh: true` to force a probe.
 
-## 설정 파일을 손으로 고칠 때
+## Changing — `vendor` and `tier` travel together
 
-설정은 상태 루트(기본 `~/.bom-orch/`)의 settings.ini 이고, 사람이 직접 고쳐도 됩니다.
-섹션 이름은 벤더 id 이고 키는 티어 이름입니다.
+Pass `vendor` and `tier` along with `model` or `effort`. All four read `optional` above only because
+the reading call takes no arguments; a change needs `vendor` **and** `tier`, and missing either makes
+the call `invalid`, with the refusal naming the values you may use. `vendor` is needed because the
+settings file's sections are vendor ids and models differ by vendor: `tier` alone cannot say where.
 
-★ **값 뒤에 `;` 나 `#` 로 메모를 달지 마세요 — 주석까지 값이 됩니다.** 이 파서는 `=` 뒤를
-공백만 다듬어 통째로 씁니다. 값 뒤에 메모를 달면 그 **문장 전체**가 모델 이름이 되어 CLI
-의 모델 인자로 그대로 넘어갑니다. 섹션 헤더 뒤의 메모는 처리되는데 값 뒤는 안 되는
-비대칭이 있습니다. 메모는 **줄 전체**를 `;` 로 시작하는 주석 줄로 쓰세요.
+Passing `vendor` and `tier` with neither `model` nor `effort` is `invalid` too — a silent no-op would
+be worse. An empty-string `model` or `effort`, by contrast, **clears** that value and returns the
+vendor and tier to the CLI's own default. A write is `verified` when the re-read matches what was
+written, `unverified` otherwise.
+
+## What is refused and what is not
+
+- **A model name outside the discovered list is not refused.** It is stored, with a notice that it is
+  not in the list found so far. Refusing would be worse: the `claude` vendor's discovery list carries
+  aliases only and filters the formal ids out on purpose, so a user who typed a formal id would be
+  locked out of it forever. Read the notice as a prompt to check your spelling.
+- **An `effort` the listed model does not support is refused**, the settings file is not touched
+  by one byte, and the refusal names the values that model does support.
+- For a vendor whose list has not been fetched yet, the effort check is skipped entirely. Call
+  `orch_models` first and the list fills in.
+
+## Editing the settings file by hand
+
+Settings live in settings.ini under the state root, `~/.bom-orch/` unless `BOM_ORCH_HOME` says
+otherwise, and may be edited by hand. Section names are vendor ids and keys are tier names.
+
+★ **Never write a `;` or `#` note after a value — the note becomes part of the value.** This parser takes
+everything after `=`, trims surrounding whitespace and stores what is left, so the whole sentence becomes
+the model name handed to the CLI as its model argument. There is an asymmetry: a note after a **section
+header** is handled, a note after a value is not — write notes as whole lines beginning with `;`.
+
+## Example envelope
+
+`orch_config` called with no arguments on a state root whose catalog is still empty.
+
+```json
+{
+  "status": "succeeded",
+  "content": "{\"current\":{\"claude\":{\"strong\":null,\"strongEffort\":null,\"fast\":null,\"fastEffort\":null},\"codex\":{\"strong\":null,\"strongEffort\":null,\"fast\":null,\"fastEffort\":null}},\"vendors\":{\"claude\":{\"models\":[],\"fetchedAt\":null},\"codex\":{\"models\":[],\"fetchedAt\":null}}}",
+  "confidence": "verified",
+  "notice": "The model list for claude, codex is empty; call orch_models first to fill the catalog, and vendors without a list skip the effort check"
+}
+```

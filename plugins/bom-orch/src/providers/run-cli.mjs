@@ -6,13 +6,13 @@ const WINDOWS = process.platform === 'win32';
 /**
  * `stop()` 뒤 `close` 를 기다리는 유예. 이 시간을 넘기면 자식의 생사와 무관하게 결과를 낸다.
  *
- * `src/test-runner.mjs` 의 같은 이름 상수와 같은 이유·같은 값이다: `kill()` 은 부탁이지
+ * `src/test-spawn.mjs` 의 같은 이름 상수와 같은 이유·같은 값이다: `kill()` 은 부탁이지
  * 보장이 아니고, 자식이 손자에게 stdout 을 물려준 채 스스로 끝나면 손자가 우리 파이프의
  * 쓰기 끝을 쥐어 `close` 가 영영 오지 않는다(실측: raw spawn 에서 T+275ms 에 exit code 7 이
  * 왔는데 stdout END/CLOSE 는 T+8000ms 까지 0건). 그 상태에서 이 함수가 settle 되지 않으면
  * 데드라인이 지나도 봉투가 나가지 않는다.
  */
-const KILL_GRACE_MS = 3_000;
+export const KILL_GRACE_MS = 3_000;
 
 /**
  * 호출자가 상한을 주지 않았을 때의 자체 상한.
@@ -24,9 +24,50 @@ const KILL_GRACE_MS = 3_000;
  *   바로 이 형태다. 즉 벤더 CLI 가 한 번 매달리면 이미 배선된 MCP 도구 호출이 영영
  *   응답하지 않는다.
  *
- * 값은 `src/test-runner.mjs` 의 같은 이름 상수와 맞춘다. 예산이 아니라 못이다.
+ * 값은 `src/test-spawn.mjs` 의 같은 이름 상수와 맞춘다. 예산이 아니라 못이다.
  */
 const DEFAULT_TIMEOUT_MS = 600_000;
+
+/**
+ * 읽기 전용 **프로브** 스폰 하나의 상한. 예산이 아니라 못이다.
+ *
+ * ★ 왜 위 기본값(10분)으로는 부족한가: 그 값은 모델 턴 하나를 견디라고 있는 수인데, 프로브가
+ *   묻는 것은 `--help` 나 인증 조회처럼 **모델을 안 부르는** 답이다. 실측(2026-08-25 컨트롤러
+ *   라이브 캡처, 로그인된 상자)은 그 답이 전부 1초 아래였다. 상한이 실행 데드라인 하나뿐이면
+ *   붙잡힌 프로브 하나가 크레딧을 쓰기도 전에 실행의 남은 시간을 통째로 먹는다.
+ *
+ * 값은 이 저장소가 이미 쓰는 프로브 어휘와 맞춘다: `src/test-discovery.mjs` 의 `PROBE_TIMEOUT_MS`
+ * (10 s)와 같고 `src/reaper.mjs` 의 8 s 와 같은 등급이다. 실측의 열 배 이상이라 느린 기계의
+ * 콜드 스타트를 자르지 않는다.
+ *
+ * ⚠ 오늘 이 못을 쓰는 것은 **인증 프로브뿐**이다. `discover`·`securityFloor` 도 같은 모양이지만
+ *   그 둘의 상한을 바꾸는 것은 이 태스크가 잰 것 밖이라 손대지 않았다(리뷰 I1 이 같은 사실을
+ *   「새 규율 위반은 아니다」로 적었다).
+ */
+export const PROBE_TIMEOUT_MS = 10_000;
+
+/**
+ * 실행 하나에 스폰 한 벌 — `work` 를 **그 실행의 신호**로 메모한다(WS4b 리뷰 I1).
+ *
+ * ★★ 열쇠가 신호인 것이 이 함수의 전부다. 실행 하나 안에서 누가 몇 번 묻든 답은 하나이고,
+ *   다음 실행은 신호가 새것이라 반드시 다시 묻는다 — 즉 **실행 사이 캐시가 아니다**. 인증은
+ *   실행 사이에 바뀌는 사실이라(사용자가 로그아웃할 수 있다) 낡은 답을 재사용하면 프로브가
+ *   조용히 거짓을 말한다. 스폰 하나가 그것보다 싸다.
+ * ★ 결과가 아니라 **프로미스**를 담는다. 같은 틱에 둘이 물어도 스폰은 한 벌이다.
+ * ★ 신호가 없으면 메모도 없다. 열쇠가 될 객체가 없는 호출은 「실행」이라는 경계가 없는 호출이고
+ *   (테스트의 직접 호출이 그렇다), 그때 캐시를 프로세스 수명으로 넓히는 것이 위의 금지다.
+ */
+export function oncePerSignal(work) {
+  const inFlight = new WeakMap();
+  return (signal, ...rest) => {
+    if (signal === null || typeof signal !== 'object') return work(signal, ...rest);
+    const seen = inFlight.get(signal);
+    if (seen !== undefined) return seen;
+    const started = work(signal, ...rest);
+    inFlight.set(signal, started);
+    return started;
+  };
+}
 
 /**
  * onProgress 에 넘기기 전에 한 줄을 JSON 으로 읽는다. 벤더 특정 스키마 검증은 각
@@ -132,7 +173,7 @@ export async function runCli({
     child = spawn(binary, [...prefixArgs, ...args], {
       env: childEnv, // ★ 교체다. buildChildEnv 가 만든 것이 자식 환경의 전부다.
       cwd,
-      shell: false, // 프롬프트 텍스트가 명령줄 인용 규칙을 만나지 않게 한다
+      shell: false, // cmd.exe 를 안 지난다 — 인용 규칙 자체는 libuv 쪽에 그대로 남는다(아래 stdin 주석)
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
       // POSIX 에서만: 자식이 자기 프로세스 그룹을 이끌어야 나중에 손자까지 끊을 수 있다.
@@ -177,8 +218,16 @@ export async function runCli({
     //   { text: 'hello', exitCode: 0, spawnError: null, timedOut: true }.
     //   close 와 clearTimeout 사이에 await 경계가 있어 생기는 창이다.
     if (finished) return;
+    // ★ 두 번째 stop 은 아무것도 안 한다 — 사유만이 아니라 **kill 자체를** 반복하지 않는다.
+    //   두 시계(abort·timeout)가 같은 타이머 페이즈에 발화하면 kill 이 두 번 나가는데,
+    //   engines 하한(node 22.11.0 = libuv 1.48.0)에서는 종료 중인 자식에 대한 두 번째
+    //   TerminateProcess 의 ERROR_ACCESS_DENIED 가 ESRCH 가 아니라 **EPERM** 으로 올라와
+    //   (uv_kill 경쟁, libuv 1.49.0 에서 수정) 'error' 이벤트가 나고, 그 settle 이
+    //   exit/close 보다 먼저 이겨 aborted 도 timedOut 도 아닌 결과가 나갔다 — 실측
+    //   22.11.0 에서 100/100, 24.x 에서 0/100.
+    if (stopReason !== null) return;
     // 트리 종료는 Task 15(reaper)의 몫이다. 여기서는 직접 자식만 끊는다.
-    if (stopReason === null) stopReason = reason;
+    stopReason = reason;
     try {
       child.kill();
     } catch {
@@ -189,7 +238,7 @@ export async function runCli({
     //    오지 않는다**(실측: raw spawn 에서 T+275ms 에 exit code 7 이 왔는데 stdout
     //    END/CLOSE 는 T+8000ms 까지 0건). 그러면 이 함수가 settle 되지 않아 봉투가
     //    나가지 않는다 — 데드라인이 정지의 유일한 권위라는 요구가 그 자리에서 깨진다.
-    //    `src/test-runner.mjs` 가 같은 이유로 같은 못을 박고 있다.
+    //    `src/test-spawn.mjs` 가 같은 이유로 같은 못을 박고 있다.
     if (hardTimer === null) hardTimer = setTimeout(() => hardSettle?.(), KILL_GRACE_MS);
   };
 
@@ -225,8 +274,8 @@ export async function runCli({
     const cap = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
     timer = setTimeout(() => stop('timedOut'), cap);
 
-    // 지시문은 stdin 으로 보낸다. argv 로 보내면 Windows 명령줄 상한(8191자)에 걸리고
-    // 프롬프트가 명령줄 인용 규칙을 만난다.
+    // 지시문은 stdin 으로 보낸다. argv 로 보내면 Windows 명령줄 상한(CreateProcessW 의 32,767자, 명령줄 **전체**)에
+    // 걸리고, `shell:false` 가 건너뛰는 것은 cmd.exe(8,191)뿐이라 libuv 의 인용은 그대로 만난다 — 단위는 `codexArgvChars` 다.
     child.stdin.on('error', () => {
       // 자식이 stdin 을 읽기 전에 죽으면 EPIPE 가 난다. 종료 코드로 이미 드러날 일이다.
     });
@@ -256,7 +305,16 @@ export async function runCli({
       resolve(value);
     };
     hardSettle = () => settle({ spawnError: null, hung: true });
-    child.on('error', (error) => settle({ spawnError: error, hung: false })); // ENOENT 등 비동기 스폰 실패
+    child.on('error', (error) => {
+      // ★ `kill` 시스콜의 실패는 스폰 실패가 아니다. 우리가 **이미 죽어 가는** 자식을 한 번 더
+      //   끊을 때 engines 하한(libuv 1.48.0)이 EPERM 을 올리는데(위 `stop` 의 WHY), 그것으로
+      //   settle 하면 정상 종료 중인 실행이 `provider_spawn_denied`("실행 권한을 고치세요")로
+      //   **오분류**된다 — 엔진의 taskkill 과 이 층의 kill 이 겹치는 **단일 kill** 경로에서도
+      //   실측 12/30. 무시해도 결과는 반드시 나온다: 자식은 실제로 죽는 중이라 close 가 오고,
+      //   영영 안 오는 최악에도 KILL_GRACE 의 못(hardSettle)이 settle 을 보장한다.
+      if (error?.syscall === 'kill') return;
+      settle({ spawnError: error, hung: false }); // ENOENT 등 비동기 스폰 실패
+    });
     // 'exit' 이 아니라 'close' 다. 'exit' 은 프로세스가 끝난 시점에 뜨고, 계약상
     // 그때 stdio 가 아직 안 닫혀 있을 수 있다. 'close' 는 파이프가 다 비워진 뒤다.
     // 정직하게 적자면: 800KB 출력으로도 둘의 차이를 드러내는 실패를 만들지 못했다

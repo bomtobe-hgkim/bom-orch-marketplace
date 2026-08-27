@@ -1,35 +1,22 @@
-import { createHash, randomBytes } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { readSettings as defaultReadSettings, resolveTier } from './config.mjs';
-import { timeoutSignal } from './deadline.mjs';
-import { runCandidateLane } from './candidate-lane.mjs';
-import {
-  buildJudgeView as createJudgeView,
-  makeBlindPair,
-  parseJudgeDecision,
-  remapJudgeDecision,
-  selectCandidates,
-  selectSingleCandidate,
-} from './candidate-selection.mjs';
-import { renderContentParts, validateArtifactPathBudget } from './content-projection.mjs';
-import { failure, MAX_CONTENT_CHARS, success } from './envelope.mjs';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+import { snapshotStoreArtifactAuthority } from './artifact-settlement.mjs';
+import { confidenceOfRun } from './confidence.mjs';
+import { haltSignal, timeoutSignal } from './deadline.mjs';
+import { ARTIFACT_PATH_JSON_BUDGET, validateArtifactPathBudget } from './content-projection.mjs';
+import { failure } from './envelope.mjs';
 import { inspectRepo as defaultInspectRepo } from './git.mjs';
-import { AXES, decide, evidenceParagraph, gradeToDeltas } from './learn/bandit.mjs';
-import { POLICY_V2_AXES } from './learn/policy-v2.mjs';
-import { computeRunLearningOutcome } from './learn/policy-v2.mjs';
 import { classifyTask } from './learn/classify.mjs';
-import { appendRun as defaultAppendRun } from './learn/journal.mjs';
-import {
-  cellKeyOf,
-  commitLearningMutation as defaultCommitLearningMutation,
-  readPosteriors as defaultReadPosteriors,
-  updatePosterior as defaultUpdatePosterior,
-} from './learn/posteriors.mjs';
-import { inspectPatch as defaultInspectPatch } from './patch-scope.mjs';
+import { appendRun, runTerminalKeys } from './learn/journal.mjs';
+import { refusedScopeAllow } from './patch-scope.mjs';
+import { MAX_ALLOW_ENTRIES, MAX_ALLOW_ENTRY_CHARS, unionScopeAllow } from './scope-allowlist.mjs';
+import { verifyProjectConfigSealed } from './project-config.mjs';
 import { listProviders } from './providers/index.mjs';
 import {
+  armEffectUnknownIntent as defaultArmEffectUnknownIntent,
+  disarmEffectUnknownIntent as defaultDisarmEffectUnknownIntent,
+  sweepLogs as defaultSweepLogs,
   sweepPatches as defaultSweepPatches,
+  sweepPlans as defaultSweepPlans,
   sweepRuns as defaultSweepRuns,
   sweepScratch as defaultSweepScratch,
   trackChild as defaultTrackChild,
@@ -37,85 +24,128 @@ import {
   treeKill as defaultTreeKill,
 } from './reaper.mjs';
 import { resolveStateRoot } from './state-root.mjs';
+import { stateSchemaNotice, stateSchemaReason } from './state-schema.mjs';
 import { canonical } from './real-path.mjs';
+import { provisionDependencies as defaultProvisionDependencies } from './deps-provision.mjs';
 import {
-  USER_PRIVILEGE_NOTE,
-  deriveTestCommand as defaultDeriveTestCommand,
   deriveFrozenTestPlan as defaultDeriveFrozenTestPlan,
-  runFrozenTests as defaultRunFrozenTests,
-  runTests as defaultRunTests,
+  frozenTestPlanConfig,
+  frozenTestPlanNotices,
 } from './test-runner.mjs';
-import {
-  collectPatchAtRevision as defaultCollectPatchAtRevision,
-  collectPatch as defaultCollectPatch,
-  createRevisionWorktree as defaultCreateRevisionWorktree,
-  createWorktree as defaultCreateWorktree,
-  listRevisionDelta as defaultListRevisionDelta,
-  listIgnoredPaths as defaultListIgnoredPaths,
-  makeWorktreeId,
-  removeWorktree as defaultRemoveWorktree,
-  revisionIdentity as defaultRevisionIdentity,
-  snapshotStep as defaultSnapshotStep,
-  statusSnapshot as defaultStatusSnapshot,
-} from './worktree.mjs';
+import { makeWorktreeId } from './worktree.mjs';
 import {
   classifyProofRequirement,
   createSerialTestQueue,
-  runCandidateEvidence,
-  splitTestOnlyDelta,
 } from './regression-proof.mjs';
 import {
-  checkpointManifest,
+  RUN_ARTIFACT_RETENTION_MS,
   createRunArtifacts,
   getRunArtifactStoreAuthority,
   inspectRunArtifactCollision,
   isRunArtifactStore,
-  writeAttemptArtifact,
-  writeCandidatePatch,
-  writeEvidenceArtifact,
-  writeWinnerAlias,
 } from './run-artifacts.mjs';
+import {
+  createRunUsageAccumulator,
+} from './run-body.mjs';
+import {
+  artifactBlocked,
+  attachExcerpts,
+  carriedFailure,
+  createFaultRegistry,
+  createRunLog,
+  handoffNotice,
+  joinNotices,
+  reasonCodeOf,
+  resultReasonCode,
+  runCancelled,
+  runDeadline,
+  statusOfReasonCode,
+  terminalOutcome,
+  terminalOutcomeOf,
+} from './run-faults.mjs';
+import { finalizeRun } from './run-finalization.mjs';
+// 레인 한 줄기의 실행과 그 어댑터 묶음은 WS8 컷 1 이 저 모듈로 옮겼다(로드맵 §3.11) — 레인
+// 단계의 새 코드는 엔진이 아니라 저쪽으로 들어간다. `PREPARATION_PRIVATE` 는 값이 아니라
+// **동일성**이라 사본을 만들 수 없어, 준비가 채우고 어댑터가 읽는 그 하나를 여기서 수입한다.
+import { PREPARATION_PRIVATE, runPreparedLane } from './run-lane-adapters.mjs';
+// 크레딧 전 관문 넷(게이트웨이·벤더 사전 점검·예측·인증)은 WS8 컷 2 가 저 모듈로 옮겼다 —
+// 자리의 근거를 적은 ★★ 주석도 함께 갔다. 새 크레딧 전 관문은 엔진이 아니라 저쪽으로 들어간다.
+import {
+  assessPreCreditRisk,
+  refuseGatewayEnvironment,
+  settleVendorPreflight,
+} from './run-precredit-gates.mjs';
+// 재개의 관문 셋과 그 산술 하나는 WS8 컷 2 가 저 모듈로 옮겼다 — 셋의 **자리**가 곧 계약이라
+// (§0-R1) 그 논증이 한 파일에 모여 있어야 한다. 새 재개 판정은 엔진이 아니라 저쪽으로 들어간다.
+import {
+  openResumeSource,
+  refuseEnvironmentDrift,
+  refuseWhenNoResumeRoom,
+  startResume,
+} from './run-resume-gates.mjs';
+// 레인 워크트리의 생성·검증·회수는 WS8 컷 2 가 저 모듈로 옮겼다 — 이 실행이 남기는 유일한
+// 바깥 부작용이라 만드는 자리와 치우는 자리가 한 파일에 있다. 새 워크트리 준비 코드는 저쪽이다.
+import {
+  createLaneAWorktree,
+  createLaneBWorktree,
+  createWorktreeCleanup,
+  snapshotBlockedResult,
+} from './run-worktrees.mjs';
+// 플래너 단계(스크래치 신원 증명 · 플래너 호출 · 계획 정본 기록)는 WS8 컷 2 가 저 모듈로
+// 옮겼다 — 회수 규칙이 한 자리여야 하기 때문이다. 새 플래너 코드는 저쪽으로 들어간다.
+import { recordPlannerCanon, runPlannerPhase } from './run-planner.mjs';
+// 진행 채널과 프로바이더 호출 이음매도 WS8 컷 2 가 저 모듈로 옮겼다 — 둘은 `runFacts` 라는
+// 같은 세 값을 싣는다. 새 진행 이벤트는 저쪽으로 들어간다.
+import { createProgressReporter, createProviderCall } from './run-progress.mjs';
+// 역할 바인딩 사슬(설정 · 밴딧 · 배정 · 보안 하한 · 티어)은 WS8 컷 2 가 저 모듈로 옮겼다 —
+// 다섯이 한 사슬이라 한 칸만 떼면 나머지 넷의 전제가 깨진다. 새 바인딩 판정은 저쪽이다.
+import { bindRunRoles } from './run-role-bindings.mjs';
+import { deepFreeze } from './util/freeze.mjs';
+import { cloneData, exactDenseArray, ownDataValue, snapshotOwnDataObject } from './util/objects.mjs';
+import { contained } from './util/paths.mjs';
+import { REASON } from './reason-codes.mjs';
+import { fail, renderNotice } from './reason-text.mjs';
+import { GENERIC_RECOVERY, errorText } from './util/errors.mjs';
 
 function validateQualityRequest(options) {
+  // ★ 문구는 넘기지 않는다 — 코드가 문장을 정한다(WS2 §7.2). `status` 만 여기서 고른다:
+  //   호출자 인자 결함은 도구 수준에서 `invalid` 이고, 그 코드들의 조악 `stopReason` 은
+  //   `blocked`(실행 전 전제 조건)다 — 두 어휘는 층이 다르고 섞이지 않는다.
+  const invalid = (reasonCode, params = {}) => failure({ status: 'invalid', reasonCode, params });
   const candidateCount = options.candidateCount === undefined ? 1 : options.candidateCount;
   if (candidateCount !== 1 && candidateCount !== 2) {
-    return failure({
-      status: 'invalid',
-      error: `candidateCount 는 1 또는 2여야 합니다: ${show(candidateCount)}`,
-      recovery: 'candidateCount 를 1 또는 2로 지정하세요.',
-    });
+    return invalid(REASON.config_candidate_count_invalid, { count: show(candidateCount) });
   }
-  if (candidateCount === 2 && options.allowSingle === true) {
-    return failure({
-      status: 'invalid',
-      error: 'candidates: 2 와 allow_single: true 는 함께 쓸 수 없습니다.',
-      recovery: '독립 후보 둘을 쓰려면 allow_single 을 false 로 두세요.',
-    });
+  if (candidateCount === 2 && options.allowSingle === true) return invalid(REASON.config_single_vendor_conflict);
+  if (candidateCount === 2 && (options.writer !== undefined || options.worker !== undefined || options.verifier !== undefined)) {
+    return invalid(REASON.config_role_override_conflict);
   }
-  if (candidateCount === 2 && (options.worker !== undefined || options.verifier !== undefined)) {
-    return failure({
-      status: 'invalid',
-      error: 'candidates: 2 는 고정 mirrored worker/verifier 배치를 사용하므로 전역 역할 override를 받을 수 없습니다.',
-      recovery: 'worker/verifier 지정을 제거하거나 candidates: 1을 사용하세요.',
-    });
-  }
-  if (typeof options.task !== 'string' || options.task.trim() === '') {
-    return failure({ status: 'invalid', error: 'task 가 비어 있습니다.', recovery: '무엇을 해야 하는지 한 문장 이상으로 적어 주세요.' });
-  }
+  if (typeof options.task !== 'string' || options.task.trim() === '') return invalid(REASON.config_task_missing);
   if (typeof options.projectPath !== 'string' || options.projectPath === '' || !isAbsolute(options.projectPath)) {
-    return failure({ status: 'invalid', error: `projectPath 가 절대 경로가 아닙니다: ${show(options.projectPath)}`, recovery: '대상 git 저장소의 절대 경로를 주세요.' });
+    return invalid(REASON.config_project_path_invalid, { path: show(options.projectPath) });
   }
   const isolation = options.isolation ?? 'worktree';
-  if (isolation !== 'worktree') {
-    return failure({ status: 'invalid', error: `isolation 값을 지원하지 않습니다: ${show(isolation)}`, recovery: "isolation 은 'worktree' 뿐입니다." });
-  }
+  if (isolation !== 'worktree') return invalid(REASON.config_isolation_unsupported, { isolation: show(isolation) });
   const budget = options.budget ?? 1;
   if (!Number.isInteger(budget) || budget < 1 || budget > MAX_BUDGET) {
-    return failure({ status: 'invalid', error: `budget 은 1 이상 ${MAX_BUDGET} 이하의 정수여야 합니다: ${show(budget)}`, recovery: `스텝 수를 1~${MAX_BUDGET} 사이의 정수로 주세요.` });
+    return invalid(REASON.config_budget_invalid, { budget: show(budget), limit: MAX_BUDGET });
   }
   const waitMs = options.waitMs ?? 0;
-  if (!Number.isFinite(waitMs) || waitMs < 0) {
-    return failure({ status: 'invalid', error: `waitMs 는 0 이상의 유한한 수여야 합니다: ${show(waitMs)}`, recovery: '밀리초 단위 상한을 주세요.' });
+  if (!Number.isFinite(waitMs) || waitMs < 0) return invalid(REASON.config_wait_ms_invalid, { waitMs: show(waitMs) });
+  // ★ 호스트 취소 신호(WS3 §0-C1, 태스크 6). 여기서는 **모양만** 본다 — 읽는 것은 태스크 7 이다.
+  //   `undefined` 는 "호스트 신호 없음"이고 그게 대부분의 호출자다(도구 밖에서 엔진을 직접
+  //   부르는 자리에는 호스트가 없다). 모양이 아닌 값을 조용히 흘려보내면 태스크 7 이
+  //   `AbortSignal.any([...])` 를 부르는 자리에서 터지는데, 그때는 이미 워크트리가 생긴 뒤다.
+  const hostSignal = options.hostSignal;
+  if (hostSignal !== undefined && !(hostSignal !== null && typeof hostSignal === 'object' &&
+      typeof hostSignal.aborted === 'boolean' && typeof hostSignal.addEventListener === 'function')) {
+    return invalid(REASON.config_arguments_invalid);
+  }
+  // ★ 재개(WS3 §0-R1). 여기서 보는 것은 **모양**뿐이다 — 그 이름의 실행이 있는지, 그것이 이 실행과
+  //   같은 정체성인지는 상태 루트를 안 뒤에야 알 수 있고, 그 답은 `resume_*` 네 코드가 낸다.
+  const resumeRunId = options.resumeRunId;
+  if (resumeRunId !== undefined && (typeof resumeRunId !== 'string' || resumeRunId === '')) {
+    return invalid(REASON.config_arguments_invalid);
   }
   return null;
 }
@@ -129,14 +159,15 @@ function validateQualityRequest(options) {
  * 이 함수 계층은 하위 `{ blocked: true }` 결과와 예외를 항상 MCP 봉투로 번역한다.
  */
 
-/** 워커가 받을 도구 집합. Bash 가 없다 — 테스트는 우리가 돌린다(§12.-1). */
-export const WORKER_TOOLS = Object.freeze(['Read', 'Glob', 'Grep', 'Edit', 'Write']);
-
-/** 베리파이어가 받을 도구 집합. 읽기만 한다. */
-export const VERIFIER_TOOLS = Object.freeze(['Read', 'Glob', 'Grep']);
-
-/** 플래너는 도구 없이 텍스트만 낸다 — 프로바이더의 읽기 전용 역할이 `--tools ''` 를 준다. */
-const PLANNER_ROLE = 'planner';
+/**
+ * 두 도구 집합은 WS8 컷 1 이 `src/run-lane-adapters.mjs` 로 바이트 보존 이동했다 — 쓰는 자리가
+ * 레인 어댑터뿐이기 때문이다(로드맵 §3.11).
+ *
+ * ★ 이 재수출은 **호환 이음매**다. 둘은 이 모듈의 공개 이름이었고 `test/engine.test.mjs` 가
+ *   엔진에서 이름으로 수입해 워커·베리파이어에게 실제로 넘어간 집합과 대조한다. 정본은 새
+ *   모듈 하나뿐이고 여기는 그 이름을 통과시키기만 한다 — 값을 다시 적으면 두 자리가 갈린다.
+ */
+export { VERIFIER_TOOLS, WORKER_TOOLS } from './run-lane-adapters.mjs';
 
 /** 스텝 수 상한. 한 번의 도구 호출이 무한정 델리게이트를 부르지 않게 한다. */
 export const MAX_BUDGET = 10;
@@ -149,11 +180,21 @@ export const MAX_BUDGET = 10;
  * 양립하지 않는다. 그래서 `waitMs` 를 "호출자가 정한 상한", 이 값을 "그것과 무관한 상한"
  * 으로 나눈다 — 호출자가 0 을 주면 이 값이 데드라인이 되고, 더 큰 값을 주면 이 값으로 깎인다.
  *
- * 1시간인 이유: 예산이 아니라 못이다. 정상적인 오케스트레이션(최대 10스텝 × 플래너·워커·
- * 테스트·베리파이어)이 여기 닿는 것은 이상 상태이고, 그때는 부분 결과라도 내보내는 편이
+ * 못이지 예산이 아닌 이유: 정상적인 오케스트레이션(최대 10스텝 × 플래너·워커·테스트·
+ * 베리파이어)이 여기 닿는 것은 이상 상태이고, 그때는 부분 결과라도 내보내는 편이
  * MCP 요청이 영영 매달리는 것보다 낫다.
+ *
+ * ★★ 55분인 이유(WS3 §0-W1). 이 값은 **호스트의 도구 타임아웃보다 먼저** 만료해야 한다 —
+ * 호스트가 먼저 끊으면 사용자에게 가는 것은 봉투가 아니라 전송 오류이고, 부분 결과도 사유
+ * 코드도 아무 채널에 안 남는다. 호스트 값(Claude `.mcp.json` 의 `timeout`, Codex 의
+ * `tool_timeout_sec` — 둘 다 3,600,000 ms)은 **올리지 않는다**: 우리가 못 고치는 남의 설정에
+ * 기대게 되기 때문이다. 그래서 엔진을 내린다. 3,600,000 − 70,000 = 3,530,000 이 상한이고
+ * 70초는 abort **뒤에** 우리가 아직 쓰는 시간이다(하드스톱 유예 10초 `HARD_STOP_GRACE_MS`
+ * + 워크트리 정리 최대 60초). 부등식은 `test/guards/wait-budget-inequality.test.mjs` 가 두
+ * 호스트 설정의 소스와 exporter 산출물 양쪽에서 지킨다. 기본 `wait_ms` 1,800,000 은 그대로다
+ * — 같이 내리면 기본 실행이 데드라인에 더 자주 걸린다(로드맵 §3.5).
  */
-export const MAX_WAIT_MS = 3_600_000;
+export const MAX_WAIT_MS = 3_300_000;
 
 /** 데드라인 뒤 주입 이음매가 signal 을 무시할 때 기다리는 단계별 유예. */
 const HARD_STOP_GRACE_MS = 10_000;
@@ -162,57 +203,9 @@ const HARD_STOP = Symbol('bom-orch:hard-stop');
 /** `src/worktree.mjs` 의 `RUN_ID_PATTERN` 과 같은 값. 갈리면 워크트리 생성이 거부된다. */
 const RUN_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
-const GENERIC_RECOVERY = '오류 로그를 확인하거나 다시 시도하세요.';
-
-/** 봉투에 실을 각 텍스트의 상한(문자). 자세한 것은 `renderContent` 를 보라. */
-const EXCERPT_CHARS = 1_200;
-const TEST_OUTPUT_CHARS = 800;
-/** 마지막 요약 단계에서 문자열 하나가 차지할 수 있는 상한. */
-const SUMMARY_FIELD_CHARS = 400;
-/** 학습 요약 한 단계에 싣는 축 수 상한. 더 큰/적대적 입력은 비상 요약으로 내려간다. */
-const AXIS_SUMMARY_LIMIT = 8;
-
-/**
- * notice 의 상한 — 개별과 합계 둘 다.
- *
- * ★ 왜 필요한가(실측): `content` 는 `envelope.mjs` 가 10,000자로 깎는데 `notice` 를 깎는
- *   코드는 저장소 어디에도 없었다. 진짜 저장소로 재니 `content` 800자 : `notice` 51,133자
- *   = 64배가 나왔고 봉투 하나가 52KB 로 나갔다 — `.gitignore` 에 `*.log` 하나가 있고 워커가
- *   로그 2,000개를 남기면 그 목록이 그대로 문장에 박힌다. 길이를 정하는 쪽이 우리가 아니라
- *   델리게이트다. 호스트가 결과를 자르면 꼬리의 `patch` 경로·`recovery` 가 먼저 사라진다.
- */
-const NOTICE_CHARS = 400;
-const NOTICES_TOTAL_CHARS = 1_600;
-
-/** 어떤 값에서도(toString 이 던지는 값 포함) 사람이 읽을 문자열을 뽑는다. */
-function safeText(value) {
-  if (typeof value === 'string') return value !== '' ? value : '알 수 없는 오류';
-  try {
-    const text = String(value?.message ?? value);
-    return text !== '' ? text : '알 수 없는 오류';
-  } catch {
-    return '알 수 없는 오류';
-  }
-}
-
-function clip(value, limit) {
-  const text = typeof value === 'string' ? value : '';
-  return text.length > limit ? `${text.slice(0, limit)}…(${text.length}자 중 앞 ${limit}자)` : text;
-}
-
-/** 쌓인 notice 를 봉투에 실을 한 덩어리로 합친다. 합계 상한을 넘기면 뒤를 접는다. */
-function joinNotices(list) {
-  if (list.length === 0) return undefined;
-  const kept = [];
-  let used = 0;
-  for (const text of list) {
-    if (kept.length > 0 && used + text.length + 1 > NOTICES_TOTAL_CHARS) break;
-    kept.push(text);
-    used += text.length + 1;
-  }
-  const dropped = list.length - kept.length;
-  return dropped > 0 ? `${kept.join(' ')} (그 밖에 알림 ${dropped}건이 더 있어 접었습니다.)` : kept.join(' ');
-}
+/** 값이 없을 때 문장에 들어가는 토큰. `renderReason` 은 빠진 인자에 **던지므로** 자리를 비울 수 없다. */
+const UNKNOWN_VALUE = '<unknown>';
+const NO_VENDORS = '(none)';
 
 /**
  * 인자 검증의 오류 메시지에 값을 적는다. **절대 던지지 않는다.**
@@ -224,6 +217,9 @@ function joinNotices(list) {
  *   `undefined` 를 넘겼을 때 `JSON.stringify` 가 `undefined` 를 돌려주는 것도 여기서 흡수한다.
  */
 function show(value) {
+  // ★ `undefined` 는 `Object.prototype.toString` 으로 내려보내지 않는다. 그 답('[object Undefined]')은
+  //   봉투 계약이 금지한 'undefined' 라는 글자를 문장에 넣는다 — 값이 없다는 사실이 값처럼 보인다.
+  if (value === undefined) return '(missing)';
   try {
     const text = JSON.stringify(value);
     if (typeof text === 'string') return text;
@@ -233,110 +229,12 @@ function show(value) {
   try {
     return Object.prototype.toString.call(value);
   } catch {
-    return '(표현할 수 없는 값)';
+    return '(unrepresentable value)';
   }
 }
 
 /** 하위 모듈의 `{blocked:true}` 인가. `ok:true` 결과와 겹치지 않는다. */
 const isBlocked = (result) => ownDataValue(result, 'blocked').value === true;
-const STORE_AUTHORITY_LOST_ERRORS = new Set([
-  'artifact_store_poisoned',
-  'manifest_authority_mismatch',
-  'manifest_checkpoint_failed',
-]);
-
-function artifactAuthorityLost(result) {
-  const hardStopped = ownDataValue(result, 'hardStopped');
-  const rawError = ownDataValue(result, 'error');
-  const error = rawError.ok === true && typeof rawError.value === 'string' ? rawError.value : '';
-  return hardStopped.ok === true && hardStopped.value === true ||
-    STORE_AUTHORITY_LOST_ERRORS.has(error) || error.endsWith('_authority_lost');
-}
-
-function validArtifactWriterSuccess(result, { kind, candidateId, path, bytes, sha256 }) {
-  try {
-    const allowedResultKeys = ['ok', 'ref', 'revision', 'manifestRef', 'duplicate'];
-    const resultKeys = ARTIFACT_SETTLEMENT_SOURCE_KEYS.get(result) ?? Reflect.ownKeys(result);
-    if (resultKeys.length !== allowedResultKeys.length ||
-        resultKeys.some((key) => typeof key !== 'string' || !allowedResultKeys.includes(key))) return false;
-    const outer = snapshotOwnDataObject(result, resultKeys);
-    const refKeys = ['kind', 'candidateId', 'path', 'sha256', 'bytes', 'expiresAt'];
-    const ref = outer === null ? null : snapshotOwnDataObject(outer.ref, refKeys);
-    const actualKeys = ref === null ? [] : Reflect.ownKeys(outer.ref);
-    return outer?.ok === true && ref !== null &&
-      Number.isSafeInteger(outer.revision) && outer.revision >= 0 &&
-      typeof outer.duplicate === 'boolean' && outer.manifestRef !== null && typeof outer.manifestRef === 'object' &&
-      actualKeys.length === refKeys.length && actualKeys.every((key) => typeof key === 'string' && refKeys.includes(key)) &&
-      ref.kind === kind && ref.candidateId === candidateId && ref.path === path && isAbsolute(ref.path) &&
-      ref.sha256 === sha256 && ref.bytes === bytes && Number.isSafeInteger(ref.bytes) && ref.bytes >= 0 &&
-      Number.isSafeInteger(ref.expiresAt) && ref.expiresAt > 0;
-  } catch {
-    return false;
-  }
-}
-
-function validManifestRef(ref, { path, revision, expiresAt }) {
-  try {
-    const keys = Reflect.ownKeys(ref);
-    const expectedKeys = ['kind', 'path', 'revision', 'expiresAt'];
-    const outer = snapshotOwnDataObject(ref, keys);
-    return outer !== null && keys.length === expectedKeys.length &&
-      keys.every((key) => typeof key === 'string' && expectedKeys.includes(key)) &&
-      outer.kind === 'manifest' && outer.path === path && isAbsolute(outer.path) &&
-      outer.revision === revision && Number.isSafeInteger(outer.revision) && outer.revision >= 0 &&
-      (expiresAt === null || outer.expiresAt === expiresAt) &&
-      Number.isSafeInteger(outer.expiresAt) && outer.expiresAt > 0;
-  } catch {
-    return false;
-  }
-}
-
-function validArtifactBlocked(result) {
-  try {
-    const keys = ARTIFACT_SETTLEMENT_SOURCE_KEYS.get(result) ?? Reflect.ownKeys(result);
-    const expectedKeys = ['blocked', 'error', 'recovery'];
-    return keys.length === expectedKeys.length &&
-      keys.every((key) => typeof key === 'string' && expectedKeys.includes(key)) &&
-      result.blocked === true && typeof result.error === 'string' && result.error !== '' &&
-      typeof result.recovery === 'string' && result.recovery !== '';
-  } catch {
-    return false;
-  }
-}
-
-function validArtifactHardStop(result) {
-  try {
-    const keys = ARTIFACT_SETTLEMENT_SOURCE_KEYS.get(result) ?? Reflect.ownKeys(result);
-    const expectedKeys = ['blocked', 'hardStopped', 'error', 'recovery'];
-    return (keys.length === 3 || keys.length === expectedKeys.length) &&
-      keys.every((key) => typeof key === 'string' && expectedKeys.includes(key)) &&
-      result.blocked === true && result.hardStopped === true && typeof result.error === 'string' && result.error !== '' &&
-      (!Object.hasOwn(result, 'recovery') || typeof result.recovery === 'string' && result.recovery !== '');
-  } catch {
-    return false;
-  }
-}
-
-function validArtifactCheckpointSuccess(result, authority) {
-  try {
-    const keys = ARTIFACT_SETTLEMENT_SOURCE_KEYS.get(result) ?? Reflect.ownKeys(result);
-    const expectedKeys = ['revision', 'manifestRef', 'duplicate'];
-    return keys.length === expectedKeys.length && keys.every((key) => typeof key === 'string' && expectedKeys.includes(key)) &&
-      Number.isSafeInteger(result.revision) && result.revision >= 0 && typeof result.duplicate === 'boolean' &&
-      validManifestRef(result.manifestRef, { ...authority, revision: result.revision });
-  } catch {
-    return false;
-  }
-}
-
-function validArtifactWriterSettlement(result, writerAuthority, manifestAuthority) {
-  return validArtifactWriterSuccess(result, writerAuthority) &&
-    manifestAuthority.expiresAt !== null && result.ref.expiresAt === manifestAuthority.expiresAt &&
-    validManifestRef(result.manifestRef, {
-      ...manifestAuthority,
-      revision: result.revision,
-    });
-}
 
 /**
  * 실행 ID 를 만든다 (배선 숙제 2).
@@ -367,272 +265,16 @@ export function makeRunId({ now = Date.now, random = Math.random } = {}) {
  * historical `mix=single` arm, intentionally assigns all roles to one provider; the coordinator
  * separately caps that result at unverified.
  */
-/**
- * 이 분류값들은 자식이 **떴다는 것**을 모호함 없이 말한다(설계 §5.8 S1).
- *
- * ★ `aborted` 가 빠진 이유: 스폰 **전** 중단과 스폰 **후** 중단이 둘 다 `'aborted'` 다. 넣으면
- *   한 줄도 안 돌린 실행을 "사용자 권한으로 돌았다"고 신고하게 되고, 매번 뜨는 보안 경고는
- *   아무도 안 읽는다. 그 갈래는 `ranWithUserPrivilege` 가 정확히 가른다.
- */
-const RAN_WITH_USER_PRIVILEGE_EXECUTIONS = new Set(['completed', 'timeout', 'hung', 'lingering']);
 
 /**
- * 배치 팔의 정본은 `src/learn/bandit.mjs` 의 `AXES.placement` 하나다. 여기서 **파생**시킨다.
+ * 배치 상수 둘과 `assignRoles`·`freezeEffectiveChoices` 는 WS3 태스크 8(스펙 §0-M1)이
+ * `src/learn/effective-choices.mjs` 로 바이트 보존 이동했다 — 학습 팔의 장부이지 조율이 아니다.
  *
- * ★ 왜 리터럴로 두면 안 되나: `assignRoles` 는 문자열 동등성으로 역전을 판단하므로 **모르는 값은
- *   전부 정방향으로 떨어진다**. 팔 이름을 바꾸면 밴딧은 새 이름을 뽑고, 엔진은 조용히 정방향으로
- *   돌고, 그 실행의 보상은 새 이름 셀로 들어간다 — 돌지도 않은 배치를 배웠다고 기록한다. 컴파일도
- *   테스트도 안 깨지므로 아무도 모른다. `tier` 축은 이미 `AXES.tier.arms` 를 읽는다.
- *
- * ★ `default` 가 정방향이라는 것은 우연이 아니다: `'claude>codex'` 는 등록 순서대로 첫째가
- *   쓰고 둘째가 검증한다는 뜻이고, 그것이 이 엔진의 정방향 정의다.
+ * ★ 이 재수출은 **호환 이음매**다. 두 상수는 이 모듈의 공개 이름이었고 `test/engine.test.mjs` 가
+ *   엔진에서 이름으로 수입해 밴딧의 팔 이름과 대조한다. 정본은 새 모듈 하나뿐이고 여기는 그
+ *   이름을 통과시키기만 한다 — 값을 다시 파생시키지 않는다(두 자리에서 파생하면 갈린다).
  */
-export const FORWARD_PLACEMENT = AXES.placement.default;
-export const REVERSED_PLACEMENT = AXES.placement.arms.find((arm) => arm !== FORWARD_PLACEMENT) ?? null;
-
-export function assignRoles(providers, decisions) {
-  const first = providers[0];
-  const second = providers[1] ?? null;
-  const reversed = decisions?.placement === REVERSED_PLACEMENT;
-
-  if (second === null) return { planner: first, worker: first, verifier: first };
-
-  // `single` 도 **어느 벤더로** 도는지는 placement 가 정한다. 첫째 벤더로 못 박으면 두 팔이
-  // 같은 실행을 내므로 `single` 실행에서 placement 축이 무연산이 되고, 태스크 8 이 그 실행의
-  // placement 셀에 보상을 준다 — 아무 일도 하지 않은 결정을 배웠다고 기록하는 것이다.
-  if (decisions?.mix === 'single') {
-    const only = reversed ? second : first;
-    return { planner: only, worker: only, verifier: only };
-  }
-
-  const worker = reversed ? second : first;
-  const verifier = reversed ? first : second;
-  return { planner: worker, worker, verifier };
-}
-
-// ── 지시문 ────────────────────────────────────────────────────────────────
-
-/**
- * @param evidence §7.5 의 근거 문단(`decide().evidence`). **지시문 앞에** 붙는다.
- *
- * ★ 앞에 두는 이유: 이 문단은 "이 저장소에서 실제로 관찰된 사실" 이고 계획을 세우기 전에
- *   읽혀야 한다. 뒤에 붙이면 긴 작업 설명 뒤로 밀린다.
- * ⚠ 문단은 **밴딧이 고른 축만** 말한다. 호출자가 축을 직접 지정하면(`options.decisions`)
- *   그 축은 문단에 안 나오거나, 밴딧이 골랐던 다른 팔이 적혀 있을 수 있다 — 문단은 결정의
- *   근거이지 이번 실행의 배치 기록이 아니다. 배치 기록은 `content.learning.decisions` 다.
- */
-function plannerInstruction({ task, testPlan, evidence }) {
-  const testLine =
-    testPlan === null || testPlan?.source === null
-      ? '이 프로젝트에서는 테스트 명령을 유도하지 못했습니다 — 검증은 사람이 합니다.'
-      : `테스트는 오케스트레이터가 직접 돌립니다: ${testPlan.source}의 고정된 테스트 계획입니다.`;
-  return [
-    ...(typeof evidence === 'string' && evidence !== '' ? [clip(evidence, EXCERPT_CHARS), ''] : []),
-    '다음 작업의 실행 계획을 세우세요. 당신은 파일을 읽거나 쓸 수 없습니다 — 텍스트 계획만 냅니다.',
-    '',
-    `작업: ${task}`,
-    '',
-    testLine,
-    '계획을 실행할 워커는 셸을 쓸 수 없고 파일 읽기·쓰기·검색만 합니다. 테스트 명령을 바꾸라고',
-    '지시하지 마세요 — 바뀌면 실행이 거부됩니다.',
-    '',
-    '무엇을 어떤 순서로 고칠지, 무엇을 근거로 다 됐다고 판단할지 짧게 적으세요.',
-  ].join('\n');
-}
-
-function workerInstruction({ task, plan, step, budget, feedback }) {
-  const lines = [
-    `작업: ${task}`,
-    '',
-    '계획:',
-    clip(plan, EXCERPT_CHARS),
-    '',
-    `이번은 ${step}/${budget} 번째 스텝입니다. 일회용 워크트리는 패치 격리 경계입니다.`,
-    'OS 샌드박스가 아니므로 바깥 파일·네트워크 접근을 막는다고 가정하지 마세요. 셸은 없습니다.',
-    '테스트는 이 실행이 끝난 뒤 오케스트레이터가 직접 돌립니다. 테스트 정의(package.json 의',
-    'scripts.test, Makefile 의 test 타깃, pytest 설정 등)를 고치지 마세요 — 고치면 실행이 거부됩니다.',
-  ];
-  if (feedback !== null) {
-    lines.push('', '앞 스텝의 결과:', clip(feedback, EXCERPT_CHARS));
-  }
-  return lines.join('\n');
-}
-
-/**
- * 이번 attempt 의 기계 실행 증거를 verifier 가 읽을 한 문단으로.
- *
- * ★★ 왜 verifier 에게 이것을 주는가(설계 §12.-1): 테스트는 델리게이트가 아니라 우리가 돌린다 —
- *   그래야 결과를 지어낼 수 없다. 그런데 판정 스키마는 verifier 에게 `evidenceIds` 를 되돌려
- *   적으라고 요구한다. 그 증거가 무엇을 말했는지 안 보여주면서 증명을 요구하는 셈이라
- *   앞뒤가 안 맞는다. 품질 게이트 리팩터가 이 자리를 빈 문자열로 흘려서, 프롬프트에
- *   "테스트 결과:" 라는 **빈 절**만 남아 있었다.
- *
- * ★ 원문은 넣지 않는다. 분류된 사실(실행·판정·안정성·신뢰·완결)과 증거 ID 뿐이다 — 전역
- *   제약이 금지하는 것은 저장·반환만이 아니라 원문을 다루는 습관 자체이고, verifier 는
- *   읽기 도구로 워크트리를 직접 볼 수 있으므로 원문이 없어도 판단할 수 있다.
- *
- * ★ 이 값은 판정을 **대신하지 않는다.** `decideAttempt` 가 machine 채널과 verifier 채널을
- *   따로 요구하므로, 여기서 "통과" 를 읽은 verifier 가 PASS 를 내도 기계 실패를 지우지 못하고
- *   그 반대도 마찬가지다(설계 §1 의 고정 기준).
- */
-function describeMachineEvidence(evidence) {
-  if (!evidence || typeof evidence !== 'object') return '이 실행에 대한 기계 증거가 없습니다.';
-  const ids = Array.isArray(evidence.evidenceIds) ? evidence.evidenceIds : [];
-  if (evidence.execution === 'not_run') {
-    return ['우리가 테스트를 실행하지 못했습니다.', `봉인된 증거: ${ids.join(', ') || '(없음)'}`].join('\n');
-  }
-  return [
-    '아래는 델리게이트의 보고가 아니라 이 오케스트레이터가 직접 실행한 결과입니다.',
-    `실행: ${evidence.execution}`,
-    `판정: ${evidence.outcome}`,
-    `안정성: ${evidence.stability}`,
-    `신뢰 가능한 러너: ${evidence.trusted === true ? '예' : '아니오'}`,
-    `완결: ${evidence.complete === true ? '예' : '아니오'}`,
-    `봉인된 증거: ${ids.join(', ') || '(없음)'}`,
-  ].join('\n');
-}
-
-function verifierInstruction({ task, plan, files, tests, expected, feedback, formatOnly = false }) {
-  const binding = JSON.stringify(expected);
-  const schema = expected.phase === 'recheck'
-    ? '{"schemaVersion":1,"candidateId":"...","attemptId":"...","candidatePatchSha256":"64 lowercase hex","evidenceIds":["..."],"verdict":"PASS|FAIL","checks":[{"id":"...","status":"resolved|persists","evidence":"..."}],"newIssues":[],"notes":[]}'
-    : '{"schemaVersion":1,"candidateId":"...","attemptId":"...","candidatePatchSha256":"64 lowercase hex","evidenceIds":["..."],"verdict":"PASS|FAIL","summary":"...","issues":[{"category":"correctness|security|requirements|scope|tests","claim":"...","evidence":"...","requiredFix":"..."}],"notes":[]}';
-  return [
-    formatOnly
-      ? '앞선 답은 형식이 틀렸습니다. 내용을 재검토하지 말고 아래 JSON 형식으로만 결과를 다시 내세요.'
-      : '아래 작업의 결과를 검토하세요. 당신은 읽기만 합니다 — 파일을 고치지 마세요.',
-    '파일을 고치면 이 판정은 버려집니다.',
-    `BINDING_JSON: ${binding}`,
-    `정확히 이 JSON 스키마만 내세요: ${schema}`,
-    '',
-    `작업: ${task}`,
-    '',
-    '계획:',
-    clip(plan, EXCERPT_CHARS),
-    '',
-    `이번 스텝이 건드린 파일: ${files.length === 0 ? '(없음)' : files.join(', ')}`,
-    '',
-    '테스트 결과:',
-    clip(tests, EXCERPT_CHARS),
-    ...(feedback?.openIds?.length > 0 ? ['', `다시 확인할 열린 이슈: ${feedback.openIds.join(', ')}`] : []),
-    '',
-    '작업이 실제로 끝났는지, 빠진 것이나 잘못된 것이 있는지 판정하세요.',
-  ].join('\n');
-}
-
-function judgeInstruction(promptInput, { formatOnly = false } = {}) {
-  return [
-    formatOnly
-      ? '앞선 답은 형식이 틀렸습니다. 후보를 다시 평가하지 말고 같은 판단을 정확한 JSON으로만 다시 내세요.'
-      : '두 익명 후보를 읽기 전용으로 비교하세요. 익명 표식 밖의 신원이나 경로를 추측하지 마세요.',
-    '정확히 이 JSON 스키마만 내세요:',
-    '{"schemaVersion":1,"decision":"X|Y|TIE","rationale":"...","majorDefects":[{"category":"correctness|security|requirements|scope|tests","claim":"...","evidence":"..."}]}',
-    `INPUT_JSON: ${JSON.stringify(promptInput)}`,
-  ].join('\n');
-}
-
-// ── content 렌더링 ────────────────────────────────────────────────────────
-
-/**
- * 봉투의 content 를 만든다.
- *
- * `envelope.mjs` 는 상한을 넘는 content 를 **꼬리부터** 자른다 — 잘린 JSON 은 파싱조차
- * 안 되므로 여기서 먼저 줄인다. 줄이는 순서는 "덜 중요한 것부터": 옛 스텝의 본문 →
- * 모든 본문 → 목록 → 스텝 목록 자체 → 크기가 고정된 요약.
- *
- * ★ **내보내는 이유는 테스트다.** 이 함수의 계약은 "**어떤** payload 에도 상한 안의 파싱
- *   가능한 JSON 을 낸다" 인데, 마지막 단계는 정의상 그 앞 단계들이 전부 실패했을 때만
- *   쓰인다. 엔진을 통째로 돌려서 그 상태를 만들려면 비현실적인 픽스처가 필요하고(실제로
- *   시도했다), 그러면 정작 그 단계를 재지 못한 채 초록이 된다 — 뮤테이션으로 확인했다.
- *   순수 함수이므로 적대적 payload 를 직접 먹여서 계약을 그대로 잰다.
- */
-export function renderContent(payload) {
-  return renderContentParts(payload).content;
-}
-
-const count = (value) => (Array.isArray(value) ? value.length : 0);
-
-/** 문자열이면 자르고 아니면 `null`. 요약 단계가 `null` 과 `''` 를 섞지 않게 한다. */
-const clipOrNull = (value) => (typeof value === 'string' ? clip(value, SUMMARY_FIELD_CHARS) : null);
-
-/** 축별 팔 문자열 맵 하나를 자른다. 축 수는 `AXES` 가, 값 길이는 여기서 묶는다. */
-function clipArms(map) {
-  if (map === null || typeof map !== 'object') return {};
-  return Object.fromEntries(
-    Object.entries(map)
-      .slice(0, AXIS_SUMMARY_LIMIT)
-      .map(([axis, arm]) => [clip(axis, SUMMARY_FIELD_CHARS), clipOrNull(arm)]),
-  );
-}
-
-/** `renderContent` 의 마지막(고정 크기) 단계가 쓰는 학습 요약. */
-function summarizeLearning(learning) {
-  const applied = learning.applied;
-  return {
-    taskClass: clipOrNull(learning.taskClass),
-    decisions: clipArms(learning.decisions),
-    sources: clipArms(learning.sources),
-    applied:
-      applied === null || typeof applied !== 'object'
-        ? null
-        : {
-            grade: clipOrNull(applied.grade),
-            axes: (Array.isArray(applied.axes) ? applied.axes : [])
-              .slice(0, AXIS_SUMMARY_LIMIT)
-              .map((axis) => clip(axis, SUMMARY_FIELD_CHARS)),
-          },
-  };
-}
-
-/** 배열 하나를 N개로 자르고 몇 개를 뺐는지 남긴다. 목록이 없으면 그대로 둔다. */
-function cut(list, keep) {
-  if (!Array.isArray(list) || list.length <= keep) return { list, omitted: 0 };
-  return { list: list.slice(0, keep), omitted: list.length - keep };
-}
-
-/** payload 의 지배 항목(경로 목록·스코프 사유)을 줄인다. */
-function trim(payload, keepFiles, keepReasons) {
-  const files = cut(payload.patch.files, keepFiles);
-  const ignored = cut(payload.patch.ignoredPaths, keepFiles);
-  // gitlinks 와 워크트리 쪽 목록도 길이를 델리게이트가 정한다 — 안 줄이면 그 둘이 큰
-  // 실행에서 어느 단계도 상한 안에 못 들어온다.
-  const gitlinks = cut(payload.patch.gitlinks, keepReasons);
-  const wtIgnored = cut(payload.worktree?.ignoredPaths, keepReasons);
-  const reasons = cut(payload.scope.reasons, keepReasons);
-  const blockers = cut(payload.blockers, keepReasons);
-  return {
-    ...payload,
-    patch: {
-      ...payload.patch,
-      files: files.list,
-      filesOmitted: files.omitted,
-      ignoredPaths: ignored.list,
-      ignoredPathsOmitted: ignored.omitted,
-      gitlinks: gitlinks.list,
-      gitlinksOmitted: gitlinks.omitted,
-    },
-    worktree: { ...payload.worktree, ignoredPaths: wtIgnored.list, ignoredPathsOmitted: wtIgnored.omitted },
-    scope: { ...payload.scope, reasons: reasons.list, reasonsOmitted: reasons.omitted },
-    blockers: blockers.list,
-    steps: (payload.steps ?? []).map((step) => {
-      const stepFiles = cut(step.worker?.files, keepFiles);
-      const stepReasons = cut(step.scope?.reasons, keepReasons);
-      return {
-        ...step,
-        ...(step.worker ? { worker: { ...step.worker, files: stepFiles.list, filesOmitted: stepFiles.omitted } } : {}),
-        ...(step.scope ? { scope: { ...step.scope, reasons: stepReasons.list } } : {}),
-      };
-    }),
-  };
-}
-
-function stripStepText(step) {
-  const out = { ...step };
-  if (out.worker) out.worker = { ...out.worker, content: '' };
-  if (out.verifier) out.verifier = { ...out.verifier, content: '' };
-  if (out.tests) out.tests = { ...out.tests, output: '' };
-  return out;
-}
+export { FORWARD_PLACEMENT, REVERSED_PLACEMENT } from './learn/effective-choices.mjs';
 
 // ── 본체 ──────────────────────────────────────────────────────────────────
 
@@ -648,39 +290,31 @@ function stripStepText(step) {
  * @param {{ task: string, projectPath: string, isolation?: string, budget?: number, candidateCount?: 1|2,
  *           waitMs?: number, decisions?: { mix?: string, placement?: string, tier?: string },
  *           planner?: string, worker?: string, verifier?: string,
- *           onProgress?: Function, deps?: object }} spec
+ *           onProgress?: Function, hostSignal?: AbortSignal, deps?: object }} spec
  * @returns MCP 봉투(`src/envelope.mjs`). content 는 JSON 문자열이다.
  */
 export async function runOrchestration(spec) {
   // ★ 구조분해로 받지 않는다. `runOrchestration(null)` 이 구조분해 자리에서 TypeError 를
   //   던지면 봉투가 아니라 거부된 프로미스가 나간다(worktree.mjs 가 같은 이유로 버렸다).
   let options = null;
-  let specKind = typeof spec;
   try {
     if (spec !== null && typeof spec === 'object' && !Array.isArray(spec)) options = spec;
-    else if (Array.isArray(spec)) specKind = 'array';
   } catch {
-    specKind = 'invalid object';
+    options = null;
   }
-  if (options === null) {
-    return failure({
-      status: 'invalid',
-      error: `인자는 JSON 객체여야 합니다 — ${spec === null ? 'null' : specKind} 를 받았습니다.`,
-      recovery: '{ task, projectPath } 를 담은 객체로 다시 부르세요.',
-    });
-  }
+  if (options === null) return failure({ status: 'invalid', reasonCode: REASON.config_arguments_invalid });
 
+  // ★ 로그 핸들은 `orchestrateQuality` 안에서 열린다. 그 함수가 던져 아래 catch 로 오면 봉투를
+  //   만들 재료가 전부 사라지는데 — 바로 그때가 로그 파일이 가장 필요한 순간이다. 열린 경로만은
+  //   여기까지 들고 나온다(열리기 전에 던졌으면 `undefined` 로 남고, 그 봉투는 `log` 없이 나간다).
+  let openedLog;
   try {
     const snapshot = snapshotOwnDataObject(options, [
       'task', 'projectPath', 'isolation', 'budget', 'candidateCount', 'allowSingle', 'waitMs',
-      'decisions', 'planner', 'worker', 'verifier', 'onProgress', 'deps',
+      'decisions', 'planner', 'writer', 'worker', 'verifier', 'onProgress', 'hostSignal', 'resumeRunId', 'scopeAllow', 'deps',
     ]);
     if (snapshot === null) {
-      return failure({
-        status: 'invalid',
-        error: '입력 객체는 getter 없이 own data property만 사용해야 합니다.',
-        recovery: 'JSON 객체로 다시 요청하세요.',
-      });
+      return failure({ status: 'invalid', reasonCode: REASON.config_arguments_invalid });
     }
     const inputFailure = validateQualityRequest(snapshot);
     if (inputFailure !== null) return inputFailure;
@@ -689,7 +323,7 @@ export async function runOrchestration(spec) {
         ? snapshotOwnDataObject(snapshot.decisions, ['mix', 'placement', 'tier'])
         : null;
       if (decisions === null) {
-        return failure({ status: 'invalid', error: 'decisions는 getter 없이 own data property만 사용해야 합니다.', recovery: 'plain object decisions를 사용하세요.' });
+        return failure({ status: 'invalid', reasonCode: REASON.config_arguments_invalid });
       }
       snapshot.decisions = Object.freeze(decisions);
     }
@@ -697,212 +331,32 @@ export async function runOrchestration(spec) {
       ? snapshotOwnDataObject(snapshot.deps)
       : {};
     if (deps === null) {
-      return failure({ status: 'invalid', error: 'deps는 getter 없이 own data property만 사용해야 합니다.', recovery: 'plain object deps를 사용하세요.' });
+      return failure({ status: 'invalid', reasonCode: REASON.config_arguments_invalid });
     }
     if (Array.isArray(deps.providers)) {
-      const providers = snapshotOwnDataArray(deps.providers);
+      const providers = exactDenseArray(deps.providers);
       if (providers === null) {
-        return failure({ status: 'invalid', error: 'providers는 accessor 없는 dense array여야 합니다.', recovery: 'plain provider array를 사용하세요.' });
+        return failure({ status: 'invalid', reasonCode: REASON.config_arguments_invalid });
       }
       deps.providers = providers.map(snapshotProviderEntry);
     }
     snapshot.deps = Object.freeze(deps);
-    return await orchestrateQuality(Object.freeze(snapshot));
-  } catch (error) {
-    return failure({
-      status: 'failed',
-      error: `오케스트레이션이 예기치 못한 오류로 멈췄습니다: ${safeText(error)}`,
-      recovery: '서버 로그를 확인한 뒤 다시 시도하세요. 워크트리가 남아 있으면 상태 루트의 worktrees/ 를 확인하세요.',
-    });
-  }
-}
-
-function snapshotOwnDataObject(value, keys = null) {
-  try {
-    const names = keys ?? Reflect.ownKeys(value);
-    const snapshot = {};
-    for (const key of names) {
-      if (typeof key !== 'string') continue;
-      const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
-      if (descriptor === undefined) continue;
-      if (!Object.hasOwn(descriptor, 'value')) return null;
-      snapshot[key] = descriptor.value;
-    }
-    return snapshot;
+    return await orchestrateQuality(Object.freeze(snapshot), (ref) => { openedLog = ref; });
   } catch {
-    return null;
-  }
-}
-
-function snapshotExactEnumerableDataObject(value, keys) {
-  try {
-    const snapshot = {};
-    for (const key of keys) {
-      if (typeof key !== 'string') return null;
-      const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
-      if (descriptor === undefined || descriptor.enumerable !== true || !Object.hasOwn(descriptor, 'value')) {
-        return null;
-      }
-      snapshot[key] = descriptor.value;
-    }
-    return snapshot;
-  } catch {
-    return null;
-  }
-}
-
-const ARTIFACT_REF_KEYS = Object.freeze(['kind', 'candidateId', 'path', 'sha256', 'bytes', 'expiresAt']);
-const MANIFEST_REF_KEYS = Object.freeze(['kind', 'path', 'revision', 'expiresAt']);
-const ARTIFACT_SETTLEMENT_KEYS = Object.freeze([
-  'ok', 'blocked', 'hardStopped', 'error', 'recovery', 'ref', 'manifestRef', 'revision', 'duplicate',
-]);
-const ARTIFACT_SETTLEMENT_SOURCE_KEYS = new WeakMap();
-
-function blockedArtifactSettlement(error) {
-  return Object.freeze({ blocked: true, error });
-}
-
-function unknownArtifactSettlement() {
-  return blockedArtifactSettlement('artifact_store_authority_lost');
-}
-
-function snapshotArtifactSettlement(value) {
-  try {
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
-    const sourceKeys = Reflect.ownKeys(value);
-    if (sourceKeys.some((key) => typeof key !== 'string' || !ARTIFACT_SETTLEMENT_KEYS.includes(key))) return null;
-    const raw = snapshotExactEnumerableDataObject(value, sourceKeys);
-    if (raw === null) return null;
-    const snapshot = {};
-    for (const key of sourceKeys) {
-      if (Object.hasOwn(raw, key)) snapshot[key] = raw[key];
-    }
-    if (Object.hasOwn(snapshot, 'ref')) {
-      const refKeys = Reflect.ownKeys(snapshot.ref);
-      if (refKeys.some((key) => typeof key !== 'string' || !ARTIFACT_REF_KEYS.includes(key))) return null;
-      const ref = snapshotExactEnumerableDataObject(snapshot.ref, refKeys);
-      if (ref === null) return null;
-      snapshot.ref = Object.freeze(ref);
-    }
-    if (Object.hasOwn(snapshot, 'manifestRef')) {
-      const manifestKeys = Reflect.ownKeys(snapshot.manifestRef);
-      if (manifestKeys.some((key) => typeof key !== 'string' || !MANIFEST_REF_KEYS.includes(key))) return null;
-      const manifestRef = snapshotExactEnumerableDataObject(snapshot.manifestRef, manifestKeys);
-      if (manifestRef === null) return null;
-      snapshot.manifestRef = Object.freeze(manifestRef);
-    }
-    const normalized = Object.freeze(snapshot);
-    ARTIFACT_SETTLEMENT_SOURCE_KEYS.set(normalized, Object.freeze([...sourceKeys]));
-    return normalized;
-  } catch {
-    return null;
-  }
-}
-
-function snapshotStoreArtifactAuthority(value, expectedPath) {
-  try {
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
-    const outerKeys = Reflect.ownKeys(value);
-    if (outerKeys.length !== 1 || outerKeys[0] !== 'manifestRef') return null;
-    const outer = snapshotExactEnumerableDataObject(value, outerKeys);
-    if (outer === null || outer.manifestRef === null || typeof outer.manifestRef !== 'object' ||
-        Array.isArray(outer.manifestRef)) return null;
-    const refKeys = Reflect.ownKeys(outer.manifestRef);
-    if (refKeys.length !== MANIFEST_REF_KEYS.length ||
-        refKeys.some((key) => typeof key !== 'string' || !MANIFEST_REF_KEYS.includes(key))) return null;
-    const ref = snapshotExactEnumerableDataObject(outer.manifestRef, refKeys);
-    if (ref === null || !validManifestRef(ref, {
-      path: expectedPath,
-      revision: 0,
-      expiresAt: ref.expiresAt,
-    })) return null;
-    return Object.freeze({ path: ref.path, expiresAt: ref.expiresAt });
-  } catch {
-    return null;
-  }
-}
-
-function classifyArtifactSettlement(value, { kind, authority = null } = {}) {
-  const result = snapshotArtifactSettlement(value);
-  if (result === null) return { kind: 'unknown', result: unknownArtifactSettlement() };
-  if (validArtifactHardStop(result)) return { kind: 'hard_stop', result };
-  if (validArtifactBlocked(result)) return { kind: 'blocked', result };
-  if (kind === 'checkpoint' && validArtifactCheckpointSuccess(result, authority)) {
-    return { kind: 'success', result };
-  }
-  if (kind === 'writer' && validArtifactWriterSettlement(result, authority.writer, authority.manifest)) {
-    return { kind: 'success', result };
-  }
-  return { kind: 'unknown', result: unknownArtifactSettlement() };
-}
-
-function acceptArtifactRevision(result, revisionAuthority) {
-  const revision = result?.revision;
-  const duplicate = result?.duplicate;
-  if (!Number.isSafeInteger(revision) || revision < 0 || typeof duplicate !== 'boolean') return false;
-  if (duplicate ? revision < revisionAuthority.latest : revision <= revisionAuthority.latest) return false;
-  revisionAuthority.latest = Math.max(revisionAuthority.latest, revision);
-  return true;
-}
-
-const UNPROVEN_REMOVAL = Object.freeze({
-  ok: false,
-  removed: false,
-  unregistered: false,
-  proven: false,
-});
-
-function snapshotRemovalResult(value) {
-  try {
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) return UNPROVEN_REMOVAL;
-    const keys = Reflect.ownKeys(value);
-    const expectedKeys = ['ok', 'removed', 'unregistered'];
-    if (keys.length !== expectedKeys.length ||
-        keys.some((key) => typeof key !== 'string' || !expectedKeys.includes(key))) return UNPROVEN_REMOVAL;
-    const raw = snapshotExactEnumerableDataObject(value, keys);
-    if (raw === null || !Object.hasOwn(raw, 'ok') || !Object.hasOwn(raw, 'removed') ||
-        !Object.hasOwn(raw, 'unregistered') || typeof raw.ok !== 'boolean' ||
-        typeof raw.removed !== 'boolean' ||
-        !(typeof raw.unregistered === 'boolean' || raw.unregistered === null)) {
-      return UNPROVEN_REMOVAL;
-    }
-    return Object.freeze({
-      ok: raw.ok,
-      removed: raw.removed,
-      unregistered: raw.unregistered,
-      proven: true,
-    });
-  } catch {
-    return UNPROVEN_REMOVAL;
-  }
-}
-
-function snapshotOwnDataArray(value) {
-  try {
-    const lengthDescriptor = Reflect.getOwnPropertyDescriptor(value, 'length');
-    if (!Object.hasOwn(lengthDescriptor ?? {}, 'value') || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0) return null;
-    const snapshot = [];
-    for (let index = 0; index < lengthDescriptor.value; index += 1) {
-      const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index));
-      if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) return null;
-      snapshot.push(descriptor.value);
-    }
-    return snapshot;
-  } catch {
-    return null;
+    return failure({ status: 'failed', reasonCode: REASON.run_orchestration_failed, log: openedLog });
   }
 }
 
 function snapshotProviderEntry(provider) {
   const snapshot = provider !== null && typeof provider === 'object' && !Array.isArray(provider)
-    ? snapshotOwnDataObject(provider, ['id', 'preflight', 'run', 'describeError', 'securityFloor'])
+    ? snapshotOwnDataObject(provider, ['id', 'preflight', 'run', 'describeError', 'securityFloor', 'authProbe'])
     : null;
   if (snapshot === null || typeof snapshot.id !== 'string' || snapshot.id === '') {
     return Object.freeze({
       id: '',
       preflight: async () => ({ available: false, error: 'invalid provider entry' }),
       run: async () => ({ error: 'invalid provider entry' }),
-      describeError: (error) => ({ error: safeText(error), recovery: GENERIC_RECOVERY }),
+      describeError: (error) => ({ error: errorText(error), recovery: GENERIC_RECOVERY }),
     });
   }
   const bind = (name, fallback) => typeof snapshot[name] === 'function'
@@ -912,385 +366,27 @@ function snapshotProviderEntry(provider) {
     id: snapshot.id,
     preflight: bind('preflight', async () => ({ available: false, error: 'invalid provider preflight' })),
     run: bind('run', async () => ({ error: 'invalid provider run' })),
-    describeError: bind('describeError', (error) => ({ error: safeText(error), recovery: GENERIC_RECOVERY })),
+    describeError: bind('describeError', (error) => ({ error: errorText(error), recovery: GENERIC_RECOVERY })),
     // ★ 선택적이다(설계 §5.8 S2(a)). 권고가 없는 프로바이더는 구현하지 않고, 없으면 엔진이
     //   그 축의 검사를 건너뛴다. 있지도 않은 권고를 흉내 내는 기본 구현을 넣으면 그 자체가
     //   거짓 신호다 — 여기서 대체값을 만들지 않는 이유다.
     ...(typeof snapshot.securityFloor === 'function' ? { securityFloor: bind('securityFloor', undefined) } : {}),
+    // ★ 같은 규칙의 둘째(WS4b §0-AU). 이 화이트리스트에 이름을 안 넣으면 게이트가 **조용히**
+    //   통째로 꺼지고, 그것은 보안 하한에서 이미 한 번 일어난 사고다 — 테스트가 그 경계를 잰다.
+    ...(typeof snapshot.authProbe === 'function' ? { authProbe: bind('authProbe', undefined) } : {}),
   });
 }
 
-function qualityTestPlanFingerprint(testPlan) {
-  return createHash('sha256').update(JSON.stringify(testPlan ?? null), 'utf8').digest('hex');
-}
-
-function qualityHash(value) {
-  return createHash('sha256').update(value).digest('hex');
-}
-
-function qualityClone(value) {
-  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
-}
-
-function qualityFreeze(value) {
-  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
-  Object.freeze(value);
-  for (const child of Object.values(value)) qualityFreeze(child);
-  return value;
-}
-
-function qualitySame(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function qualityProviderFailure(result) {
-  return result === null || typeof result !== 'object' || (typeof result.error === 'string' && result.error !== '');
-}
-
-function qualityWriterSettlement(result) {
-  if (result?.hardStopped === true) return 'effect_unknown';
-  if (result?.truncated === true || result?.doneReason === 'timeout' || result?.doneReason === 'aborted') return 'effect_unknown';
-  if (qualityProviderFailure(result)) return 'effect_unknown';
-  return 'sealed';
-}
-
-function combineContentUsage(...values) {
-  const totals = { calls: 0, promptTokensKnown: 0, evalTokensKnown: 0, incomplete: false };
-  const exact = { calls: 0n, promptTokensKnown: 0n, evalTokensKnown: 0n };
-  for (const value of values) {
-    for (const key of ['calls', 'promptTokensKnown', 'evalTokensKnown']) {
-      const amount = value?.[key];
-      if (Number.isSafeInteger(amount) && amount >= 0) exact[key] += BigInt(amount);
-      else totals.incomplete = true;
-    }
-    if (value?.incomplete === true) totals.incomplete = true;
-  }
-  for (const key of ['calls', 'promptTokensKnown', 'evalTokensKnown']) {
-    if (exact[key] <= BigInt(Number.MAX_SAFE_INTEGER)) totals[key] = Number(exact[key]);
-    else totals.incomplete = true;
-  }
-  return totals;
-}
-
-function createRunUsageAccumulator() {
-  let nextId = 1;
-  let finalized = null;
-  const tickets = new Map();
-  return Object.freeze({
-    start(input) {
-      if (finalized !== null) throw new Error('usage_finalized');
-      const ticket = Object.freeze({ id: `call-${nextId++}`, ...input });
-      tickets.set(ticket.id, { ticket, settled: false, value: null });
-      return ticket;
-    },
-    settle(ticket, value) {
-      const cell = tickets.get(ticket?.id);
-      if (finalized !== null || cell === undefined || cell.ticket !== ticket || cell.settled) return;
-      cell.settled = true;
-      cell.value = value;
-    },
-    finalize() {
-      if (finalized !== null) return finalized;
-      const totals = {
-        calls: tickets.size,
-        promptTokensKnown: 0,
-        evalTokensKnown: 0,
-        incomplete: false,
-      };
-      const exact = { promptTokensKnown: 0n, evalTokensKnown: 0n };
-      for (const cell of tickets.values()) {
-        if (!cell.settled) {
-          totals.incomplete = true;
-          continue;
-        }
-        for (const [source, target] of [['promptTokens', 'promptTokensKnown'], ['evalTokens', 'evalTokensKnown']]) {
-          const amount = cell.value?.[source];
-          if (Number.isSafeInteger(amount) && amount >= 0) exact[target] += BigInt(amount);
-          else totals.incomplete = true;
-        }
-      }
-      for (const target of ['promptTokensKnown', 'evalTokensKnown']) {
-        if (exact[target] <= BigInt(Number.MAX_SAFE_INTEGER)) totals[target] = Number(exact[target]);
-        else totals.incomplete = true;
-      }
-      finalized = qualityFreeze({ ...totals });
-      return finalized;
-    },
-  });
-}
-
-function exactRoleBinding(provider, settings, tier, role) {
-  const selected = resolveTier(settings, provider.id, tier);
-  return qualityFreeze({
-    providerId: provider.id,
-    model: selected.model ?? null,
-    effort: selected.effort ?? null,
-    tier,
-    role,
-  });
-}
-
-function candidateRefFromSummary(candidate) {
-  const attempt = candidate.patch === null ? null : candidate.attempts.find((entry) => entry.attemptId === candidate.patch.sourceAttemptId);
-  return {
-    candidateId: candidate.candidateId,
-    sourceAttemptId: candidate.patch?.sourceAttemptId ?? attempt?.attemptId ?? null,
-    terminalClass: candidate.terminalClass,
-    treeHash: attempt?.sealed?.treeHash ?? null,
-    patchRef: candidate.patch?.ref ?? null,
-    proofStatus: candidate.regressionProof.status,
-    tests: {
-      execution: candidate.tests.execution,
-      outcome: candidate.tests.outcome,
-      stability: candidate.tests.stability,
-      complete: candidate.tests.complete,
-    },
-    scope: {
-      flagged: candidate.scope.flagged === true,
-      reasonCount: candidate.scope.reasonCount ?? 0,
-      omittedReasonCount: candidate.scope.omittedReasonCount ?? 0,
-    },
-  };
-}
-
-function resolvedOmittedCount(candidate) {
-  const seen = new Set();
-  for (const attempt of candidate.attempts ?? []) {
-    for (const issueId of attempt.verdictRef?.issueIds ?? []) {
-      if (typeof issueId === 'string') seen.add(issueId);
-    }
-  }
-  for (const issueId of candidate.issues?.openIds ?? []) seen.delete(issueId);
-  return seen.size;
-}
-
-function contentIssue(candidate) {
-  return {
-    candidateId: candidate.candidateId,
-    openIssueIds: [...candidate.issues.openIds],
-    openIssueCount: candidate.issues.count,
-    resolvedOmittedCount: resolvedOmittedCount(candidate),
-  };
-}
-
-function contentCandidate(candidate) {
-  return {
-    candidateId: candidate.candidateId,
-    binding: candidate.binding,
-    terminalClass: candidate.terminalClass,
-    patch: candidate.patch === null ? null : {
-      path: candidate.patch.ref.path,
-      sha256: candidate.patch.ref.sha256,
-      bytes: candidate.patch.ref.bytes,
-      empty: candidate.patch.empty,
-      files: [...candidate.patch.files],
-    },
-    proofStatus: candidate.regressionProof.status,
-    openIssueIds: [...candidate.issues.openIds],
-    openIssueCount: candidate.issues.count,
-    scope: {
-      flagged: candidate.scope.flagged,
-      reasonCount: candidate.scope.reasonCount,
-      omittedReasonCount: candidate.scope.omittedReasonCount,
-    },
-    stopReason: candidate.stopReason,
-    usage: candidate.usage,
-  };
-}
-
-function contentVerdict(candidate) {
-  if (candidate?.verdict === null || candidate?.verdict === undefined) return null;
-  return {
-    candidateId: candidate.candidateId,
-    attemptId: candidate.patch?.sourceAttemptId ?? candidate.attempts.at(-1)?.attemptId ?? '',
-    verdict: candidate.verdict.verdict,
-    summary: null,
-  };
-}
-
-function contentEvidenceRef(record, path, { attemptId, expectedPath }) {
-  const evidenceId = ownDataValue(record, 'evidenceId');
-  const recordAttemptId = ownDataValue(record, 'attemptId');
-  const kind = ownDataValue(record, 'kind');
-  const repetition = ownDataValue(record, 'repetition');
-  const classified = ownDataValue(record, 'classified');
-  const outcome = ownDataValue(classified.value, 'outcome');
-  const witnesses = ownDataValue(classified.value, 'witnessIds');
-  const witnessIds = witnesses.ok === true ? snapshotOwnDataArray(witnesses.value) : null;
-  const suffix = kind.value === 'b0' ? 'B0' : kind.value === 'br' ? 'BR' : kind.value === 'c' ? 'C' : null;
-  if (path !== expectedPath || !isAbsolute(path) || evidenceId.ok !== true || recordAttemptId.ok !== true ||
-      kind.ok !== true || repetition.ok !== true || classified.ok !== true || outcome.ok !== true ||
-      recordAttemptId.value !== attemptId || suffix === null || ![1, 2].includes(repetition.value) ||
-      evidenceId.value !== `${attemptId}/${suffix}/${repetition.value}` ||
-      !['pass', 'fail', 'unknown'].includes(outcome.value) || witnessIds === null ||
-      witnessIds.some((witness) => !/^[0-9a-f]{64}$/.test(witness))) return null;
-  return qualityFreeze({
-    evidenceId: evidenceId.value,
-    kind: kind.value,
-    repetition: repetition.value,
-    outcome: outcome.value,
-    witnessCount: witnessIds.length,
-    path,
-  });
-}
-
-function fixedFloorInput({ runId, stopReason, candidateCount, selection, pathBudget, candidates, issues, omittedCounts }) {
-  return {
-    runId,
-    stopReason,
-    candidateCount,
-    outcome: selection.outcome,
-    selectedCandidateId: selection.selectedCandidateId,
-    paths: pathBudget.paths,
-    candidates: candidates.map((candidate) => ({
-      candidateId: candidate.candidateId,
-      patchPresent: candidate.patch !== null,
-      proofStatus: candidate.regressionProof.status,
-    })),
-    issueSummary: issues.map((issue) => ({
-      candidateId: issue.candidateId,
-      openIssueIds: issue.openIssueIds,
-      openIssueCount: issue.openIssueCount,
-    })),
-    omittedCounts,
-  };
-}
-
-function artifactBlocked(runId, error, recovery, notice = undefined) {
-  return failure({
-    status: 'blocked', confidence: 'unverified', runId, stopReason: error,
-    error, recovery, ...(notice ? { notice } : {}),
-  });
-}
-
+/**
+ * 공유 `contained` 에 **같은 경로**를 더한 엔진판이다.
+ *
+ * ★ 공유본은 넷 중 셋의 답을 따라 `parent === child` 를 거짓으로 본다. 여기서 그 답을
+ *   그대로 쓰면 `artifact_root_overlaps_project`(상태 루트와 대상 저장소가 같은 경로일
+ *   때 내는 이유 코드)가 사라진다 — 바깥으로 나가는 문자열이 달라지는 동작 변경이라
+ *   이 티어의 범위 밖이다. 같음만 이 파일에서 더하고 나머지 판정은 공유본에 맡긴다.
+ */
 function pathContains(parent, child) {
-  const value = relative(parent, child);
-  return value === '' || value !== '..' && !value.startsWith(`..${sep}`) && !isAbsolute(value);
-}
-
-const PREPARATION_PRIVATE = new WeakMap();
-
-const WORKTREE_HANDLE_KEYS = Object.freeze([
-  'ok', 'path', 'projectPath', 'stateRoot', 'runId', 'worktreeId', 'purpose', 'baseline',
-  'baselineIdentity', 'lastSnapshot', 'transplanted', 'ignoredPaths', 'sharedRules',
-]);
-
-function ownDataValue(value, key) {
-  try {
-    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
-    return descriptor !== undefined && Object.hasOwn(descriptor, 'value')
-      ? { ok: true, value: descriptor.value }
-      : { ok: false, value: undefined };
-  } catch {
-    return { ok: false, value: undefined };
-  }
-}
-
-function snapshotBlockedResult(value) {
-  if (value === null || typeof value !== 'object') return null;
-  const raw = snapshotOwnDataObject(value, ['blocked', 'hardStopped', 'error', 'recovery']);
-  if (raw === null) return null;
-  return {
-    blocked: raw.blocked === true,
-    hardStopped: raw.hardStopped === true,
-    error: typeof raw.error === 'string' ? raw.error : null,
-    recovery: typeof raw.recovery === 'string' ? raw.recovery : null,
-  };
-}
-
-function snapshotBoundedStrings(value) {
-  if (value === null) return null;
-  const values = snapshotOwnDataArray(value);
-  if (values === null || values.length > 10_000 || values.some((entry) =>
-    typeof entry !== 'string' || entry.length > 32_768 || /[\u0000\uFFFD]/.test(entry))) return undefined;
-  return qualityFreeze([...values]);
-}
-
-function snapshotWorktreeHandle(handle, expected) {
-  try {
-  const raw = handle !== null && typeof handle === 'object' && !Array.isArray(handle)
-    ? snapshotOwnDataObject(handle, WORKTREE_HANDLE_KEYS)
-    : null;
-  if (raw === null || WORKTREE_HANDLE_KEYS.some((key) => !Object.hasOwn(raw, key))) return null;
-  const baselineIdentity = raw.baselineIdentity !== null && typeof raw.baselineIdentity === 'object' &&
-    !Array.isArray(raw.baselineIdentity)
-    ? snapshotOwnDataObject(raw.baselineIdentity, ['commit', 'tree'])
-    : null;
-  const ignoredPaths = snapshotBoundedStrings(raw.ignoredPaths);
-  const sharedRules = snapshotBoundedStrings(raw.sharedRules);
-  const objectId = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-  if (raw.ok !== true || raw.path !== expected.path || raw.projectPath !== expected.projectPath ||
-      raw.stateRoot !== expected.stateRoot || raw.runId !== expected.runId ||
-      raw.worktreeId !== expected.worktreeId || raw.purpose !== expected.purpose ||
-      !objectId.test(raw.baseline) || raw.lastSnapshot !== raw.baseline ||
-      baselineIdentity === null || !objectId.test(baselineIdentity.commit) || !objectId.test(baselineIdentity.tree) ||
-      baselineIdentity.commit !== raw.baseline ||
-      expected.baseline !== null && (raw.baseline !== expected.baseline.commit ||
-        baselineIdentity.tree !== expected.baseline.tree) ||
-      typeof raw.transplanted !== 'boolean' || expected.transplanted !== null && raw.transplanted !== expected.transplanted ||
-      ignoredPaths === undefined || sharedRules === undefined) return null;
-  const clone = {
-    ok: true,
-    path: raw.path,
-    projectPath: raw.projectPath,
-    stateRoot: raw.stateRoot,
-    runId: raw.runId,
-    worktreeId: raw.worktreeId,
-    purpose: raw.purpose,
-    baseline: raw.baseline,
-    baselineIdentity: qualityFreeze({ ...baselineIdentity }),
-    lastSnapshot: raw.lastSnapshot,
-    transplanted: raw.transplanted,
-    ignoredPaths,
-    sharedRules,
-  };
-  for (const key of Reflect.ownKeys(clone)) {
-    const descriptor = Object.getOwnPropertyDescriptor(clone, key);
-    Object.defineProperty(clone, key, {
-      ...descriptor,
-      writable: key === 'lastSnapshot',
-      configurable: false,
-    });
-  }
-  Object.preventExtensions(clone);
-  return clone;
-  } catch {
-    return null;
-  }
-}
-
-function provenOwnedWorktreeForCleanup(handle, expected) {
-  let authority;
-  try {
-    authority = Object.fromEntries(
-      ['ok', 'path', 'projectPath', 'stateRoot', 'runId', 'worktreeId', 'purpose']
-        .map((key) => [key, ownDataValue(handle, key)]),
-    );
-  } catch {
-    return null;
-  }
-  if (authority.ok.ok !== true || authority.ok.value !== true ||
-      authority.path.ok !== true || authority.path.value !== expected.path ||
-      authority.projectPath.ok !== true || authority.projectPath.value !== expected.projectPath ||
-      authority.stateRoot.ok !== true || authority.stateRoot.value !== expected.stateRoot ||
-      authority.runId.ok !== true || authority.runId.value !== expected.runId ||
-      authority.worktreeId.ok !== true || authority.worktreeId.value !== expected.worktreeId ||
-      authority.purpose.ok !== true || authority.purpose.value !== expected.purpose) return null;
-  return {
-    ok: true,
-    path: expected.path,
-    projectPath: expected.projectPath,
-    stateRoot: expected.stateRoot,
-    runId: expected.runId,
-    worktreeId: expected.worktreeId,
-    purpose: expected.purpose,
-    baseline: expected.baseline?.commit ?? null,
-    baselineIdentity: expected.baseline,
-    lastSnapshot: expected.baseline?.commit ?? null,
-    transplanted: expected.transplanted === true,
-    ignoredPaths: [],
-    sharedRules: [],
-  };
+  return relative(parent, child) === '' || contained(parent, child);
 }
 
 async function prepareRunNamespace(options, deps) {
@@ -1299,64 +395,22 @@ async function prepareRunNamespace(options, deps) {
   const candidateCount = runOptions.candidateCount === undefined ? 1 : runOptions.candidateCount;
   const {
     task, projectPath, budget, deadlineAt, deadline, effectiveWaitMs,
-    registered, now, stage, recoveryStage, onSpawn, killLiveChildren, isWorktreeEffectUnknown,
+    registered, now, stage, recoveryStage, haltReasonCode, runHalt, onSpawn, killLiveChildren,
+    isWorktreeEffectUnknown, openLog, logLine, addNotice, envelopeExtras, redact,
   } = context;
-  const fail = (envelope) => qualityFreeze({ ok: false, envelope });
+  // ★ 준비 단계의 이탈 하나. 이름을 `fail` 로 두면 문구 정본의 `fail(REASON.x)` 를 가린다.
+  const halt = (envelope) => deepFreeze({ ok: false, envelope });
   if (![1, 2].includes(candidateCount) || candidateCount === 2 &&
-      (runOptions.worker !== undefined || runOptions.verifier !== undefined) ||
+      (runOptions.writer !== undefined || runOptions.worker !== undefined || runOptions.verifier !== undefined) ||
       typeof task !== 'string' || task.trim() === '' || typeof projectPath !== 'string' ||
       projectPath === '' || !isAbsolute(projectPath) || (runOptions.isolation ?? 'worktree') !== 'worktree' ||
       !Number.isInteger(budget) || budget < 1 || budget > MAX_BUDGET ||
       !Number.isSafeInteger(deadlineAt)) {
-    return fail(failure({ status: 'invalid', error: 'c1 preparation input is invalid', recovery: '입력값을 확인하세요.' }));
+    return halt(failure({ status: 'invalid', reasonCode: REASON.run_preparation_input_invalid }));
   }
-  const preflightSettlements = await Promise.all(registered.map(async (provider, registryIndex) => {
-    try {
-      const result = await stage(`${provider.id} preflight`, () => provider.preflight(deadline));
-      return [provider.id, result && typeof result === 'object' ? result : { available: false, error: 'preflight 응답이 잘못됐습니다.' }, provider, registryIndex];
-    } catch (error) {
-      let described;
-      try { described = provider.describeError(error); } catch { described = { error: safeText(error), recovery: GENERIC_RECOVERY }; }
-      return [provider.id, { available: false, ...described }, provider, registryIndex];
-    }
-  }));
-  if (preflightSettlements.some(([, result]) => result?.hardStopped === true)) {
-    return fail(failure({ status: 'deadline_exceeded', error: `프로바이더 사전 점검 중 데드라인(${effectiveWaitMs}ms)이 지났습니다.`, recovery: 'wait_ms 를 늘리거나 CLI 설치 상태를 확인하세요.', confidence: 'unverified', stopReason: 'deadline_exceeded' }));
-  }
-  const groupedSettlements = new Map();
-  for (const [id, result, provider, registryIndex] of preflightSettlements) {
-    if (!groupedSettlements.has(id)) groupedSettlements.set(id, []);
-    groupedSettlements.get(id).push({ result, provider, registryIndex });
-  }
-  const availability = qualityFreeze(Object.fromEntries([...groupedSettlements].map(([id, entries]) => [
-    id,
-    entries.length === 1
-      ? entries[0].result
-      : { available: false, error: 'duplicate provider id', recovery: `중복 provider id를 제거하세요: ${id}` },
-  ])));
-  const providers = [...groupedSettlements.values()]
-    .filter((entries) => entries.length === 1 && entries[0].result?.available === true)
-    .sort((left, right) => left[0].registryIndex - right[0].registryIndex)
-    .map((entries) => entries[0].provider);
-  if (providers.length === 0) {
-    return fail(failure({ status: 'blocked', error: '사용 가능한 프로바이더가 하나도 없습니다.', recovery: preflightSettlements.map(([id, value]) => `${id}: ${value.recovery ?? value.error ?? '설치 상태를 확인하세요.'}`).join(' / ') }));
-  }
-  for (const role of ['planner', 'worker', 'verifier']) {
-    const wanted = runOptions[role];
-    if (wanted !== undefined && wanted !== null && availability[wanted]?.available !== true) {
-      return fail(failure({ status: 'blocked', error: `${role} 로 지정한 프로바이더(${wanted})를 사용할 수 없습니다.`, recovery: availability[wanted]?.recovery ?? '해당 CLI 설치와 PATH 설정을 확인하세요.' }));
-    }
-  }
-  if (providers.length < 2 && (candidateCount === 2 || runOptions.allowSingle !== true)) {
-    return fail(failure({ status: 'blocked', error: '교차 벤더 검증에 필요한 프로바이더 둘을 사용할 수 없습니다.', recovery: '두 벤더 CLI 를 설치하거나, 단일 벤더 결과를 수용하려면 allow_single: true 를 명시하세요.' }));
-  }
-  const progress = (phase, step = 0, identity = {}) => {
-    try {
-      runOptions.onProgress?.(candidateCount === 1
-        ? { phase, step, event: { type: 'phase', phase } }
-        : { phase, step, ...identity, event: { type: 'phase', phase, ...identity } });
-    } catch { /* advisory */ }
-  };
+  // ★★ 실행 이름과 상태 루트를 **사전 점검보다 먼저** 정한다(WS3 §0-E). 이 블록이 아래 있던 동안
+  //   사전 점검에서 멈춘 봉투는 `log` 를 못 달았고, 벤더별 사유는 봉투가 못 싣는 벤더 산문이라
+  //   (불변식 4) 어느 채널에도 안 남았다. 상태 루트가 벤더보다 먼저 보이는 것도 맞는 순서다.
   const runId = typeof deps.runId === 'string' && RUN_ID_PATTERN.test(deps.runId)
     ? deps.runId
     : makeRunId({ now, random: typeof deps.random === 'function' ? deps.random : Math.random });
@@ -1370,223 +424,304 @@ async function prepareRunNamespace(options, deps) {
     stateRoot = await canonicalStateRoot(requestedRoot);
     if (typeof stateRoot !== 'string') throw new Error('canonicalization failed');
   } catch {
-    return fail(artifactBlocked(runId, 'artifact_root_not_canonical', 'BOM_ORCH_HOME 경로를 먼저 만들고 더 짧은 절대 경로로 다시 시도하세요.'));
+    return halt(artifactBlocked(runId, REASON.artifact_root_not_canonical, { path: requestedRoot }));
   }
+  // ★ 여기서부터 모든 봉투가 로그 참조를 들고 나간다 — 로그 파일의 자리는 상태 루트가 정한다.
+  //   위의 실패 **둘**(인자 검증·상태 루트 정준화)만 `log` 없이 나가고, 그것이 유일한 경우다(WS2 §5).
+  await openLog({ stateRoot, projectPath, runId });
+  // ★ 상태 루트가 정해진 순간 종료 기록의 자리도 정해진다(WS3 §0-D1) — 사전 점검에서 막힌
+  //   실행의 행이 갈 곳이 여기다. 그런데 그 "정해짐" 을 `context` 에 알리는 시점은 `openLog`
+  //   **뒤**로 둔다(리뷰 Q2, WS3 태스크 2 수정 라운드) — 앞이면 아래 창이 생긴다. `openLog`
+  //   는 세척기(`makeRedactor`)를 설치하기 **전에** 던질 수 있다(`makeRedactor`·`homedir`
+  //   자체가 던지는 경우). `setRunIdentity({stateRoot})` 가 그 앞에 있으면, 그 사이에 던진
+  //   실행도 `runStateRoot` 는 이미 채워져 있어 최상위 catch 의 종료 sink(`settleRun`)가
+  //   `runStateRoot !== null` 만 보고 저널 쓰기를 시도한다 — 그 행의 `taskPreview` 는 세척기
+  //   없이(항등 `redact`) 만들어지고, 저널에는 보존 정책이 없으니 세척 안 지난 평문이 디스크에
+  //   영구히 남는다. `openLog` 뒤로 늦추면 그 창에서 던진 실행은 `settleRun` 의 게이트
+  //   (`runStateRoot === null`)에 걸려 저널 쓰기 자체를 시도하지 않는다 — 세척 안 지난 문자열이
+  //   디스크에 닿을 길이 없다. 상태 루트 정준화 실패는 이 줄에 닿기 전에 빠지고, 사전 점검
+  //   halt 넷은 옛 순서에서도 새 순서에서도 이 줄을 지난 **뒤에** 멈춘다(종료 행이 있어야 하는
+  //   실행들이다) — 어느 쪽도 이 재배치로 달라지지 않고, 달라지는 것은 `openLog` 가 던진
+  //   실행뿐이다.
+  context.setRunIdentity?.({ stateRoot });
+  // ★★ 호스트 취소는 사전 점검보다 **앞선다**(WS3 §0-C2). 사용자가 이미 그만두라고 했는데 벤더를
+  //   전부 깨워 「어느 CLI 가 없다」를 보고하면, 그 봉투는 자기가 끊은 실행에 대한 벤더 문제로
+  //   읽힌다 — 그리고 그 사이 벤더 프로세스가 뜬다(취소의 종료 기준은 자식 0 이다).
+  // ★ **데드라인은 여기서 안 본다.** 그 순서를 바꾸면 오늘 사전 점검에서 막히는 사용자가 보는
+  //   실패가 달라진다(WS3 §0-E 가 상태 루트에 대해 한 것과 같은 등급의 판정이고, 이 태스크의
+  //   것이 아니다). 취소는 오늘 아무 봉투도 없던 자리라 새 행동이지 바뀐 행동이 아니다.
+  if (haltReasonCode() === REASON.run_cancelled) return halt(runHalt({ runId, extras: envelopeExtras() }));
+  // ★★ 여기부터 lane-a 워크트리까지는 **순서가 곧 계약**이다: 재개 관문 1(지목된 실행이 있고
+  //   읽히는가) → 게이트웨이 구성 거부 → 벤더별 사전 점검. 셋 다 「어떤 벤더 프로세스도 뜨기
+  //   전」이라는 같은 사실 위에 서 있고, 하나라도 뒤로 밀면 그 봉투는 자기 사유가 아니라 벤더
+  //   문제로 읽힌다. 판정과 그 자리의 근거는 `src/run-resume-gates.mjs`·
+  //   `src/run-precredit-gates.mjs` 의 ★★ 주석이 들고 있다 — 엔진에 남은 것은 이 순서뿐이다.
+  const source = await openResumeSource({ runOptions, stateRoot, runId, envelopeExtras });
+  if (source.refusal !== null) return halt(source.refusal);
+  const { resumeRunId, resumeSource } = source;
+  const gateway = refuseGatewayEnvironment({ deps, runId, logLine, envelopeExtras });
+  if (gateway.refusal !== null) return halt(gateway.refusal);
+  const vendors = await settleVendorPreflight({
+    registered, runOptions, candidateCount, runId, deadline, stage, logLine, runHalt, envelopeExtras,
+  });
+  if (vendors.refusal !== null) return halt(vendors.refusal);
+  const providers = vendors.providers;
+  const { runFacts, progress } = createProgressReporter({ runId, budget, candidateCount, runOptions });
+  logLine('info', null, 'run_started', { runId, candidateCount, budget, deadlineAt, projectPath });
   const pathBudget = validateArtifactPathBudget({ stateRoot, runId, candidateCount });
-  if (isBlocked(pathBudget)) return fail(artifactBlocked(runId, pathBudget.error, pathBudget.recovery));
+  if (isBlocked(pathBudget)) {
+    return halt(artifactBlocked(runId, reasonCodeOf(pathBudget, REASON.artifact_paths_invalid), {
+      limit: ARTIFACT_PATH_JSON_BUDGET, path: stateRoot, runId,
+    }, envelopeExtras()));
+  }
   const collisionCheck = deps.inspectRunArtifactCollision ?? inspectRunArtifactCollision;
   const readonlyDeps = deps.artifactReadonlyDeps ?? { canonicalPath: canonicalStateRoot };
   const collision = await collisionCheck({ stateRoot, runId }, readonlyDeps);
-  if (isBlocked(collision)) return fail(artifactBlocked(runId, collision.error, collision.recovery));
+  if (isBlocked(collision)) {
+    return halt(artifactBlocked(runId, reasonCodeOf(collision, REASON.artifact_collision_inspection_failed), {
+      path: stateRoot, runId,
+    }, envelopeExtras()));
+  }
   if (collision.collision === true) {
-    return fail(artifactBlocked(runId, 'artifact_namespace_collision', '기존 bytes를 보존했습니다. 새 runId로 다시 시도하세요.'));
+    return halt(artifactBlocked(runId, REASON.artifact_namespace_collision, { runId }, envelopeExtras()));
   }
   try {
     canonicalProject = await canonicalProjectPath(projectPath);
     if (typeof canonicalProject !== 'string') throw new Error('canonicalization failed');
+    context.setRunIdentity?.({ projectPath: canonicalProject });
   } catch {
-    return fail(artifactBlocked(runId, 'project_root_not_canonical', 'project 경로를 확인하세요.'));
+    return halt(artifactBlocked(runId, REASON.git_project_root_not_canonical, { path: projectPath }, envelopeExtras()));
   }
   if (pathContains(stateRoot, canonicalProject) || pathContains(canonicalProject, stateRoot)) {
-    return fail(artifactBlocked(runId, 'artifact_root_overlaps_project', 'BOM_ORCH_HOME을 대상 저장소와 겹치지 않는 별도 경로로 옮기세요.'));
+    return halt(artifactBlocked(runId, REASON.artifact_root_overlaps_project, {}, envelopeExtras()));
   }
 
   const sweepScratch = deps.sweepScratch ?? defaultSweepScratch;
   const sweepPatches = deps.sweepPatches ?? defaultSweepPatches;
   const sweepRuns = deps.sweepRuns ?? defaultSweepRuns;
+  // ★ `logs` 가 네 번째 행이다. 장수 서버는 부팅이 며칠에 한 번이라 리퍼의 부팅 스윕만으로는
+  //   그 사이에 쌓인 로그를 못 본다 — 실행 시작 스윕과 부팅 스윕이 **같은 함수**를 부른다.
+  const sweepLogs = deps.sweepLogs ?? defaultSweepLogs;
+  // ★ `plans` 가 다섯 번째 행이다(WS4a 태스크 9). 오늘까지 이 디렉터리를 쓰는 자리는 **하나도**
+  //   없었고, 남는 것은 모델이 쓴 계획 초안이라 평문이다 — 부팅 스윕과 실행 시작 스윕이 같은
+  //   함수를 부르는 이유는 나머지 넷과 같다(장수 서버는 부팅이 며칠에 한 번이다).
+  const sweepPlans = deps.sweepPlans ?? defaultSweepPlans;
   const sweepNow = now();
-  const sweepSummaries = [];
+  let sweptRemoved = 0;
+  let sweptSkipped = 0;
+  // ★ 던진 스윕은 `skipped` 가 아니다. `skipped` 는 "봤고 남겨 뒀다" 이고, 던진 쪽은 무엇을
+  //   남겼는지조차 모른다 — 하나로 접으면 알림이 안 본 사실을 단정한다(WS2 Task 10 수정 패스).
+  let sweptFailed = 0;
   for (const [name, sweep, args] of [
     ['scratch', sweepScratch, [stateRoot, sweepNow]],
+    ['plans', sweepPlans, [stateRoot, sweepNow]],
     ['patches', sweepPatches, [stateRoot, sweepNow, { excludeRunId: runId }]],
     ['runs', sweepRuns, [stateRoot, sweepNow, { excludeRunId: runId }]],
+    ['logs', sweepLogs, [{ stateRoot, now: sweepNow }]],
   ]) {
     try {
       const summary = await sweep(...args);
       const removed = Array.isArray(summary?.removed) ? summary.removed.length : summary?.removed ?? 0;
-      if (removed > 0 || (summary?.skipped?.length ?? 0) > 0) {
-        sweepSummaries.push(`${name}:${removed}/${summary?.skipped?.length ?? 0}`);
-      }
+      const skipped = summary?.skipped?.length ?? 0;
+      sweptRemoved += removed;
+      sweptSkipped += skipped;
+      logLine('info', null, 'retention_swept', { sweep: name, removed, skipped, failed: 0 });
     } catch {
-      sweepSummaries.push(`${name}:0/1`);
+      sweptFailed += 1;
+      logLine('warn', null, 'retention_swept', { sweep: name, removed: 0, skipped: 0, failed: 1 });
     }
   }
+  const sweepSummaries = sweptRemoved > 0 || sweptSkipped > 0 || sweptFailed > 0
+    ? [renderNotice('retention_swept', { removed: sweptRemoved, skipped: sweptSkipped, failed: sweptFailed })]
+    : [];
 
   if (deadline?.aborted === true || now() >= deadlineAt) {
-    return fail(failure({ status: 'deadline_exceeded', confidence: 'unverified', runId, stopReason: 'deadline_exceeded', error: `데드라인(${effectiveWaitMs}ms)이 지났습니다.`, recovery: 'wait_ms를 늘려 다시 시도하세요.' }));
+    return halt(runHalt({ runId, extras: envelopeExtras(sweepSummaries) }));
   }
   progress('inspect');
   const inspectRepo = deps.inspectRepo ?? defaultInspectRepo;
-  const inspected = await stage('저장소 점검', () => inspectRepo(projectPath));
+  const inspected = await stage('repository inspection', () => inspectRepo(projectPath));
   if (inspected?.hardStopped === true) {
-    return fail(failure({ status: 'deadline_exceeded', confidence: 'unverified', runId, stopReason: 'deadline_exceeded', error: inspected.error, recovery: inspected.recovery }));
+    return halt(runHalt({ runId, extras: envelopeExtras(sweepSummaries) }));
   }
-  if (isBlocked(inspected)) return fail(artifactBlocked(runId, inspected.error, inspected.recovery ?? GENERIC_RECOVERY));
+  if (isBlocked(inspected)) {
+    logLine('error', resultReasonCode(inspected), 'repository inspection', { detail: inspected.error ?? '' });
+    // ★ WS2 Task 14. git 사전 점검의 결함도 카탈로그가 분류하고 `stderrTail` 을 함께 들고 온다 —
+    //   그 둘이 있어야 라벨된 git stderr 발췌가 붙는다(§3.2 EC3). 벤더와 **같은 함수**를 쓴다:
+    //   두 벌이면 한쪽만 세척되거나 한쪽만 상한을 지킨다. 허용 집합은 카탈로그가 이미 좁혔다.
+    // ★ status 도 여기서 고르지 않는다(I1 과 같은 규칙): 실려 갈 코드의 조악값이 정하고, 코드
+    //   없이 미분류로 나가는 결과만 「실행 전 전제 실패」라는 뜻의 'blocked' 로 남는다. 오늘 git
+    //   점검이 내는 코드는 전부 조악 blocked 라 값이 같지만, 주입된 의존성이 다른 조악값의 코드를
+    //   들고 오면 {status:'blocked', stopReason:'infrastructure_failed'} 짝이 나가던 자리다.
+    const carried = carriedFailure(inspected, { path: projectPath, waitMs: effectiveWaitMs });
+    return halt(failure({
+      status: carried.reasonCode === undefined ? 'blocked' : statusOfReasonCode(carried.reasonCode),
+      confidence: confidenceOfRun({ unverified: true }), runId, excerpts: attachExcerpts(inspected, { vendor: 'git', redact }),
+      ...carried, ...envelopeExtras(sweepSummaries),
+    }));
+  }
+  // ★★ 프로젝트 설정(`.bom-orch.json`)을 읽을 커밋. 방금 `inspectRepo` 가 검증한 HEAD 다 —
+  //   계획을 동결하는 이 자리에서 알 수 있는 유일한 커밋이고, 실행의 봉인 baseline 은 lane-a
+  //   워크트리가 생긴 **뒤에야** 존재한다(아래 `preparedLaneA.baselineIdentity`). 그 둘이 같은
+  //   설정을 담고 있는지는 baseline 직후에 대조하고(`verifyProjectConfigSealed`), 갈리면 멈춘다.
+  //   ★ 주입된 `inspectRepo` 스텁이 HEAD 를 안 주면 설정 기능 자체가 꺼진다 — 설정을 도입하기
+  //     전의 동작 그대로다. 프로덕션 경로는 언제나 진짜 `inspectRepo` 라 그 자리가 아니다.
+  const projectConfigCommit = typeof inspected?.head === 'string' && inspected.head !== '' ? inspected.head : null;
   const usesDefaultTestPlanDeriver = deps.deriveFrozenTestPlan === undefined;
   const deriveFrozenTestPlan = deps.deriveFrozenTestPlan ?? defaultDeriveFrozenTestPlan;
-  const derivedTestPlan = await stage('고정 테스트 계획 유도', () => deriveFrozenTestPlan(projectPath, deps.testRunnerDeps ?? {}));
-  if (isBlocked(derivedTestPlan)) return fail(artifactBlocked(runId, derivedTestPlan.error, derivedTestPlan.recovery ?? GENERIC_RECOVERY));
+  const derivedTestPlan = await stage('frozen test plan', () => deriveFrozenTestPlan(projectPath, {
+    ...(deps.testRunnerDeps ?? {}),
+    ...(projectConfigCommit === null ? {} : { projectConfigCommit }),
+  }));
+  // ★★ carry 하기 **전에** 「누가 껐는가」를 먼저 가른다 — 바로 위 저장소 점검과 아래
+  //   의존성 제공이 이미 쓰는 규율이고, 이 자리만 그 밖에 있었다(WS4a 태스크 11, m17).
+  //   `stage()` 의 유예가 만료되면 `haltFail` 이 `hardStopped:true` 인 중립 실패를 내는데, 그것을
+  //   `carriedFailure` 로 실으면 정지 버튼을 누른 사용자가 「계획을 못 얼렸다」는 코드와 그
+  //   회복을 받는다. 이름은 `haltReasonCode()` 하나가 붙인다. 워크트리 전이라 치울 것은 없다.
+  if (derivedTestPlan?.hardStopped === true) {
+    return halt(runHalt({ runId, extras: envelopeExtras(sweepSummaries) }));
+  }
+  if (isBlocked(derivedTestPlan)) {
+    logLine('error', resultReasonCode(derivedTestPlan), 'frozen test plan', { detail: derivedTestPlan.error ?? '' });
+    // ★ status 는 위 점검 halt 와 같은 규칙이다 — 실려 갈 코드의 조악값이 정한다.
+    const carried = carriedFailure(derivedTestPlan, { path: projectPath, waitMs: effectiveWaitMs });
+    return halt(failure({
+      status: carried.reasonCode === undefined ? 'blocked' : statusOfReasonCode(carried.reasonCode),
+      confidence: confidenceOfRun({ unverified: true }), runId,
+      ...carried, ...envelopeExtras(sweepSummaries),
+    }));
+  }
   // The production test-plan builder attaches private frozen runtime authority to
   // the returned object. Preserve that identity; injected mutable fixtures still
   // receive the defensive clone used by the controller tests.
-  const frozenTestPlan = usesDefaultTestPlanDeriver && Object.isFrozen(derivedTestPlan)
+  // ★ 여기는 try 밖이다. 복사가 실패했다고 던지면 그 토큰이 봉투의 `error` 로 그대로 새어
+  //   나간다(runId 도 없는 "예기치 못한 오류" 문장). 대신 복사 못 하는 계획은 **못 쓰는**
+  //   계획이므로, 계획이 아예 쓰레기일 때 이미 나던 코드로 같은 자리에서 닫는다 — 워크트리는
+  //   아직 만들기 전이라 치울 것도 없다.
+  const clonedTestPlan = usesDefaultTestPlanDeriver && Object.isFrozen(derivedTestPlan)
     ? derivedTestPlan
-    : qualityFreeze(qualityClone(derivedTestPlan));
+    : cloneData(derivedTestPlan);
+  if (clonedTestPlan === undefined) {
+    return halt(artifactBlocked(runId, REASON.run_binding_preparation_failed, {}, envelopeExtras(sweepSummaries)));
+  }
+  const frozenTestPlan = deepFreeze(clonedTestPlan);
+  // ★★ 분류 둘은 순수 함수이고 입력이 `task` 와 방금 얼어붙은 계획뿐이라, 여기가 가장 이른 자리다
+  //   — 워크트리보다도 크레딧보다도 앞이다. 태스크 2 의 preflight 가 크레딧 전에 이 둘을 읽는다.
+  const taskClass = classifyTask({ task, testSource: frozenTestPlan.source ?? null });
+  const proofRequirement = classifyProofRequirement({ task, taskClass });
+  // ★ 계획 파생이 낸 알림(지금은 「검증만 되고 아직 소비되지 않는 설정 키」 하나). 계획 객체는
+  //   지문에 들어가는 정확한 키 집합이라 실을 자리가 없어서 사설 런타임에서 꺼낸다. 원본 identity
+  //   로 읽는다 — 주입된 계획은 복제를 거치므로 그쪽에는 애초에 런타임이 없다(빈 배열).
+  const configNotices = frozenTestPlanNotices(derivedTestPlan);
+  // ★ 같은 사설 런타임에서 **baseline 설정 자체**도 꺼낸다. 이 실행이 그것을 읽는 자리는
+  //   위 파생 한 번뿐이고(커밋 오브젝트에서), 아래 의존성 제공이 유일한 소비자다 — 다시 읽으면
+  //   같은 커밋에 대한 git 왕복이 두 벌이 되고 「이 실행이 읽은 설정」이 두 개가 된다.
+  const baselineConfig = frozenTestPlanConfig(derivedTestPlan);
+  // ★★ 허용목록의 합집합(WS5 스펙 §0 D1a). 자리가 여기인 이유는 **읽는 자리가 하나**이기
+  //   때문이다: 프로젝트 설정은 바로 위 한 번만 읽히고(커밋 오브젝트에서), 호출 인자는
+  //   `runOptions` 에 있다. 아래로 내려가서 접으면 레인마다 다른 합집합이 생길 수 있다.
+  // ★ 검증하지 않고 **접기만** 한다. 모양이 이상한 값은 합집합이 그 항목만 버리고, 그 결과는
+  //   「아무것도 안 지워진다」 — 즉 이 축의 실패는 언제나 닫는 쪽이다. 도구 층이 이미 배열·원소
+  //   타입을 정확한 코드로 거부하므로(`validateArgs`), 여기서 다시 거부하면 라이브러리로 이 함수를
+  //   부르는 쪽만 새 실패 모양을 얻는다.
+  const scopeAllow = unionScopeAllow(runOptions.scopeAllow, baselineConfig?.scope?.allow);
+  // 못 쓴 항목과 이름 부를 수 없는 항목은 **조용히 사라지지 않는다**. 둘 다 사용자가 쓴 것이고,
+  // 말하지 않으면 「내가 적었는데 왜 안 듣지」의 답이 어느 채널에도 없다.
+  if (scopeAllow.ignored > 0) {
+    addNotice(renderNotice('scope_allow_entries_dropped', {
+      kept: MAX_ALLOW_ENTRIES, chars: MAX_ALLOW_ENTRY_CHARS, dropped: scopeAllow.ignored,
+    }));
+  }
+  const refusedAllow = refusedScopeAllow(scopeAllow.entries.map((one) => one.entry));
+  if (refusedAllow.length > 0) {
+    addNotice(renderNotice('scope_allow_hard_list_ignored', { entries: refusedAllow.map((one) => one.entry).join(', ') }));
+  }
+  const drift = refuseEnvironmentDrift({
+    resumeSource, frozenTestPlan, runId, resumeRunId, envelopeExtras: () => envelopeExtras(sweepSummaries),
+  });
+  if (drift.refusal !== null) return halt(drift.refusal);
+  const risk = await assessPreCreditRisk({
+    task, canonicalProject, candidateCount, budget, effectiveWaitMs,
+    frozenTestPlan, proofRequirement, baselineConfig, providers,
+    runId, deadline, deps, stage, logLine, addNotice, runHalt,
+    envelopeExtras: () => envelopeExtras(sweepSummaries),
+  });
+  if (risk.refusal !== null) return halt(risk.refusal);
+  const preflight = risk.preflight;
 
-  const createWorktree = deps.createWorktree ?? defaultCreateWorktree;
-  const laneAExpected = {
-    path: join(stateRoot, 'worktrees', makeWorktreeId({ runId, purpose: 'lane-a' })),
-    projectPath: canonicalProject,
-    stateRoot,
-    runId,
-    worktreeId: makeWorktreeId({ runId, purpose: 'lane-a' }),
-    purpose: 'lane-a',
-    baseline: null,
-    transplanted: null,
-  };
-  let laneWorktree;
-  try {
-    laneWorktree = await stage('lane-a 워크트리 생성', () => createWorktree({
-      projectPath, stateRoot, runId, worktreeId: laneAExpected.worktreeId, purpose: 'lane-a',
-    }), {
-      onHardStop: (pending) => pending.then((late) => {
-        const latePath = ownDataValue(late, 'path');
-        const lateOk = ownDataValue(late, 'ok');
-        if (lateOk.ok === true && lateOk.value === true && latePath.ok === true && latePath.value === laneAExpected.path) {
-          return recoveryStage('late worktree handoff', () =>
-            (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: laneAExpected.path }));
-        }
-        return null;
-      }).catch(() => null),
-    });
-  } catch {
-    return fail(artifactBlocked(runId, 'invalid_worktree_handle', GENERIC_RECOVERY));
-  }
-  const laneAFailure = snapshotBlockedResult(laneWorktree);
-  if (laneAFailure?.hardStopped === true) {
-    const owned = provenOwnedWorktreeForCleanup(laneWorktree, laneAExpected);
-    let cleanupNotice;
-    if (owned !== null) {
-      const removal = snapshotRemovalResult(await recoveryStage('hard-stopped lane-a worktree cleanup', () =>
-        (deps.removeWorktree ?? defaultRemoveWorktree)(owned)).catch(() => null));
-      if (!(removal.ok === true && removal.removed === true && removal.unregistered === true)) {
-        const tracked = await recoveryStage('hard-stopped lane-a worktree handoff', () =>
-          (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: owned.path })).catch(() => false);
-        cleanupNotice = tracked === true
-          ? `워크트리 정리를 리퍼에 넘겼습니다: ${owned.path}`
-          : `manual cleanup required: ${owned.path}`;
-      }
-    }
-    return fail(failure({ status: 'deadline_exceeded', confidence: 'unverified', runId, stopReason: 'deadline_exceeded', error: laneAFailure.error ?? 'worktree_creation_failed', recovery: owned?.path ?? laneAFailure.recovery ?? GENERIC_RECOVERY, ...(cleanupNotice ? { notice: cleanupNotice } : {}) }));
-  }
-  if (laneAFailure?.blocked === true) {
-    const owned = provenOwnedWorktreeForCleanup(laneWorktree, laneAExpected);
-    let cleanupNotice;
-    if (owned !== null) {
-      const removal = snapshotRemovalResult(await recoveryStage('blocked lane-a worktree cleanup', () =>
-        (deps.removeWorktree ?? defaultRemoveWorktree)(owned)).catch(() => null));
-      if (!(removal.ok === true && removal.removed === true && removal.unregistered === true)) {
-        const tracked = await recoveryStage('blocked lane-a worktree handoff', () =>
-          (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: owned.path })).catch(() => false);
-        cleanupNotice = tracked === true
-          ? `워크트리 정리를 리퍼에 넘겼습니다: ${owned.path}`
-          : `manual cleanup required: ${owned.path}`;
-      }
-    }
-    return fail(artifactBlocked(runId, laneAFailure.error ?? 'worktree_creation_failed', owned?.path ?? laneAFailure.recovery ?? GENERIC_RECOVERY, cleanupNotice));
-  }
-  const preparedLaneA = snapshotWorktreeHandle(laneWorktree, laneAExpected);
-  if (preparedLaneA === null) {
-    const owned = provenOwnedWorktreeForCleanup(laneWorktree, laneAExpected);
-    const cleanup = owned === null
-      ? { paths: [], notices: [] }
-      : await (async () => {
-          const removal = snapshotRemovalResult(await recoveryStage('invalid lane-a worktree cleanup', () =>
-            (deps.removeWorktree ?? defaultRemoveWorktree)(owned)).catch(() => null));
-          const removed = removal.ok === true && removal.removed === true && removal.unregistered === true;
-          if (removed) return { paths: [owned.path], notices: [] };
-          const tracked = await recoveryStage('invalid lane-a worktree handoff', () =>
-            (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: owned.path })).catch(() => false);
-          return { paths: [owned.path], notices: [tracked === true
-            ? `워크트리 정리를 리퍼에 넘겼습니다: ${owned.path}`
-            : `manual cleanup required: ${owned.path}`] };
-        })();
-    return fail(artifactBlocked(runId, 'invalid_worktree_handle', cleanup.paths.join(', ') || GENERIC_RECOVERY, joinNotices(cleanup.notices)));
-  }
+  const laneA = await createLaneAWorktree({
+    projectPath, canonicalProject, stateRoot, runId, deps, stage, recoveryStage, runHalt,
+    envelopeExtras: (notices = []) => envelopeExtras([...sweepSummaries, ...notices]),
+  });
+  if (laneA.refusal !== null) return halt(laneA.refusal);
+  const preparedLaneA = laneA.laneWorktree;
   progress('worktree');
-  const baseline = qualityFreeze({ ...preparedLaneA.baselineIdentity });
+  const baseline = deepFreeze({ ...preparedLaneA.baselineIdentity });
   const laneWorktrees = [preparedLaneA];
-  const cleanupPreparationWorktrees = async (worktrees, label) => {
-    const unique = [];
-    const paths = new Set();
-    for (const worktree of worktrees) {
-      if (worktree?.ok !== true || typeof worktree.path !== 'string' || paths.has(worktree.path)) continue;
-      paths.add(worktree.path);
-      unique.push(worktree);
+  const cleanupPreparationWorktrees = createWorktreeCleanup({ stateRoot, runId, deps, recoveryStage });
+  const resumption = await startResume({
+    resumeSource, resumeRunId, baseline, candidateCount, budget, runId,
+    cleanupWorktrees: (label) => cleanupPreparationWorktrees(laneWorktrees, label),
+    envelopeExtras: (notices = []) => envelopeExtras([...sweepSummaries, ...notices]),
+  });
+  if (resumption.refusal !== null) return halt(resumption.refusal);
+  const resume = resumption.resume;
+  // ★★ 설정 봉인 대조(WS4a 태스크 4). 계획이 읽은 커밋과 이 실행이 봉인한 baseline 이 같은
+  //   `.bom-orch.json` 을 담고 있을 때만 잇는다. 다르다는 것은 사용자가 설정을 **미커밋으로**
+  //   고쳤다는 뜻이고, 그러면 이 실행이 읽은 설정과 사용자가 보고 있는 설정이 다르다 —
+  //   절반만 적용하지도 조용히 무시하지도 않고 `config_uncommitted` 로 멈춘다. 이 자리가 가장
+  //   이르다: baseline 은 방금 생겼고 두 번째 레인도 벤더 호출도 아직 없어서, 거부는 방금 만든
+  //   워크트리 하나만 치운다.
+  // ★ **소스**의 미커밋 변경은 여기서 아무 말도 하지 않는다. 이식된 소스가 이 실행의 대상이고,
+  //   설정 파일 하나만 커밋 오브젝트에서 읽히기 때문에 이 규칙이 그 파일에만 걸린다.
+  // ★ 주입 이음매로 만들지 않았다. 이 함수는 git 오브젝트만 읽는 순수 함수라 진짜 저장소로
+  //   재는 것이 가장 정직하고(`test/project-config.test.mjs`·`test/engine.test.mjs`), 부르지
+  //   않는 실행이 있는 이음매를 「모든 이음매가 하드 스톱을 지킨다」 목록에 넣으면 그 목록이
+  //   거짓이 된다. 하드 스톱은 `stage()` 가 그대로 건다.
+  if (projectConfigCommit !== null) {
+    const sealedConfig = await stage('project config seal', () => verifyProjectConfigSealed({
+      cwd: preparedLaneA.path, derivedCommit: projectConfigCommit, sealedCommit: baseline.commit,
+    }));
+    // ★★ 여기도 carry 보다 하드 스톱이 먼저다(WS4a 태스크 11, m17). 이 자리는 워크트리를
+    //   치우므로 어긋남이 **두 채널로** 나갔다: 봉투의 `config_uncommitted` 와, 회수 단계에 붙는
+    //   'project config seal mismatch' 라는 라벨. 끊긴 실행에서는 둘 다 거짓이고, 라벨은 로그와
+    //   `stage_authority_revoked` 알림에 그대로 실려 남는다 — 그래서 라벨도 함께 참이 돼야 한다.
+    if (sealedConfig?.hardStopped === true) {
+      const cleanup = await cleanupPreparationWorktrees(laneWorktrees, 'project config seal halt');
+      return halt(runHalt({ runId, extras: envelopeExtras([...sweepSummaries, ...cleanup.notices]) }));
     }
-    const notices = [];
-    for (const worktree of unique) {
-      const removal = snapshotRemovalResult(await recoveryStage(`${label} cleanup`, () =>
-        (deps.removeWorktree ?? defaultRemoveWorktree)(worktree)).catch(() => null));
-      const removed = removal.ok === true && removal.removed === true && removal.unregistered === true;
-      if (removed) continue;
-      const tracked = await recoveryStage(`${label} handoff`, () =>
-        (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: worktree.path })).catch(() => false);
-      notices.push(tracked === true
-        ? `워크트리 정리를 리퍼에 넘겼습니다: ${worktree.path}`
-        : `manual cleanup required: ${worktree.path}`);
+    if (sealedConfig?.ok !== true) {
+      const cleanup = await cleanupPreparationWorktrees(laneWorktrees, 'project config seal mismatch');
+      const carried = carriedFailure(sealedConfig, { path: projectPath, waitMs: effectiveWaitMs });
+      return halt(failure({
+        status: carried.reasonCode === undefined ? 'blocked' : statusOfReasonCode(carried.reasonCode),
+        confidence: confidenceOfRun({ unverified: true }), runId,
+        ...carried, ...envelopeExtras([...sweepSummaries, ...cleanup.notices]),
+      }));
     }
-    return { paths: unique.map((value) => value.path), notices };
-  };
+  }
+  if (resume !== null) {
+    logLine('info', null, 'resume', {
+      source: resume.from, reusedAttempts: resume.reusedAttempts, startOrdinal: resume.startOrdinal,
+    });
+    // ★ 그리고 종료 행에도 남긴다 — 위 줄은 `info` 라 `orch_status` 의 로그 꼬리가 걸러 내므로,
+    //   이 한 줄이 없으면 재구성 본문은 서수가 왜 그 수부터인지 말할 자리가 없다(최종 리뷰 M17).
+    context.setRunIdentity?.({ resumedFrom: resume.from });
+  }
+  const room = await refuseWhenNoResumeRoom({
+    resume, budget, runId,
+    cleanupWorktrees: (label) => cleanupPreparationWorktrees(laneWorktrees, label),
+    envelopeExtras: (notices = []) => envelopeExtras([...sweepSummaries, ...notices]),
+  });
+  if (room.refusal !== null) return halt(room.refusal);
   if (candidateCount === 2) {
-    const createRevisionWorktree = deps.createRevisionWorktree ?? defaultCreateRevisionWorktree;
-    const laneBExpected = {
-      path: join(stateRoot, 'worktrees', makeWorktreeId({ runId, purpose: 'lane-b' })),
-      projectPath: canonicalProject,
-      stateRoot,
-      runId,
-      worktreeId: makeWorktreeId({ runId, purpose: 'lane-b' }),
-      purpose: 'lane-b',
-      baseline,
-      transplanted: false,
-    };
-    let laneB;
-    try {
-      laneB = await stage('lane-b shared-baseline worktree creation', () => createRevisionWorktree({
-      sourceWorktree: preparedLaneA,
-      stateRoot,
-      runId,
-      purpose: 'lane-b',
-      revision: baseline.commit,
-    }), {
-      onHardStop: (pending) => pending.then((late) => {
-        const latePath = ownDataValue(late, 'path');
-        const lateOk = ownDataValue(late, 'ok');
-        if (lateOk.ok === true && lateOk.value === true && latePath.ok === true && latePath.value === laneBExpected.path) {
-          return recoveryStage('late lane-b worktree handoff', () =>
-            (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: laneBExpected.path }));
-        }
-        return null;
-      }).catch(() => null),
-      });
-    } catch {
-      const cleanup = await cleanupPreparationWorktrees([preparedLaneA], 'shared baseline preparation failure');
-      return fail(artifactBlocked(runId, 'shared_baseline_mismatch', cleanup.paths.join(', '), joinNotices(cleanup.notices)));
-    }
-    const laneBFailure = snapshotBlockedResult(laneB);
-    const preparedLaneB = snapshotWorktreeHandle(laneB, laneBExpected);
-    if (laneBFailure?.hardStopped === true || laneBFailure?.blocked === true || preparedLaneB === null ||
-        preparedLaneB.path === preparedLaneA.path) {
-      const ownedLaneB = provenOwnedWorktreeForCleanup(laneB, laneBExpected);
-      const cleanup = await cleanupPreparationWorktrees(
-        [preparedLaneA, ...(ownedLaneB === null ? [] : [ownedLaneB])],
-        'shared baseline preparation failure',
-      );
-      return fail(laneBFailure?.hardStopped === true
-        ? failure({ status: 'deadline_exceeded', confidence: 'unverified', runId, stopReason: 'deadline_exceeded', error: laneBFailure.error ?? 'shared_baseline_mismatch', recovery: cleanup.paths.join(', '), ...(cleanup.notices.length ? { notice: joinNotices(cleanup.notices) } : {}) })
-        : artifactBlocked(runId, laneBFailure?.error ?? 'shared_baseline_mismatch', cleanup.paths.join(', '), joinNotices(cleanup.notices)));
-    }
-    laneWorktrees.push(preparedLaneB);
+    const laneB = await createLaneBWorktree({
+      preparedLaneA, baseline, canonicalProject, stateRoot, runId, deps, stage, recoveryStage,
+      cleanupWorktrees: cleanupPreparationWorktrees, runHalt,
+      envelopeExtras: (notices = []) => envelopeExtras([...sweepSummaries, ...notices]),
+    });
+    if (laneB.refusal !== null) return halt(laneB.refusal);
+    laneWorktrees.push(laneB.laneWorktree);
   }
   context.setRunIdentity?.({
     runId,
@@ -1594,269 +729,122 @@ async function prepareRunNamespace(options, deps) {
     worktreePath: preparedLaneA.path,
     worktreePaths: laneWorktrees.map((worktree) => worktree.path),
   });
-  let taskClass;
-  let proofRequirement;
-  let decisions;
-  let decisionSources;
-  let bandit = null;
-  let baseRoles;
-  try {
-    taskClass = classifyTask({ task, testSource: frozenTestPlan.source ?? null });
-    proofRequirement = classifyProofRequirement({ task, taskClass });
-    const rawPosteriors = await stage('학습 상태 읽기', () =>
-      (deps.readPosteriors ?? defaultReadPosteriors)(stateRoot)).catch(() => ({ ok: false, cells: {} }));
-    const posteriors = qualityClone(rawPosteriors);
-    const advice = bandit = decide({
-      cells: posteriors?.ok === true ? posteriors.cells : {}, taskClass,
-      allowed: { single: runOptions.allowSingle === true },
-      random: typeof deps.random === 'function' ? deps.random : Math.random,
-    });
-    const rawDecisions = runOptions.decisions && typeof runOptions.decisions === 'object' ? runOptions.decisions : {};
-    decisions = {};
-    decisionSources = {};
-    for (const axis of ['mix', 'placement', 'tier']) {
-      decisions[axis] = rawDecisions[axis] ?? advice.decisions[axis];
-      decisionSources[axis] = rawDecisions[axis] === undefined ? advice.sources[axis] : 'caller';
-    }
-    baseRoles = assignRoles(providers, decisions);
-  } catch {
-    const cleanup = await cleanupPreparationWorktrees(laneWorktrees, 'binding preparation failure');
-    return fail(artifactBlocked(runId, 'binding_preparation_failed', cleanup.paths.join(', '), joinNotices(cleanup.notices)));
-  }
-  const pick = (wanted, fallback) => wanted == null ? fallback : providers.find((provider) => provider.id === wanted);
-  const plannerProvider = pick(runOptions.planner, candidateCount === 2 ? providers[0] : baseRoles.planner);
-  const writerProvider = candidateCount === 2 ? providers[0] : pick(runOptions.worker, baseRoles.worker);
-  const verifierProvider = candidateCount === 2 ? providers[1] : pick(runOptions.verifier, baseRoles.verifier);
-  if (!plannerProvider || !writerProvider || !verifierProvider || writerProvider.id === verifierProvider.id && runOptions.allowSingle !== true) {
-    const cleanup = await cleanupPreparationWorktrees(laneWorktrees, 'invalid binding worktree');
-    return fail(artifactBlocked(runId, 'invalid_frozen_binding', cleanup.notices.length === 0
-      ? '서로 다른 사용 가능한 writer/verifier를 지정하세요.' : cleanup.paths.join(', '),
-    joinNotices(cleanup.notices)));
-  }
-  // ★★ 설계 §5.8 S2(a) — 쓰기 역할의 보안 하한. 여기가 자리인 이유가 둘이다: writer 가 방금
-  //   확정됐고, 아직 어떤 CLI 도 안 띄웠다. 막을 거면 워크트리를 쥐여주기 **전**에 막아야 한다.
-  //
-  // ★ c2 는 두 레인이 서로 바꿔 쓰므로 두 프로바이더가 **모두** writer 후보다. c1 은 writer 만
-  //   묻는다 — 읽기 전용 역할은 강등 대상이 아니므로 그것 때문에 프로브를 돌리지 않는다.
-  //   (설계 문구 그대로 "read-only 로 강등" 이다. 실행 금지가 아니다.)
-  const writerCandidates = candidateCount === 2
-    ? [writerProvider, verifierProvider]
-    : [writerProvider];
-  for (const candidate of new Set(writerCandidates)) {
-    const probe = deps.securityFloor ?? (typeof candidate.securityFloor === 'function'
-      ? (() => candidate.securityFloor(deadline))
-      : null);
-    if (probe === null) continue;
-    let floor;
-    try {
-      floor = await stage(`${candidate.id} 보안 하한 확인`, () => probe(candidate.id, candidate));
-    } catch {
-      floor = null;
-    }
-    // 모르면 막지 않는다. 읽지 못한 버전은 「취약하다」의 증거가 아니고, 추측하는 게이트는
-    // 버전 문자열 형식이 바뀌는 날 멀쩡한 설치를 전부 벽돌로 만든다.
-    if (floor?.writable !== false) continue;
-    const cleanup = await cleanupPreparationWorktrees(laneWorktrees, 'security floor rejection');
-    return fail(failure({
-      status: 'blocked',
-      confidence: 'unverified',
-      runId,
-      // 설치된 버전은 **엔진이** 싣는다. 조치하는 사람이 가장 먼저 알아야 하는 값이라
-      // 프로바이더가 문구에 넣어줬기를 기대하지 않는다.
-      error: `${candidate.id}${typeof floor.version === 'string' ? `(${floor.version})` : ''} 를 writer 로 쓸 수 없습니다: ${floor.error ?? '보안 하한 미만입니다.'}`,
-      recovery: floor.recovery ?? '해당 CLI 를 올리거나 다른 벤더를 writer 로 지정하세요.',
-      ...(cleanup.notices.length ? { notice: joinNotices(cleanup.notices) } : {}),
-    }));
-  }
-
-  let settings;
-  let tier;
-  let plannerBinding;
-  let laneBinding;
-  try {
-    const rawSettings = await stage('모델 설정 읽기', () => (deps.readSettings ?? defaultReadSettings)(stateRoot)).catch(() => ({}));
-    settings = qualityFreeze(qualityClone(rawSettings ?? {}));
-    tier = AXES.tier.arms.includes(decisions.tier) ? decisions.tier : AXES.tier.default;
-    plannerBinding = exactRoleBinding(plannerProvider, settings, tier, 'planner');
-    laneBinding = qualityFreeze({
-      writer: exactRoleBinding(writerProvider, settings, tier, 'worker'),
-      verifier: exactRoleBinding(verifierProvider, settings, tier, 'verifier'),
-    });
-  } catch {
-    const cleanup = await cleanupPreparationWorktrees(laneWorktrees, 'settings preparation failure');
-    return fail(artifactBlocked(runId, 'binding_preparation_failed', cleanup.paths.join(', '), joinNotices(cleanup.notices)));
-  }
-  const laneBindings = candidateCount === 1 ? [laneBinding] : [
-    laneBinding,
-    qualityFreeze({
-      writer: exactRoleBinding(verifierProvider, settings, tier, 'worker'),
-      verifier: exactRoleBinding(writerProvider, settings, tier, 'verifier'),
-    }),
-  ];
-  const laneProviders = candidateCount === 1 ? [{ writer: writerProvider, verifier: verifierProvider }] : [
-    { writer: writerProvider, verifier: verifierProvider },
-    { writer: verifierProvider, verifier: writerProvider },
-  ];
-  const effectiveChoices = freezeEffectiveChoices({
-    candidateCount, providers, decisions, tier, writerProvider, verifierProvider, runOptions, settings,
-  });
+  // ★★ 의존성 제공(WS4a 태스크 5 — 로드맵 §3.6 의 옵트인 (a)). 자리의 근거가 셋이고, 셋 다
+  //   **바로 위 줄들이 방금 참으로 만든 것**이다:
+  //   (1) 두 레인의 워크트리가 **둘 다** 있다 — 제공은 레인마다 한 번이고, 공유 캐시 덕에
+  //       둘째 설치는 오프라인으로 끝난다.
+  //   (2) `setRunIdentity` 가 방금 그 경로들을 이 실행의 authoring 워크트리로 등록했다. 그래야
+  //       설치 자식이 리퍼 원장과 트리 킬 대상에 제대로 오른다(`onSpawn` 의 `childWorktree` 판정).
+  //   (3) 아직 어떤 델리게이트도 안 떴다. 워크트리는 baseline 과 바이트가 같으므로 npm 이 읽는
+  //       `package.json`·`.npmrc`·잠금 파일은 전부 **사용자가 커밋한 것**이다 — 러너의 머리
+  //       주석이 `npm install` 을 거부한 이유(워크트리 `package.json` 은 델리게이트가 쓴다)가
+  //       이 시점에는 성립하지 않는다.
+  // ★ 옵트인 판정을 여기서 다시 하지 않는다. 관문은 `provisionRequested` **하나**이고 그것은
+  //   제공기 안에 있다 — 여기에 사본을 두면 「옵트인 없이는 절대 실행되지 않음」의 증명이
+  //   두 자리로 갈린다. 옵트인이 없는 실행에서 이 호출은 git 도 자식도 건드리지 않고 되돌아온다.
+  // ★ 설정은 **워크트리에서 읽지 않는다.** 계획을 동결할 때 커밋 오브젝트에서 읽은 값이
+  //   `baselineConfig` 로 와 있고, 이 자리에서 파일을 여는 코드는 한 줄도 없다.
+  // ★ `mayTouchWorktree` 인 이유: 설치는 워크트리에 **쓴다**. 권위가 중간에 회수되면 무엇이
+  //   남았는지 우리가 모르고, 그 사실은 봉투가 말해야 한다.
+  const provisionNotices = [];
   /**
-   * 설계 §7.5 의 근거 문단 — 밴딧이 계획을 짜는 게 아니라 **증거를 공급한다**.
+   * ★★ 준비 단계의 halt 가 싣는 봉투 부속 — **이 실행이 이미 한 일은 사라지지 않는다.**
    *
-   * ★★ 이 배선은 `4b53bfe` 가 조용히 끊었다(`evidence: {}`). 그대로 되살리면 안 된다: 문단은
-   *   `AXES` 전체를 돌며 만들어지므로 `rewrite`(엔진이 결정에서 버리는 축)와 구분되지 않는
-   *   `tier`(팔 뒤에 아무것도 없는 상태)에 대한 문장까지 살아 있는 모델에게 간다. 기본 설치에서는
-   *   문단의 절반 이상이 사실상 거짓이 된다.
-   *
-   * ★ 그래서 **이 실행이 실제로 고를 수 있었던 축만** 싣는다. `identifiable` 이 정확히 그
-   *   질문의 답이고, 이미 위에서 얼어붙었다. 학습이 보상하지 않는 축은 모델에게도 말하지 않는다 —
-   *   한 실행에 대해 두 곳이 다른 말을 하면 어느 쪽도 못 믿는다.
-   *
-   * ★ c2 블라인딩이 공짜로 지켜진다: 벤더 이름을 담은 축은 `placement` 하나뿐이고, c2 는 그것을
-   *   `mirrored_two_lane_placement` 로 이미 식별 불가로 표시한다. 두 레인이 공유하는 계획
-   *   텍스트에 벤더 이름이 실릴 길이 없다.
+   * `provisionNotices` 와 `configNotices` 는 한참 아래(`src/run-planner.mjs` 가 짓는
+ * `plannerNotices`)에서 처음 읽히는데,
+   * 그 사이에는 halt 가 여럿이다. 그 자리들이 `[...sweepSummaries, ...cleanup.notices]` 만
+   * 실으면 **의존성을 실제로 설치하고 `<stateRoot>/cache/npm` 을 만든 실행**이 그 사실을 한
+   * 글자도 말하지 않는 봉투로 끝난다 — 그리고 `deps_provisioned` 는 「stateRoot 밖에 쓰지
+   * 않는다」(전역 제약 §5.5)를 봉투가 말하는 **유일한** 자리다. 캐시는 halt 를 넘어 살아남고
+   * (회수는 워크트리만 지운다, 보관 정책은 WS6), 그래서 이 문장은 halt 에서 더 필요하다.
+   * `project_config_reporter_unavailable` 도 같은 경로에서 같은 이유로 잃고 있었다.
    */
-  const plannerEvidence = evidenceParagraph(
-    bandit,
-    POLICY_V2_AXES.filter((axis) => effectiveChoices[axis]?.identifiable === true),
-  );
-  const judgeBindings = candidateCount === 2
-    ? laneProviders.map(({ writer }) => exactRoleBinding(writer, settings, tier, 'thinker'))
-    : [];
-  const usageAccumulator = createRunUsageAccumulator();
-  const callProvider = async ({ provider, binding, kind, laneId, attemptId, judgeIndex = null, instruction, workspace, tools, nonWorktree = false }) => {
-    if (deadline?.aborted === true || now() >= deadlineAt) {
-      const error = new Error('deadline_expired');
-      error.preBoundary = true;
-      throw error;
+  const preparationExtras = (cleanupNotices) =>
+    envelopeExtras([...sweepSummaries, ...configNotices, ...provisionNotices, ...cleanupNotices]);
+  const provisionDependencies = deps.provisionDependencies ?? defaultProvisionDependencies;
+  for (const lane of laneWorktrees) {
+    const provisioned = await stage('dependency provisioning', () => provisionDependencies({
+      config: baselineConfig,
+      baselineCommit: baseline.commit,
+      worktreePath: lane.path,
+      stateRoot,
+      runId,
+      signal: deadline,
+      onSpawn: (child) => onSpawn(child, { worktreePath: lane.path, ownerWorktreePath: lane.path }),
+    }), { mayTouchWorktree: true, worktreePath: lane.path });
+    // release는 npm 효과가 난 **뒤**의 정리 경계다. 상위 schema 때문에 lease를 못 내렸어도
+    // 성공한 설치를 실패로 뒤집지 않고, 정확한 좌표를 최종 봉투 notice에 합친다.
+    const cacheLeaseRelease = provisioned?.cacheLeaseRelease;
+    const releaseSchemaNotice = stateSchemaNotice(cacheLeaseRelease?.stateSchema);
+    if (releaseSchemaNotice !== null) {
+      provisionNotices.push(releaseSchemaNotice);
+    } else if (cacheLeaseRelease?.ok === false) {
+      // 일반 해제 실패도 상위 schema와 같이 성공한 설치를 뒤집지 않는다. 다만 두 문구를
+      // 같이 싣지 않는다: schema 좌표가 있으면 표준 알림이 더 정확한 진단이다.
+      provisionNotices.push(renderNotice('deps_cache_lease_release_failed', {}));
+      logLine('warn', null, 'package cache lease release', {
+        status: typeof cacheLeaseRelease.status === 'string' && cacheLeaseRelease.status !== ''
+          ? cacheLeaseRelease.status
+          : UNKNOWN_VALUE,
+        detail: typeof cacheLeaseRelease.detail === 'string' ? cacheLeaseRelease.detail : '',
+      });
     }
-    const ticket = usageAccumulator.start({ kind, laneId, attemptId, judgeIndex });
-    const phase = kind === 'verifier_format' ? 'verifier' : kind === 'judge_format' ? 'judge' : kind === 'writer' ? 'worker' : kind;
-    progress(phase, attemptId === null ? judgeIndex ?? 0 : Number(attemptId.slice(-3)), {
-      laneId,
-      attemptId,
-      role: binding.role,
-      judgeIndex,
-    });
-    let result;
-    try {
-      result = await stage(`${kind} provider`, () => provider.run({
-        role: binding.role, model: binding.model, effort: binding.effort, instruction, workspace,
-        tools, allowedTools: tools, signal: deadline,
-        onSpawn: (child) => onSpawn(child, {
-          late: deadline?.aborted === true,
-          planner: kind === 'planner' || nonWorktree,
-          worktreePath: nonWorktree ? null : workspace,
-          ownerWorktreePath: workspace,
-          laneId,
-          attemptId,
-          role: binding.role,
-          judgeIndex,
-          reportIdentity: candidateCount === 2,
-        }),
-        onProgress: (event) => {
-          if (deadline?.aborted !== true) {
-            try {
-              runOptions.onProgress?.(candidateCount === 1
-                ? { phase: kind, event }
-                : { phase, laneId, attemptId, role: binding.role, judgeIndex, event });
-            } catch { /* advisory */ }
-          }
-        },
-        runId,
-      }), { mayTouchWorktree: !nonWorktree && kind !== 'planner', worktreePath: workspace });
-      if (result?.hardStopped === true) throw new Error('provider_effect_unknown');
-      return result;
-    } finally {
-      usageAccumulator.settle(ticket, { promptTokens: result?.promptTokens ?? null, evalTokens: result?.evalTokens ?? null });
+    // ★★ carry 하기 **전에** 「누가 껐는가」를 먼저 가른다 — 형제 단계들과 같은 규율이다
+    //   (이 파일의 저장소 점검, `src/run-worktrees.mjs` 의 레인 준비 둘). 제공기는 실행이 멈췄다는
+    //   사실만 알고 그 이유는 모르므로 코드 없이 중립으로 돌아온다(`{ok:false, hardStopped:true}`);
+    //   이름은 `haltReasonCode()` 가 붙인다. 이 줄이 없으면 정지 버튼을 누른 사용자가
+    //   `deps_unavailable` 과 「잠금 파일을 커밋하라」는 조언을 받는다(재리뷰 Important 1).
+    if (provisioned?.hardStopped === true || deadline?.aborted === true) {
+      const cleanup = await cleanupPreparationWorktrees(laneWorktrees, 'dependency provisioning halt');
+      return halt(runHalt({ runId, extras: preparationExtras(cleanup.notices) }));
     }
-  };
-  const plansRoot = join(stateRoot, 'plans');
-  let planDir = null;
-  let planDirIdentity = null;
-  const plannerNotices = [];
-  let plannerUsage = qualityFreeze({ calls: 0, promptTokensKnown: 0, evalTokensKnown: 0, incomplete: false });
-  let plannerProviderEntered = false;
-  let plan = task;
-  try {
-    const plannedRoot = await canonical(plansRoot);
-    const expectedPlansRoot = resolve(stateRoot, 'plans');
-    if (plannedRoot === null || relative(plannedRoot, expectedPlansRoot) !== '' || relative(plannedRoot, stateRoot) === '' ||
-        !pathContains(stateRoot, plannedRoot)) throw new Error('planner_scratch_root_untrusted');
-    await mkdir(plansRoot, { recursive: true });
-    planDir = await mkdtemp(join(plansRoot, `${runId}-planner-`));
-    const returnedPlanDir = resolve(planDir);
-    const [canonicalPlanDir, planStat] = await Promise.all([canonical(planDir), lstat(planDir, { bigint: true })]);
-    const canonicalPlansRoot = await canonical(plansRoot);
-    if (canonicalPlanDir === null || canonicalPlansRoot === null || relative(canonicalPlansRoot, expectedPlansRoot) !== '' || !pathContains(stateRoot, canonicalPlansRoot) ||
-        !planStat.isDirectory() || planStat.isSymbolicLink() || relative(canonicalPlanDir, returnedPlanDir) !== '' ||
-        relative(canonicalPlansRoot, canonicalPlanDir) === '' || !pathContains(canonicalPlansRoot, canonicalPlanDir)) {
-      throw new Error('planner_scratch_identity_unavailable');
+    if (provisioned?.ok !== true) {
+      const cleanup = await cleanupPreparationWorktrees(laneWorktrees, 'dependency provisioning refusal');
+      // status 는 실려 갈 코드의 조악값이 정한다(설정 봉인 관문과 같은 규칙) — 손으로 고르지 않는다.
+      // lease 획득은 공유 상태에 쓰는 경계다. 중간 제공기의 deps_unavailable fallback보다
+      // 저수준 리더가 보존한 상위 schema 좌표가 우선해야 업데이트 회복이 최종 봉투에 남는다.
+      const carried = stateSchemaReason(releaseSchemaNotice === null ? provisioned?.stateSchema : undefined) ??
+        carriedFailure(provisioned, { path: projectPath, waitMs: effectiveWaitMs });
+      return halt(failure({
+        status: carried.reasonCode === undefined ? 'blocked' : statusOfReasonCode(carried.reasonCode),
+        confidence: confidenceOfRun({ unverified: true }), runId,
+        ...carried, ...preparationExtras(cleanup.notices),
+      }));
     }
-    planDir = canonicalPlanDir;
-    planDirIdentity = { path: canonicalPlanDir, dev: planStat.dev, ino: planStat.ino };
-    plannerProviderEntered = true;
-    const planner = await callProvider({
-      provider: plannerProvider, binding: plannerBinding, kind: 'planner', laneId: null, attemptId: null,
-      instruction: plannerInstruction({ task, testPlan: frozenTestPlan, evidence: plannerEvidence }),
-      workspace: planDir, tools: undefined,
-    });
-    plannerUsage = qualityFreeze({
-      calls: 1,
-      promptTokensKnown: Number.isSafeInteger(planner?.promptTokens) && planner.promptTokens >= 0 ? planner.promptTokens : 0,
-      evalTokensKnown: Number.isSafeInteger(planner?.evalTokens) && planner.evalTokens >= 0 ? planner.evalTokens : 0,
-      incomplete: !Number.isSafeInteger(planner?.promptTokens) || planner.promptTokens < 0 || !Number.isSafeInteger(planner?.evalTokens) || planner.evalTokens < 0,
-    });
-    if (qualityProviderFailure(planner)) {
-      plannerNotices.push('planner failed; original task text was used');
-    } else if (typeof planner?.content === 'string' && planner.content !== '') {
-      plan = clip(planner.content, EXCERPT_CHARS);
+    if (releaseSchemaNotice === null) {
+      const schemaNotice = stateSchemaNotice(provisioned?.stateSchema);
+      if (schemaNotice !== null) provisionNotices.push(schemaNotice);
     }
-  } catch (error) {
-    if (plannerUsage.calls === 0 && plannerProviderEntered && error?.preBoundary !== true) {
-      plannerUsage = qualityFreeze({ calls: 1, promptTokensKnown: 0, evalTokensKnown: 0, incomplete: true });
-    }
-    plan = task;
-    if (planDir !== null && planDirIdentity === null) plannerNotices.push('planner scratch identity could not be proven');
-    plannerNotices.push('planner failed; original task text was used');
-  } finally {
-    if (planDir !== null && planDirIdentity !== null) {
-      let removed = false;
-      const childrenProven = await killLiveChildren(planDirIdentity.path);
-      if (childrenProven) {
-        try {
-          const [actual, current] = await Promise.all([canonical(planDir), lstat(planDir, { bigint: true })]);
-          if (actual !== null && relative(actual, planDirIdentity.path) === '' && current.dev === planDirIdentity.dev && current.ino === planDirIdentity.ino && current.isDirectory() && !current.isSymbolicLink()) {
-            const removal = await recoveryStage('planner scratch cleanup', () =>
-              (deps.removePlannerScratch ?? rm)(planDirIdentity.path, { recursive: true, force: false }));
-            if (removal?.hardStopped !== true) {
-              removed = await lstat(planDirIdentity.path).then(() => false, (error) => error?.code === 'ENOENT');
-            }
-          }
-        } catch (error) {
-          removed = error?.code === 'ENOENT';
-        }
-      }
-      if (!removed) plannerNotices.push(`planner scratch cleanup pending: ${planDir}`);
-    } else if (planDir !== null) {
-      plannerNotices.push(`planner scratch cleanup pending: ${planDir}`);
-    }
+    if (Array.isArray(provisioned.notices)) provisionNotices.push(...provisioned.notices);
   }
+  const roles = await bindRunRoles({
+    providers, runOptions, candidateCount, taskClass, baselineConfig, stateRoot, runId, deadline,
+    deps, stage, logLine, configNotices, preparationExtras,
+    cleanupWorktrees: (label) => cleanupPreparationWorktrees(laneWorktrees, label),
+  });
+  if (roles.refusal !== null) return halt(roles.refusal);
+  const {
+    controls, decisions, decisionSources, plannerProvider, writerProvider, verifierProvider, tier,
+    plannerBinding, laneBindings, laneProviders, effectiveChoices, plannerEvidence, judgeBindings,
+  } = roles;
+  const usageAccumulator = createRunUsageAccumulator();
+  // 벤더 결함 장부 — 실행 하나가 본 결함을 순서대로 들고 있다가 봉투 조립이 코드 하나와
+  // 발췌 ≤3 과 벤더별 드리프트 한 줄을 꺼낸다(`src/run-faults.mjs`).
+  const faultRegistry = createFaultRegistry({ logLine, redact: context.redact });
+  const callProvider = createProviderCall({
+    runFacts, progress, runOptions, candidateCount, runId, deadline, deadlineAt, now,
+    stage, logLine, onSpawn, usageAccumulator, recordProviderOutcome: faultRegistry.recordProviderOutcome,
+  });
+  const planner = await runPlannerPhase({
+    task, runId, stateRoot, frozenTestPlan, plannerProvider, plannerBinding, plannerEvidence,
+    configNotices, provisionNotices, deps, recoveryStage, logLine, killLiveChildren, callProvider,
+  });
+  const { plan, plannedByModel, plannerUsage, plannerNotices } = planner;
 
   if (deadline?.aborted === true || now() >= deadlineAt) {
     const cleanup = await cleanupPreparationWorktrees(laneWorktrees, 'post-planner authoring');
-    const authoringNotices = cleanup.notices;
-    const pendingPlannerNotice = plannerNotices.filter((value) => value.startsWith('planner scratch cleanup pending:'));
-    return fail(failure({
-      status: 'deadline_exceeded', confidence: 'unverified', runId, stopReason: 'deadline_exceeded',
-      error: 'planner 뒤 데드라인이 지났습니다.',
-      recovery: pendingPlannerNotice.length > 0
-        ? `${pendingPlannerNotice.join(' / ')}${authoringNotices.length === 0 ? '' : `; ${laneWorktrees.map((value) => value.path).join(', ')}`}`
-        : authoringNotices.length === 0 ? 'wait_ms를 늘려 다시 시도하세요.' : cleanup.paths.join(', '),
-      ...(authoringNotices.length > 0 || pendingPlannerNotice.length > 0 ? { notice: [
-        ...pendingPlannerNotice,
-        ...authoringNotices,
-      ].join(' / ') } : {}),
+    return halt(runHalt({
+      runId, extras: envelopeExtras([...sweepSummaries, ...plannerNotices, ...cleanup.notices]),
     }));
   }
   const initialManifest = {
@@ -1872,7 +860,7 @@ async function prepareRunNamespace(options, deps) {
   const artifactStore = await recoveryStage('artifact store initialization', () =>
     (deps.createRunArtifacts ?? createRunArtifacts)(
       { stateRoot, runId, initialManifest }, deps.artifactDeps ?? {},
-    )).catch(() => ({ blocked: true, error: 'artifact_store_initialization_failed', recovery: preparedLaneA.path }));
+    )).catch(() => fail(REASON.artifact_store_initialization_failed));
   const artifactStoreFailure = snapshotBlockedResult(artifactStore);
   let artifactStoreValid = false;
   if (artifactStoreFailure?.blocked !== true) {
@@ -1888,26 +876,20 @@ async function prepareRunNamespace(options, deps) {
   }
   if (artifactStoreFailure?.blocked === true || !artifactStoreValid) {
     let cleanup;
-      if (candidateCount === 1) {
-        const tracked = await recoveryStage('artifact initialization worktree handoff', () =>
-        (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: preparedLaneA.path })).catch(() => false);
-        cleanup = {
-        paths: [preparedLaneA.path],
-          notices: [tracked === true
-          ? `워크트리 정리를 리퍼에 넘겼습니다: ${preparedLaneA.path}`
-          : `manual cleanup required: ${preparedLaneA.path}`],
-        };
+    if (candidateCount === 1) {
+      const tracked = await recoveryStage('artifact initialization worktree handoff', () =>
+        (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: preparedLaneA.path, projectPath: preparedLaneA.projectPath })).catch(() => false);
+      cleanup = { paths: [preparedLaneA.path], notices: [handoffNotice(tracked, preparedLaneA.path)] };
     } else {
       cleanup = await cleanupPreparationWorktrees(laneWorktrees, 'artifact initialization worktree');
     }
-    const recoveryNotices = cleanup.notices;
-    const error = artifactStoreFailure?.hardStopped === true
-      ? 'artifact_store_authority_lost'
-      : artifactStoreFailure?.blocked === true ? artifactStoreFailure.error ?? 'artifact_store_initialization_failed' : 'invalid_artifact_store';
-    return fail(artifactBlocked(runId, error, cleanup.paths.join(', '), joinNotices([
-      ...(sweepSummaries.length ? [`retention ${sweepSummaries.join(',')}`] : []),
-      ...plannerNotices,
-      ...recoveryNotices,
+    const reasonCode = artifactStoreFailure?.hardStopped === true
+      ? REASON.artifact_store_authority_lost
+      : artifactStoreFailure?.blocked === true
+        ? reasonCodeOf(artifactStore, REASON.artifact_store_initialization_failed)
+        : REASON.artifact_store_invalid;
+    return halt(artifactBlocked(runId, reasonCode, { runId }, envelopeExtras([
+      ...sweepSummaries, ...plannerNotices, ...cleanup.notices,
     ])));
   }
 
@@ -1923,1659 +905,49 @@ async function prepareRunNamespace(options, deps) {
   }
   const revisionZeroAuthority = snapshotStoreArtifactAuthority(rawStoreAuthority, pathBudget.paths.manifestPath);
   if (revisionZeroAuthority === null) {
-    const cleanup = candidateCount === 1
-      ? { paths: [preparedLaneA.path], notices: [await recoveryStage('artifact authority worktree handoff', () =>
-        (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: preparedLaneA.path })).catch(() => false) === true
-        ? `워크트리 정리를 리퍼에 넘겼습니다: ${preparedLaneA.path}`
-        : `manual cleanup required: ${preparedLaneA.path}`] }
-      : await cleanupPreparationWorktrees(laneWorktrees, 'artifact authority worktree');
-    return fail(artifactBlocked(runId, 'invalid_artifact_store', cleanup.paths.join(', '), joinNotices([
-      ...plannerNotices,
-      ...cleanup.notices,
+    let cleanup;
+    if (candidateCount === 1) {
+      // ★ 리퍼가 받았는지 아닌지가 **다른 문장**이다(`handoffNotice`). 이 자리에 있던 삼항이
+      //   `=== handoffNotice(true, …)` 로 뭉개져 알림 배열에 리터럴 `false` 가 실렸었다 —
+      //   워크트리가 어디 남았는지가 통째로 사라진다.
+      const tracked = await recoveryStage('artifact authority worktree handoff', () =>
+        (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: preparedLaneA.path, projectPath: preparedLaneA.projectPath })).catch(() => false);
+      cleanup = { paths: [preparedLaneA.path], notices: [handoffNotice(tracked, preparedLaneA.path)] };
+    } else {
+      cleanup = await cleanupPreparationWorktrees(laneWorktrees, 'artifact authority worktree');
+    }
+    return halt(artifactBlocked(runId, REASON.artifact_store_invalid, { runId }, envelopeExtras([
+      ...sweepSummaries, ...plannerNotices, ...cleanup.notices,
     ])));
   }
+
+  await recordPlannerCanon({ ...planner, artifactStore, runId, deps, recoveryStage, logLine });
 
   const testQueue = createSerialTestQueue({ now });
   const evidenceCache = new Map();
   const prepared = {
     ok: true, runId, stateRoot, deadlineAt, candidateCount, frozenTestPlan, baseline,
     laneWorktrees: Object.freeze([...laneWorktrees]), laneBindings: Object.freeze([...laneBindings]),
-    laneWorktree: preparedLaneA, proofRequirement, plannerBinding, laneBinding, plan, plannerUsage,
+    proofRequirement, preflight, plannerBinding, plan, plannedByModel, plannerUsage,
     artifactPaths: pathBudget.paths, artifactStore, manifestAuthority: revisionZeroAuthority, testQueue, evidenceCache,
     artifactRevisionAuthority: { latest: 0 },
-    usageAccumulator, sweepNotice: sweepSummaries.length ? `retention ${sweepSummaries.join(',')}` : null,
+    usageAccumulator, sweepNotice: sweepSummaries[0] ?? null,
+    // 허용목록은 실행 하나에 하나다(위 합집합). 레인이 아니라 준비가 들고 있는 이유는 `baseline`
+    // 과 같다 — 레인마다 다시 접으면 두 레인이 다른 허용목록으로 같은 패치를 판정할 수 있다.
+    scopeAllow: scopeAllow.entries,
+    // 재개의 사실들(`from`·`reusedAttempts`·`startOrdinal`·`noticeParams`). 레인은 여기서 시작
+    // 서수를 받고, 종료 경로는 여기서 알림을 짓는다 — 두 소비자가 같은 값을 읽는다.
+    resume,
   };
   PREPARATION_PRIVATE.set(prepared, {
     taskClass, decisions, decisionSources, plannerProvider, writerProvider, verifierProvider,
     laneProviders, judgeBindings: Object.freeze([...judgeBindings]), tier, plannerNotices, callProvider, pathBudget, progress,
-    effectiveChoices,
+    effectiveChoices, learningMutationEnabled: controls.mutationEnabled, faultRegistry,
   });
   return Object.freeze(prepared);
 }
 
-async function runPreparedLane(input) {
-  const { preparation, laneIndex, context, artifactAuthority, judgeViewProjector = null } = input;
-  const laneId = laneIndex === 0 ? 'lane-a' : 'lane-b';
-  const laneWorktree = preparation.laneWorktrees[laneIndex];
-  const laneBinding = preparation.laneBindings[laneIndex];
-  const privateFacts = {
-    // 설계 §5.8 S1 — 이 런에서 저장소 테스트 스위트를 사용자 권한으로 실제로 돌렸는가.
-    userPrivilegeObserved: false,
-    privatePatches: new Map(),
-    attemptDeltas: new Map(),
-    evidenceByAttempt: new Map(),
-    attemptArtifactRefs: new Map(),
-    contentEvidenceRefs: new Map(),
-    contentEvidenceOmissions: { count: 0 },
-    judgeViews: null,
-  };
-  const boundary = {
-    preparation,
-    laneIndex,
-    laneId,
-    laneWorktree,
-    laneBinding,
-    context,
-    artifactAuthority,
-    privateFacts,
-    judgeViewProjector,
-  };
-  const adapters = createPreparedLaneAdapters(boundary);
-  try {
-    const candidate = await runCandidateLane({
-      runId: preparation.runId,
-      laneId,
-      task: context.task,
-      plan: preparation.plan,
-      binding: laneBinding,
-      budget: context.budget,
-      deadlineAt: preparation.deadlineAt,
-      baseline: preparation.baseline,
-      proofRequirement: preparation.proofRequirement,
-      frozenTestPlan: preparation.frozenTestPlan,
-      authoringWorktree: laneWorktree,
-    }, adapters);
-    const contentFacts = qualityFreeze({
-      attempts: candidate.attempts.map((attempt) => ({
-        candidateId: candidate.candidateId,
-        ordinal: attempt.ordinal,
-        attemptId: attempt.attemptId,
-        retryOf: attempt.retryOf,
-        result: attempt.result,
-        hash: attempt.sealed?.patchSha256 ?? null,
-        ref: privateFacts.attemptArtifactRefs.get(attempt.attemptId) ?? null,
-        usage: combineContentUsage(attempt.usage?.writer, attempt.usage?.verifier),
-      })),
-      evidenceRefs: [...privateFacts.contentEvidenceRefs.values()],
-      evidenceOmittedCount: privateFacts.contentEvidenceOmissions.count,
-    });
-    return qualityFreeze({
-      candidate,
-      judgeViews: privateFacts.judgeViews,
-      contentFacts,
-      userPrivilegeObserved: privateFacts.userPrivilegeObserved === true,
-    });
-  } finally {
-    privateFacts.privatePatches.clear();
-    privateFacts.attemptDeltas.clear();
-    privateFacts.evidenceByAttempt.clear();
-    privateFacts.attemptArtifactRefs.clear();
-    privateFacts.contentEvidenceRefs.clear();
-  }
-}
-
-function createPreparedLaneAdapters(input) {
-  const {
-    preparation, laneIndex, laneId, laneWorktree, laneBinding, context,
-    artifactAuthority, privateFacts, judgeViewProjector,
-  } = input;
-  const {
-    runId, stateRoot, deadlineAt, frozenTestPlan, baseline, proofRequirement,
-    plan, artifactPaths, artifactStore, manifestAuthority, artifactRevisionAuthority, testQueue, evidenceCache,
-  } = preparation;
-  const { laneProviders, callProvider, progress } = PREPARATION_PRIVATE.get(preparation);
-  const providers = laneProviders[laneIndex];
-  const {
-    deps, task, budget, deadline, now, stage, recoveryStage, onSpawn, killLiveChildren,
-  } = context;
-  const {
-    checkpoint, artifactStorePoison, poisonedArtifactResult, poisonArtifactStore,
-    handoffWorktree, writeAttempt, writeEvidence, writeCandidate, setLatestManifestRef,
-    isStoreAuthorityLost = () => false,
-  } = artifactAuthority;
-  const {
-    privatePatches, attemptDeltas, evidenceByAttempt, attemptArtifactRefs, contentEvidenceRefs,
-    contentEvidenceOmissions,
-  } = privateFacts;
-  const classifyWriterResult = (rawResult, writer) => classifyArtifactSettlement(rawResult, {
-    kind: 'writer',
-    authority: { writer, manifest: manifestAuthority },
-  });
-  const acceptWriterResult = (settlement) => settlement.kind === 'success' &&
-    acceptArtifactRevision(settlement.result, artifactRevisionAuthority);
-  const snapshotStep = deps.snapshotStep ?? defaultSnapshotStep;
-  const revisionIdentity = deps.revisionIdentity ?? defaultRevisionIdentity;
-  const listRevisionDelta = deps.listRevisionDelta ?? defaultListRevisionDelta;
-  const collectPatchAtRevision = deps.collectPatchAtRevision ?? defaultCollectPatchAtRevision;
-  const inspectPatch = deps.inspectPatch ?? defaultInspectPatch;
-  const listIgnoredPaths = deps.listIgnoredPaths ?? defaultListIgnoredPaths;
-  const identity = (role, attemptId = null) => ({ laneId, attemptId, role, judgeIndex: null });
-  const label = (value) => preparation.candidateCount === 1 ? value : `${laneId} ${value}`;
-
-  return {
-    now,
-    isAborted: () => deadline?.aborted === true,
-    checkpointAttemptAllocation: (value) => checkpoint(artifactStore, {
-      eventId: `attempt:${value.laneId}:${String(value.ordinal).padStart(3, '0')}:allocated`,
-      type: 'attempt_allocated',
-      laneId: value.laneId,
-      ordinal: value.ordinal,
-      attemptId: value.attemptId,
-      retryOf: value.retryOf,
-    }),
-    callWriter: async (value) => {
-      let result;
-      try {
-        result = await callProvider({
-          provider: providers.writer,
-          binding: laneBinding.writer,
-          kind: 'writer',
-          laneId,
-          attemptId: value.attemptId,
-          instruction: workerInstruction({
-            task,
-            plan,
-            step: value.ordinal,
-            budget,
-            feedback: value.feedback.openIds.length ? `열린 이슈: ${value.feedback.openIds.join(', ')}` : null,
-          }),
-          workspace: laneWorktree.path,
-          tools: [...WORKER_TOOLS],
-        });
-      } catch (error) {
-        return {
-          status: error?.preBoundary === true ? 'timeout' : 'effect_unknown',
-          callStarted: error?.preBoundary !== true,
-          usage: { promptTokens: null, evalTokens: null },
-        };
-      }
-      return {
-        status: qualityWriterSettlement(result),
-        usage: { promptTokens: result?.promptTokens, evalTokens: result?.evalTokens },
-      };
-    },
-    sealAttempt: async ({ attemptId, ordinal }) => {
-      const snapshot = await stage(label('writer snapshot'), () =>
-        snapshotStep(laneWorktree, `bom-orch attempt ${ordinal} writer`), {
-        mayTouchWorktree: true,
-        worktreePath: laneWorktree.path,
-      });
-      if (isBlocked(snapshot) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(snapshot?.commit ?? '')) {
-        return { ok: false, writerResult: 'snapshot_failed' };
-      }
-      const revision = await stage(label('revision identity'), () =>
-        revisionIdentity(laneWorktree, snapshot.commit));
-      if (revision?.ok !== true || revision.commit !== snapshot.commit ||
-          !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(revision.tree ?? '')) {
-        return { ok: false, writerResult: 'seal_failed' };
-      }
-      const delta = await stage(label('revision delta'), () =>
-        listRevisionDelta(laneWorktree, { from: baseline.commit, to: revision.commit }));
-      const validDeltaEntry = (entry) => {
-        if (entry === null || typeof entry !== 'object' || Array.isArray(entry) ||
-            Reflect.ownKeys(entry).length !== 4 ||
-            !['path', 'status', 'oldMode', 'newMode'].every((key) => Object.hasOwn(entry, key))) return false;
-        const regular = (mode) => mode === '100644' || mode === '100755';
-        return entry.status === 'added' ? entry.oldMode === null && regular(entry.newMode)
-          : entry.status === 'deleted' ? regular(entry.oldMode) && entry.newMode === null
-            : entry.status === 'modified' && regular(entry.oldMode) && regular(entry.newMode);
-      };
-      if (isBlocked(delta) || delta?.ok !== true || !Array.isArray(delta.entries) ||
-          delta.entries.some((entry) => typeof entry?.path !== 'string' || entry.path === '' ||
-            entry.path.includes('\\') || !validDeltaEntry(entry)) ||
-          delta.entries.some((entry, index) => index > 0 && Buffer.compare(
-            Buffer.from(delta.entries[index - 1].path, 'utf8'),
-            Buffer.from(entry.path, 'utf8'),
-          ) >= 0)) return { ok: false, writerResult: 'seal_failed' };
-      const patch = await stage(label('candidate patch collection'), () =>
-        collectPatchAtRevision(laneWorktree, { from: baseline.commit, to: revision.commit }), {
-        mayTouchWorktree: true,
-        worktreePath: laneWorktree.path,
-      });
-      progress('patch', ordinal, identity('worker', attemptId));
-      const deltaPaths = delta.entries.map((entry) => entry.path);
-      if (isBlocked(patch) || patch?.ok !== true || !Buffer.isBuffer(patch.patch) ||
-          patch.sha256 !== qualityHash(patch.patch) || patch.empty !== (patch.patch.length === 0) ||
-          !Array.isArray(patch.files) || patch.files.length !== deltaPaths.length ||
-          patch.files.some((path, index) => path !== deltaPaths[index])) {
-        return { ok: false, writerResult: 'seal_failed' };
-      }
-      const patchSha256 = qualityHash(patch.patch);
-      privatePatches.set(attemptId, Buffer.from(patch.patch));
-      attemptDeltas.set(attemptId, {
-        delta,
-        files: [...patch.files],
-        empty: patch.empty,
-        sha256: patchSha256,
-        identity: revision,
-      });
-      return {
-        ok: true,
-        sealed: {
-          commit: revision.commit,
-          treeHash: revision.tree,
-          patchSha256,
-          testPlanFingerprint: frozenTestPlan.planFingerprint,
-        },
-      };
-    },
-    evaluateAttempt: async ({ attemptId, sealed }) => {
-      const stored = attemptDeltas.get(attemptId);
-      const ignored = await stage(label('ignored path listing'), () => listIgnoredPaths(laneWorktree));
-      const scope = await stage(label('patch inspection'), () => inspectPatch({
-        files: stored.delta.entries.map((entry) => entry.path),
-        worktree: laneWorktree.path,
-        baseline: baseline.commit,
-      }));
-      progress('scope', Number(attemptId.slice(-3)), identity('worker', attemptId));
-      if (isBlocked(scope) || !Array.isArray(ignored)) {
-        return { evidence: [], cleanup: [], operationalFailure: { code: 'evidence_authority_mismatch' } };
-      }
-      if (scope.flagged === true) {
-        return {
-          tests: { execution: 'not_run', outcome: 'unknown', stability: 'unknown', complete: false, trusted: false, failureFingerprints: [] },
-          regressionProof: { required: proofRequirement.required, status: proofRequirement.required ? 'unavailable' : 'not_applicable', repairable: false, evidenceIds: [], witnessIds: [], reasonCodes: ['policy_failure'] },
-          evidence: [], cleanup: [], operationalFailure: null,
-          scope: { flagged: true, reasonCount: scope.reasons?.length ?? 0, omittedReasonCount: scope.omitted ?? 0, changedFileCount: stored.delta.entries.length },
-        };
-      }
-      const splitDelta = deps.splitTestOnlyDelta ?? splitTestOnlyDelta;
-      const testDelta = await splitDelta({
-        entries: stored.delta.entries,
-        baselineRevision: baseline.commit,
-        candidateRevision: sealed.commit,
-        testPlan: frozenTestPlan,
-        ignoredPaths: ignored,
-        unsafePaths: stored.delta.unsafePaths ?? [],
-        candidateWorktree: laneWorktree,
-      }, { collectPatchAtRevision });
-      if (testDelta?.status === 'unsafe') {
-        const policyReasons = new Set([
-          'test_definition_tampering', 'unsafe_test_path', 'ignored_test_path',
-          'invalid_delta_path', 'duplicate_delta_path', 'invalid_ignored_path', 'invalid_unsafe_path',
-        ]);
-        const candidatePolicyFailure = Array.isArray(testDelta.reasonCodes) &&
-          testDelta.reasonCodes.some((reason) => policyReasons.has(reason));
-        if (!candidatePolicyFailure) {
-          return { evidence: [], cleanup: [], operationalFailure: { code: 'evidence_authority_mismatch' } };
-        }
-        return {
-          tests: { execution: 'not_run', outcome: 'unknown', stability: 'unknown', complete: false, trusted: false, failureFingerprints: [] },
-          regressionProof: { required: proofRequirement.required, status: proofRequirement.required ? 'unavailable' : 'not_applicable', repairable: false, evidenceIds: [], witnessIds: [], reasonCodes: ['policy_failure'] },
-          evidence: [], cleanup: [], operationalFailure: null,
-          scope: { flagged: true, reasonCount: testDelta.reasonCodes.length, omittedReasonCount: 0, changedFileCount: stored.delta.entries.length },
-        };
-      }
-      const evidenceRunner = deps.runCandidateEvidence ?? runCandidateEvidence;
-      progress('tests', Number(attemptId.slice(-3)), identity('worker', attemptId));
-      const evidence = await stage(label('candidate evidence'), () => evidenceRunner({
-        runId, laneId, attemptId, baseline,
-        candidate: { ...sealed }, frozenTestPlan, proofRequirement, testDelta,
-        deadlineAt, testQueue, cache: evidenceCache,
-      }, {
-        sourceWorktree: laneWorktree,
-        stateRoot,
-        createRevisionWorktree: deps.createRevisionWorktree ?? defaultCreateRevisionWorktree,
-        revisionIdentity,
-        // ★ S1 신고의 관측 지점. 자식이 실제로 떴는지를 아는 곳은 여기 하나뿐이다 — 레인 요약도
-        //   attempt 기록도 이 사실을 안 들고 나온다. 어느 레인의 어느 시도였든 한 번이라도
-        //   돌았으면 런 전체가 신고 대상이다.
-        runFrozenTests: async (...args) => {
-          const record = await (deps.runFrozenTests ?? defaultRunFrozenTests)(...args);
-          if (record?.ranWithUserPrivilege === true) privateFacts.userPrivilegeObserved = true;
-          return record;
-        },
-        removeWorktree: deps.removeWorktree ?? defaultRemoveWorktree,
-        killTrackedChildren: deps.killTrackedChildren,
-        checkFrozenEnvironment: deps.checkFrozenEnvironment,
-        selectTestDeltaWitnesses: deps.selectTestDeltaWitnesses,
-        onSpawn: (child, evidenceAuthority) => onSpawn(child, preparation.candidateCount === 1
-          ? { ...evidenceAuthority }
-          : {
-              ...evidenceAuthority,
-              laneId,
-              attemptId,
-              role: 'tests',
-              reportIdentity: true,
-              ownerWorktreePath: laneWorktree.path,
-            }),
-        now,
-        persistEvidence: (value, authority) => {
-          if (isStoreAuthorityLost()) return Promise.resolve(poisonedArtifactResult());
-          const onAbort = () => poisonArtifactStore('evidence_store_authority_lost', { authorityLost: true, laneId });
-          if (authority?.signal?.aborted === true) onAbort();
-          else authority?.signal?.addEventListener?.('abort', onAbort, { once: true });
-          let pending;
-          try {
-            pending = Promise.resolve(writeEvidence(artifactStore, value, authority));
-          } catch (error) {
-            authority?.signal?.removeEventListener?.('abort', onAbort);
-            throw error;
-          }
-          return pending.then((rawResult) => {
-            const recordBytes = Buffer.from(`${JSON.stringify(value.record, null, 2)}\n`, 'utf8');
-            const expectedPath = join(
-              artifactPaths.runDir,
-              'evidence',
-              `${laneId}-${String(value.attemptOrdinal).padStart(3, '0')}-${String(value.evidenceOrdinal).padStart(3, '0')}.json`,
-            );
-            const settlement = classifyWriterResult(rawResult, {
-              kind: 'evidence', candidateId: laneId, path: expectedPath,
-              bytes: recordBytes.length, sha256: qualityHash(recordBytes),
-            });
-            const accepted = acceptWriterResult(settlement);
-            const result = accepted ? settlement.result : settlement.kind === 'success'
-              ? unknownArtifactSettlement() : settlement.result;
-            if (settlement.kind === 'success' && !accepted) poisonArtifactStore('artifact_store_authority_lost', {
-              laneId, authorityLost: true,
-            });
-            if (settlement.kind === 'unknown') poisonArtifactStore('artifact_store_authority_lost', {
-              laneId, authorityLost: true,
-            });
-            const authorityLost = artifactAuthorityLost(result);
-            if (authorityLost) poisonArtifactStore(
-              preparation.candidateCount === 1 ? 'artifact_store_authority_lost' : result.error, {
-                laneId, authorityLost: true, deadlineLost: result?.hardStopped === true,
-              },
-            );
-            else if (preparation.candidateCount === 2 && isBlocked(result)) {
-              poisonArtifactStore('evidence_persistence_failed', { laneId });
-            }
-            else if (!isBlocked(result) && settlement.kind !== 'success') return unknownArtifactSettlement();
-            setLatestManifestRef(result?.manifestRef);
-            if (!isBlocked(result) && typeof result?.ref?.path === 'string') {
-              const projection = contentEvidenceRef(value.record, result.ref.path, { attemptId, expectedPath });
-              if (projection !== null) contentEvidenceRefs.set(projection.evidenceId, projection);
-              else contentEvidenceOmissions.count += 1;
-            }
-            return result;
-          }).catch(() => {
-            poisonArtifactStore('artifact_store_authority_lost', { authorityLost: true, laneId });
-            return { blocked: true, error: 'artifact_store_authority_lost' };
-          }).finally(() => authority?.signal?.removeEventListener?.('abort', onAbort));
-        },
-        handoffEvidenceCleanup: async ({ path }) =>
-          handoffWorktree(path, label('producer evidence worktree handoff')),
-        runnerDeps: deps.testRunnerDeps,
-      }), { mayTouchWorktree: true, worktreePath: laneWorktree.path });
-      if (evidence?.hardStopped === true) poisonArtifactStore('evidence_controller_authority_lost', {
-        authorityLost: true, deadlineLost: true, laneId,
-      });
-      // S1 신고의 두 번째 관측 지점. `runFrozenTests` 래퍼가 정확한 신호이지만 증거 러너를 통째로
-      // 갈아끼우는 경로에서는 그 래퍼가 안 불린다. 분류값이 **모호하지 않게** 실행을 말할 때도
-      // 신고한다 — `aborted` 는 스폰 전/후를 구분 못 하므로 여기 넣지 않는다.
-      if (RAN_WITH_USER_PRIVILEGE_EXECUTIONS.has(evidence?.tests?.execution)) {
-        privateFacts.userPrivilegeObserved = true;
-      }
-      evidenceByAttempt.set(attemptId, qualityClone(evidence?.evidence ?? []));
-      return {
-        ...evidence,
-        scope: { flagged: false, reasonCount: 0, omittedReasonCount: 0, changedFileCount: stored.delta.entries.length },
-      };
-    },
-    callVerifier: async ({ expected, feedback, formatCorrection, machineEvidence }) => {
-      let result;
-      const beforeStatus = await stage(label('verifier status before'), () =>
-        (deps.statusSnapshot ?? defaultStatusSnapshot)(laneWorktree)).catch(() => null);
-      const beforeIgnored = await stage(label('verifier ignored before'), () =>
-        listIgnoredPaths(laneWorktree)).catch(() => null);
-      try {
-        result = await callProvider({
-          provider: providers.verifier,
-          binding: laneBinding.verifier,
-          kind: formatCorrection ? 'verifier_format' : 'verifier',
-          laneId,
-          attemptId: expected.attemptId,
-          instruction: verifierInstruction({
-            task,
-            plan,
-            files: attemptDeltas.get(expected.attemptId)?.files ?? [],
-            tests: describeMachineEvidence(machineEvidence),
-            expected,
-            feedback,
-            formatOnly: formatCorrection,
-          }),
-          workspace: laneWorktree.path,
-          tools: [...VERIFIER_TOOLS],
-        });
-      } catch (error) {
-        return { operationalFailure: true, callStarted: error?.preBoundary !== true, raw: null, usage: { promptTokens: null, evalTokens: null }, touchedSources: [], mutationCheck: { clean: false } };
-      }
-      if (qualityProviderFailure(result) || result?.hardStopped === true || result?.truncated === true ||
-          result?.doneReason === 'timeout' || result?.doneReason === 'aborted') {
-        return { operationalFailure: true, callStarted: true, raw: null, usage: { promptTokens: result?.promptTokens, evalTokens: result?.evalTokens }, touchedSources: [], mutationCheck: { clean: false } };
-      }
-      const afterStatus = await stage(label('verifier status after'), () =>
-        (deps.statusSnapshot ?? defaultStatusSnapshot)(laneWorktree)).catch(() => null);
-      const afterIgnored = await stage(label('verifier ignored after'), () =>
-        listIgnoredPaths(laneWorktree)).catch(() => null);
-      // ★★ 「스냅샷을 못 찍었다」와 「verifier 가 트리를 바꿨다」는 **다른 사실**이다. 하나의
-      //   `clean:false` 로 뭉치면 일시적인 git 실패(잠긴 인덱스 등)가 변조 판정으로 나가고,
-      //   그 lane 은 rejected/disputed 로 끝난다 — 설계 §4 불변식 7 이 금지한 「인프라 실패가
-      //   semantic FAIL 로 위장」이다. 가용성을 따로 실어 lane 이 blocked 로 보내게 한다.
-      const available = beforeStatus?.ok === true && afterStatus?.ok === true &&
-        Array.isArray(beforeIgnored) && Array.isArray(afterIgnored);
-      const clean = available &&
-        JSON.stringify(beforeStatus) === JSON.stringify(afterStatus) &&
-        JSON.stringify(beforeIgnored) === JSON.stringify(afterIgnored);
-      return {
-        raw: { content: result?.content ?? '', truncated: result?.truncated === true },
-        usage: { promptTokens: result?.promptTokens, evalTokens: result?.evalTokens },
-        touchedSources: [],
-        mutationCheck: { clean, available },
-      };
-    },
-    writeAttemptArtifact: async (record) => {
-      if (isStoreAuthorityLost()) return poisonedArtifactResult();
-      const recordBytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`, 'utf8');
-      const rawResult = await stage(label('attempt artifact'), () =>
-        writeAttempt(artifactStore, { laneId, ordinal: record.ordinal, record })).catch(() => {
-        poisonArtifactStore('artifact_store_authority_lost', { authorityLost: true, laneId });
-        return { blocked: true, error: 'artifact_store_authority_lost' };
-      });
-      const settlement = classifyWriterResult(rawResult, {
-        kind: 'attempt', candidateId: laneId,
-        path: join(artifactPaths.runDir, 'attempts', `${laneId}-${String(record.ordinal).padStart(3, '0')}.json`),
-        bytes: recordBytes.length, sha256: qualityHash(recordBytes),
-      });
-      const accepted = acceptWriterResult(settlement);
-      const result = accepted ? settlement.result : settlement.kind === 'success'
-        ? unknownArtifactSettlement() : settlement.result;
-      if (settlement.kind === 'success' && !accepted) poisonArtifactStore('artifact_store_authority_lost', {
-        authorityLost: true, laneId,
-      });
-      if (settlement.kind === 'unknown') poisonArtifactStore('artifact_store_authority_lost', {
-        authorityLost: true, laneId,
-      });
-      if (artifactAuthorityLost(result)) poisonArtifactStore(
-        preparation.candidateCount === 1 ? 'artifact_store_authority_lost' : result?.error ?? 'artifact_store_authority_lost', {
-          authorityLost: true, deadlineLost: result?.hardStopped === true, laneId,
-        },
-      );
-      else if (preparation.candidateCount === 2 && isBlocked(result)) poisonArtifactStore('attempt_artifact_failed', { laneId });
-      setLatestManifestRef(result?.manifestRef);
-      if (!isBlocked(result) && typeof result?.ref?.path === 'string') {
-        attemptArtifactRefs.set(record.attemptId, result.ref.path);
-      }
-      return result;
-    },
-    persistCandidatePatch: async ({ sourceAttemptId, sealed }) => {
-      const bytes = privatePatches.get(sourceAttemptId);
-      if (!Buffer.isBuffer(bytes) || qualityHash(bytes) !== sealed.patchSha256) return { blocked: true };
-      if (isStoreAuthorityLost()) return poisonedArtifactResult();
-      const rawWritten = await recoveryStage(label('candidate artifact'), () =>
-        writeCandidate(artifactStore, { laneId, sourceAttemptId, patch: bytes })).catch(() => {
-        poisonArtifactStore('artifact_store_authority_lost', { authorityLost: true, laneId });
-        return { blocked: true, error: 'artifact_store_authority_lost' };
-      });
-      const settlement = classifyWriterResult(rawWritten, {
-        kind: 'candidate', candidateId: laneId, path: artifactPaths.candidatePaths[laneId],
-        bytes: bytes.length, sha256: qualityHash(bytes),
-      });
-      const accepted = acceptWriterResult(settlement);
-      const written = accepted ? settlement.result : settlement.kind === 'success'
-        ? unknownArtifactSettlement() : settlement.result;
-      if (settlement.kind === 'success' && !accepted) poisonArtifactStore('artifact_store_authority_lost', {
-        authorityLost: true, laneId,
-      });
-      if (settlement.kind === 'unknown') poisonArtifactStore('artifact_store_authority_lost', {
-        authorityLost: true, laneId,
-      });
-      if (artifactAuthorityLost(written)) poisonArtifactStore(
-        preparation.candidateCount === 1 ? 'artifact_store_authority_lost' : written?.error ?? 'artifact_store_authority_lost', {
-          authorityLost: true, deadlineLost: written?.hardStopped === true, laneId,
-        },
-      );
-      else if (preparation.candidateCount === 2 && isBlocked(written)) poisonArtifactStore('candidate_artifact_failed', { laneId });
-      if (isBlocked(written)) return written;
-      if (settlement.kind !== 'success') return unknownArtifactSettlement();
-      setLatestManifestRef(written?.manifestRef);
-      if (judgeViewProjector === null) privatePatches.clear();
-      return {
-        sourceAttemptId,
-        ref: written.ref,
-        empty: bytes.length === 0,
-        files: attemptDeltas.get(sourceAttemptId)?.files ?? [],
-      };
-    },
-    quarantineWorktree: async (value) => {
-      let quarantineHardStopped = false;
-      if (typeof deps.quarantineWorktree === 'function') {
-        const quarantined = await recoveryStage(label('authoring worktree quarantine'), () =>
-          deps.quarantineWorktree(value)).catch(() => false);
-        const hardStopped = ownDataValue(quarantined, 'hardStopped');
-        quarantineHardStopped = hardStopped.ok !== true || hardStopped.value !== false;
-      }
-      await killLiveChildren(laneWorktree.path);
-      if (quarantineHardStopped) return false;
-      return handoffWorktree(laneWorktree.path, label('quarantined worktree handoff'));
-    },
-    handoffEvidenceCleanup: async ({ path }) => handoffWorktree(path, label('evidence worktree handoff')),
-    ...(judgeViewProjector === null ? {} : {
-      buildJudgeView: ({ candidate, sourceAttemptId, finalLedger }) => {
-        const bytes = privatePatches.get(sourceAttemptId);
-        const delta = attemptDeltas.get(sourceAttemptId)?.delta;
-        const evidence = evidenceByAttempt.get(sourceAttemptId);
-        if (!Buffer.isBuffer(bytes) || !Array.isArray(delta?.entries) || !Array.isArray(evidence)) return null;
-        try {
-          const views = judgeViewProjector({
-            candidate,
-            privateFacts: {
-              patchBytes: Buffer.from(bytes),
-              deltaEntries: qualityClone(delta.entries),
-              persistedEvidence: qualityClone(evidence),
-              finalLedger,
-            },
-          });
-          if (!Array.isArray(views) || views.length !== 2 || views.some((view) => view === null)) return null;
-          privateFacts.judgeViews = qualityFreeze([...views]);
-          return views[0];
-        } finally {
-          privatePatches.delete(sourceAttemptId);
-          attemptDeltas.delete(sourceAttemptId);
-          evidenceByAttempt.delete(sourceAttemptId);
-        }
-      },
-    }),
-  };
-}
-
-/**
- * Freeze what this Run actually chose, and whether that choice is attributable.
- *
- * ★ Only the coordinator can answer "was this a real choice?".  A terminal
- *   candidate summary shows the binding that ran but not why: it cannot tell a
- *   caller's role pin from a bandit draw, cannot see that `single` was never an
- *   offered arm, and cannot know the registry order the placement arm mapped
- *   onto.  `learn/policy-v2.mjs` therefore never reconstructs this — it only
- *   narrows what we assert here with facts it can check itself.
- *
- * ★ `arm` is the arm that **ran**, not the arm that was sampled.  c2 runs both
- *   placements mirrored and always cross-verifies, so its mix arm is `mix` even
- *   when the bandit had sampled `single` and the coordinator ignored it.
- *   Recording the sampled value would reward an arm no provider ever executed.
- */
-/**
- * Did the tier arms actually name different runs?
- *
- * ★★ With no `settings.ini` — the out-of-box state — `resolveTier` returns the same
- *   `{ model: null, effort: null }` for **every** arm, so both arms spawn the identical CLI at
- *   identical effort.  The arm is then a label with nothing behind it, and rewarding it writes an
- *   observation about a distinction that never existed.  This file already refuses that three times
- *   over (`assignRoles` for `single` placement, §14.2 for c2 placement, `single_arm_not_offered`
- *   for mix); `learn/policy-v2.mjs` states the rule outright — what was never a choice stays out of
- *   both maps.  Tier was simply the axis nobody applied it to.
- *
- * ★ One configured tier is enough to make the axis real: `strong` resolves to that model while
- *   `fast` stays the CLI's own default.  So this asks whether the arms **differ**, not whether the
- *   user configured all of them.
- *
- * ★ Why it matters later rather than now: while the arms are identical every draw is free.  The
- *   counterfeit observations only bite once the owner runs `orch_config`, and design §7.6's decay
- *   was never built, so nothing washes them out.
- */
-function tierArmsDistinguishable(settings, participants) {
-  const vendors = [...new Set(participants.filter((provider) => provider != null).map((provider) => provider.id))];
-  return vendors.some((vendorId) => {
-    const resolved = AXES.tier.arms.map((arm) => {
-      const value = resolveTier(settings, vendorId, arm);
-      return JSON.stringify([value?.model ?? null, value?.effort ?? null]);
-    });
-    return resolved.some((value) => value !== resolved[0]);
-  });
-}
-
-function freezeEffectiveChoices({ candidateCount, providers, decisions, tier, writerProvider, verifierProvider, runOptions, settings }) {
-  // c2 refuses placement but still rewards tier, so the no-op guard belongs on both branches.
-  const tierReal = tierArmsDistinguishable(settings, [writerProvider, verifierProvider]);
-  if (candidateCount === 2) {
-    return qualityFreeze({
-      // Two mirrored lanes are exactly the cross-verified mix; §14.2 refuses
-      // placement because both arms ran and neither produced the result alone.
-      mix: { arm: 'mix', identifiable: true, reason: 'mirrored_cross_verification' },
-      placement: { arm: null, identifiable: false, reason: 'mirrored_two_lane_placement' },
-      tier: {
-        arm: tier,
-        identifiable: tierReal,
-        reason: tierReal ? 'actual_run_tier' : 'tier_not_distinguishable',
-      },
-    });
-  }
-  const rolePinned = runOptions.worker != null || runOptions.verifier != null;
-  const expected = assignRoles(providers, decisions);
-  // "The actual binding equals the recorded arm" is checked against the same
-  // mapping the Run used, not re-derived from provider ids by hand.
-  const bindingMatchesArm = providers.length >= 2 &&
-    writerProvider.id === expected.worker.id && verifierProvider.id === expected.verifier.id;
-  const actualMixArm = writerProvider.id === verifierProvider.id ? 'single' : 'mix';
-  const singleWasOffered = runOptions.allowSingle === true;
-  return qualityFreeze({
-    mix: {
-      arm: actualMixArm,
-      identifiable: !rolePinned && singleWasOffered && bindingMatchesArm && actualMixArm === decisions.mix,
-      reason: rolePinned ? 'role_pin'
-        : !singleWasOffered ? 'single_arm_not_offered'
-        : !bindingMatchesArm ? 'provider_shortage'
-        : actualMixArm !== decisions.mix ? 'arm_not_executed'
-        : 'actual_single_lane_binding',
-    },
-    placement: {
-      arm: decisions.placement,
-      identifiable: !rolePinned && bindingMatchesArm,
-      reason: rolePinned ? 'role_pin' : bindingMatchesArm ? 'actual_single_lane_binding' : 'provider_shortage',
-    },
-    tier: {
-      arm: tier,
-      identifiable: !rolePinned && tierReal,
-      reason: rolePinned ? 'role_pin' : tierReal ? 'actual_run_tier' : 'tier_not_distinguishable',
-    },
-  });
-}
-
-/**
- * The single c1/c2 learning seam: exactly one WAL transaction per Run.
- *
- * ★ Called after selection and the winner alias attempt are durable, and
- *   **before cleanup**.  Cleanup can only remove a worktree the Run no longer
- *   needs; it cannot make a verified patch unverified, so it must never change
- *   the grade (plan Task 12: a later cleanup failure preserves the semantic
- *   status and adds only a notice).  Committing first also means a crash during
- *   cleanup keeps the learning we already earned.
- *
- * ★ Every path that reaches durable selection commits exactly once, including
- *   the alias failure — that Run is graded `null` by the neutralizing stop
- *   reason but still deserves a row, otherwise its `run_id` names nothing a
- *   person could correct later.  Paths that fail *before* durable selection
- *   journal nothing at all.
- *
- * Learning failure stays a notice; it never changes the Run's envelope.
- */
-async function commitRunLearning(input) {
-  const {
-    deps, stage, stateRoot, runId, taskClass, decisions, candidateCount,
-    stopReason, selection, candidates, effectiveChoices, attemptRefs, artifactRefs,
-  } = input;
-  // The reducer consumes the terminal summaries themselves — it reads only the
-  // fields it whitelists — but the journal below stores a *bounded* selection.
-  // A full `Selection` carries judge rationale, and provider prose must never
-  // reach durable learning state.
-  const learningInput = qualityFreeze({
-    policyVersion: 2,
-    candidateCount,
-    selection,
-    candidates,
-    stopReason,
-    effectiveChoices,
-  });
-  try { deps.onRunLearningInput?.(learningInput); } catch { /* observation only */ }
-  const outcome = computeRunLearningOutcome(learningInput);
-  const journalSelection = { outcome: selection.outcome, selectedCandidateId: selection.selectedCandidateId };
-  const appliedAxes = Object.keys(outcome.appliedChoices);
-  const rewardableAxes = Object.keys(outcome.rewardableChoices);
-  const deltas = gradeToDeltas(outcome.grade);
-  // One axis, one cell, one delta — the WAL refuses a repeated cellKey, so a
-  // double-counted Run cannot reach the posterior even by accident.
-  const updates = deltas === null ? [] : appliedAxes.map((axis) => ({
-    cellKey: cellKeyOf(taskClass, axis), arm: outcome.appliedChoices[axis], ...deltas,
-  }));
-  const attempted = updates.length > 0;
-  const stored = await stage('학습 트랜잭션 기록', () =>
-    (deps.commitLearningMutation ?? defaultCommitLearningMutation)(stateRoot, {
-      updates,
-      journal: {
-        runId,
-        taskClass,
-        decisions,
-        outcome: { grade: outcome.grade, stopReason },
-        appliedGrade: attempted ? outcome.grade : null,
-        appliedAxes: attempted ? appliedAxes : [],
-        rewardableAxes,
-        policyVersion: 2,
-        candidateCount,
-        attemptRefs,
-        artifactRefs,
-        selection: journalSelection,
-        effectiveChoices,
-        appliedChoices: attempted ? outcome.appliedChoices : {},
-        rewardableChoices: outcome.rewardableChoices,
-      },
-    }, deps.learningOperationOptions)).catch(() => null);
-  // ★★ 무엇이 **실제로 반영됐는지**는 저장 결과가 정한다. `commitLearningMutation` 의 평범한
-  //   실패는 던지는 것도 `blocked` 도 아닌 `{ ok: false, reason }` 이다(잠금 경합·못 읽는
-  //   사후분포·WAL 실패). 그 모양을 성공으로 읽으면 사후분포에도 저널에도 한 글자가 안 들어간
-  //   실행이 본문에 `applied.grade` 를 적어 내보내고, 사용자가 그 runId 로 정정하려 하면
-  //   저널에서 찾지 못한다. `pending: true` 도 「아직 완료되지 않았다」이므로 같은 답이다.
-  const durable = stored?.ok === true;
-  return qualityFreeze({
-    outcome,
-    applied: attempted && durable,
-    appliedAxes: attempted && durable ? appliedAxes : [],
-    grade: attempted && durable ? outcome.grade : null,
-    notices: durable ? [] : ['학습 기록을 완료하지 못했습니다.'],
-  });
-}
-
-/**
- * Canonical artifact ref order: manifest, then each lane's candidate patch in
- * lane order, then the winner alias.  Fixing the order keeps two deterministic
- * Runs journalling byte-identical rows.
- */
-function learningArtifactRefs({ manifestRef, candidates, winnerRef }) {
-  const refs = [];
-  if (manifestRef) refs.push(manifestRef);
-  for (const candidate of candidates) {
-    if (candidate.patch?.ref) refs.push(candidate.patch.ref);
-  }
-  if (winnerRef) refs.push(winnerRef);
-  return refs;
-}
-
-/** Logical attempt IDs in lane order, then ordinal order. Never attempt bodies. */
-const learningAttemptRefs = (candidates) =>
-  candidates.flatMap((candidate) => candidate.attempts.map((attempt) => attempt.attemptId));
-
-async function orchestrateFinalC1(context) {
-  const preparation = await prepareRunNamespace(context, context.deps);
-  if (preparation.ok !== true) return preparation.envelope;
-  const {
-    runId, stateRoot, deadlineAt, frozenTestPlan, baseline, laneWorktree, proofRequirement,
-    plannerBinding, laneBinding, plan, artifactStore, testQueue, evidenceCache, usageAccumulator,
-  } = preparation;
-  const {
-    taskClass, decisions, decisionSources, plannerProvider, writerProvider, verifierProvider,
-    plannerNotices, callProvider, pathBudget, progress, effectiveChoices,
-  } = PREPARATION_PRIVATE.get(preparation);
-  const {
-    options, deps, task, budget, deadline, effectiveWaitMs, now, stage, recoveryStage, onSpawn,
-    killLiveChildren, isWorktreeEffectUnknown,
-  } = context;
-  const handoffWorktree = async (path, label = 'worktree handoff') => {
-    const result = await recoveryStage(label, () =>
-      (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: path })).catch(() => false);
-    return result === true;
-  };
-  const sweepSummaries = preparation.sweepNotice === null ? [] : [preparation.sweepNotice.replace(/^retention /, '')];
-  const writeAttempt = deps.writeAttemptArtifact ?? writeAttemptArtifact;
-  const writeEvidence = deps.writeEvidenceArtifact ?? writeEvidenceArtifact;
-  const writeCandidate = deps.writeCandidatePatch ?? writeCandidatePatch;
-  const checkpointRaw = deps.checkpointManifest ?? checkpointManifest;
-  let artifactStorePoison = null;
-  let latestManifestRef = null;
-  const poisonArtifactStore = (reason) => {
-    if (artifactStorePoison === null) artifactStorePoison = reason;
-  };
-  const poisonedArtifactResult = () => ({ blocked: true, error: artifactStorePoison ?? 'artifact_store_authority_lost' });
-  const checkpoint = async (store, event) => {
-    if (artifactStorePoison !== null) return poisonedArtifactResult();
-    const rawResult = await stage(`manifest ${event.type}`, () => checkpointRaw(store, event))
-      .catch(() => ({ blocked: true, error: 'manifest_checkpoint_failed' }));
-    const settlement = classifyArtifactSettlement(rawResult, {
-      kind: 'checkpoint', authority: preparation.manifestAuthority,
-    });
-    const result = settlement.result;
-    if (settlement.kind === 'success' && !acceptArtifactRevision(result, preparation.artifactRevisionAuthority)) {
-      poisonArtifactStore('artifact_store_authority_lost');
-      return unknownArtifactSettlement();
-    }
-    if (settlement.kind === 'unknown' || result?.hardStopped === true) poisonArtifactStore('artifact_store_authority_lost');
-    else if (isBlocked(result)) poisonArtifactStore(result?.error ?? 'manifest_checkpoint_failed');
-    if (result?.manifestRef) latestManifestRef = result.manifestRef;
-    return result;
-  };
-  const artifactAuthority = {
-    checkpoint,
-    artifactStorePoison: () => artifactStorePoison,
-    isStoreAuthorityLost: () => artifactStorePoison !== null,
-    poisonedArtifactResult,
-    poisonArtifactStore,
-    handoffWorktree,
-    setLatestManifestRef: (value) => { if (value) latestManifestRef = value; },
-    writeAttempt,
-    writeEvidence,
-    writeCandidate,
-  };
-  const laneResult = await runPreparedLane({ preparation, laneIndex: 0, context, artifactAuthority });
-  const candidate = laneResult.candidate;
-
-  if (artifactStorePoison !== null) {
-    await killLiveChildren();
-    await handoffWorktree(laneWorktree.path, 'poisoned artifact worktree handoff');
-    return artifactBlocked(runId, artifactStorePoison, laneWorktree.path);
-  }
-
-  if (deadline?.aborted !== true && (candidate.recovery !== null || ['allocation_checkpoint_failed', 'attempt_artifact_failed', 'candidate_artifact_failed', 'snapshot_failed', 'seal_failed'].includes(candidate.stopReason))) {
-    await handoffWorktree(laneWorktree.path, 'candidate failure worktree handoff');
-    return artifactBlocked(runId, candidate.stopReason, laneWorktree.path);
-  }
-
-  const candidateRef = candidateRefFromSummary(candidate);
-  const expectedCandidatePath = pathBudget.paths?.candidatePaths?.['lane-a'];
-  if (candidate.patch !== null && candidate.patch.ref?.path !== expectedCandidatePath) {
-    await handoffWorktree(laneWorktree.path, 'candidate path worktree handoff');
-    return artifactBlocked(runId, 'candidate_path_authority_mismatch', laneWorktree.path);
-  }
-  const candidateCheckpoint = await checkpoint(artifactStore, { eventId: 'candidate:lane-a:recorded', type: 'candidate_recorded', value: candidateRef });
-  if (isBlocked(candidateCheckpoint)) {
-    await handoffWorktree(laneWorktree.path, 'candidate checkpoint worktree handoff');
-    if (deadline?.aborted === true || candidateCheckpoint?.hardStopped === true) {
-      return failure({ status: 'deadline_exceeded', confidence: 'unverified', runId, stopReason: 'deadline_exceeded', error: `데드라인(${effectiveWaitMs}ms)이 지났습니다.`, recovery: laneWorktree.path });
-    }
-    return artifactBlocked(runId, 'candidate_manifest_failed', laneWorktree.path);
-  }
-  const issuesCheckpoint = await checkpoint(artifactStore, { eventId: 'issues:lane-a:recorded', type: 'issues_recorded', value: { candidateId: 'lane-a', openIssueIds: candidate.issues.openIds, openIssueCount: candidate.issues.count, limitExceeded: candidate.issues.limitExceeded } });
-  if (isBlocked(issuesCheckpoint)) {
-    await handoffWorktree(laneWorktree.path, 'issues checkpoint worktree handoff');
-    return artifactBlocked(runId, 'candidate_manifest_failed', laneWorktree.path);
-  }
-  const selection = selectSingleCandidate(candidate);
-  const usage = usageAccumulator.finalize();
-  const usageCheckpoint = await checkpoint(artifactStore, { eventId: 'usage:run:final', type: 'usage_recorded', value: usage });
-  if (isBlocked(usageCheckpoint)) {
-    await handoffWorktree(laneWorktree.path, 'usage checkpoint worktree handoff');
-    return artifactBlocked(runId, 'selection_manifest_failed', laneWorktree.path);
-  }
-  const selectionCheckpoint = await checkpoint(artifactStore, { eventId: 'selection:run:recorded', type: 'selection_recorded', value: selection });
-  if (isBlocked(selectionCheckpoint)) {
-    await handoffWorktree(laneWorktree.path, 'selection checkpoint worktree handoff');
-    return artifactBlocked(runId, 'selection_manifest_failed', laneWorktree.path);
-  }
-  // Selection is durable from here on, so every remaining exit journals exactly
-  // one row.  Nothing above this line may journal at all.
-  const learn = (stopReason, winnerRef) => commitRunLearning({
-    deps, stage, stateRoot, runId, taskClass, decisions, candidateCount: 1,
-    stopReason, selection, candidates: [candidate], effectiveChoices,
-    attemptRefs: learningAttemptRefs([candidate]),
-    artifactRefs: learningArtifactRefs({ manifestRef: latestManifestRef, candidates: [candidate], winnerRef }),
-  });
-  let winner = null;
-  if (selection.outcome === 'winner') {
-    const rawWinner = await recoveryStage('winner alias', () =>
-      (deps.writeWinnerAlias ?? writeWinnerAlias)(artifactStore, { candidateId: 'lane-a' }))
-      .catch(() => ({ blocked: true }));
-    const candidatePatchRef = candidate.patch?.ref;
-    const settlement = classifyArtifactSettlement(rawWinner, {
-      kind: 'writer',
-      authority: {
-        writer: {
-          kind: 'winner', candidateId: 'lane-a', path: pathBudget.paths?.winnerAliasPath,
-          bytes: candidatePatchRef?.bytes, sha256: candidatePatchRef?.sha256,
-        },
-        manifest: preparation.manifestAuthority,
-      },
-    });
-    winner = settlement.kind === 'success' && !acceptArtifactRevision(settlement.result, preparation.artifactRevisionAuthority)
-      ? unknownArtifactSettlement() : settlement.result;
-    if (settlement.kind === 'success' && winner !== settlement.result) poisonArtifactStore('artifact_store_authority_lost');
-    if (settlement.kind === 'unknown' || winner?.hardStopped === true) poisonArtifactStore('artifact_store_authority_lost');
-    const winnerRef = winner?.ref;
-    const expectedWinnerPath = pathBudget.paths?.winnerAliasPath;
-    if (isBlocked(winner) || winner?.ok !== true || winnerRef?.kind !== 'winner' ||
-        winnerRef?.candidateId !== 'lane-a' || winnerRef?.path !== expectedWinnerPath ||
-        winnerRef.path === candidatePatchRef?.path || winnerRef?.sha256 !== candidatePatchRef?.sha256 ||
-        winnerRef?.bytes !== candidatePatchRef?.bytes || !Number.isSafeInteger(winnerRef?.bytes) || winnerRef.bytes <= 0 ||
-        !Number.isSafeInteger(winnerRef?.expiresAt) || winnerRef.expiresAt <= 0) {
-      // Selection is already durable, so this Run owns a journal row even though
-      // it returns blocked: `winner_alias_failed` grades it neutral, and the
-      // refs we record are the last ones we actually proved.
-      await learn('winner_alias_failed', null);
-      await handoffWorktree(laneWorktree.path, 'winner failure worktree handoff');
-      return artifactBlocked(runId, 'winner_alias_failed', laneWorktree.path);
-    }
-    if (winner?.manifestRef) latestManifestRef = winner.manifestRef;
-  }
-
-  const selected = selection.outcome === 'winner';
-  // The learning row records the terminal stop as it stood when the grade was
-  // decided.  The envelope re-reads the deadline after cleanup below, so a
-  // deadline that fires during storage still surfaces to the caller without
-  // retroactively rewriting what we learned.
-  const learning = await learn(
-    deadline?.aborted === true && !selected ? 'deadline_exceeded' : candidate.stopReason,
-    winner?.ref ?? null,
-  );
-  let cleanup = { removed: false, unregistered: false, tracked: false };
-  const cleanupNotices = [];
-  const preserveAuthoring = candidate.terminalClass === 'blocked' || candidate.recovery !== null || isWorktreeEffectUnknown?.() === true;
-  const childrenProven = await killLiveChildren();
-  const removal = childrenProven === true && !preserveAuthoring
-    ? snapshotRemovalResult(await stage('authoring cleanup', () =>
-      (deps.removeWorktree ?? defaultRemoveWorktree)(laneWorktree)).catch(() => null))
-    : UNPROVEN_REMOVAL;
-  if (childrenProven === true && removal.ok === true && removal.removed === true && removal.unregistered === true) {
-    cleanup = { removed: true, unregistered: true, tracked: false };
-  } else {
-    const physicalRemoved = removal.ok === true && removal.removed === true;
-    const unregistered = removal.ok === true &&
-      (removal.unregistered === true || removal.unregistered === false || removal.unregistered === null)
-      ? removal.unregistered : false;
-    const tracked = await recoveryStage('authoring cleanup handoff', () =>
-      (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: laneWorktree.path })).catch(() => false);
-    cleanup = { removed: physicalRemoved, unregistered, tracked: tracked === true };
-    if (tracked !== true) cleanupNotices.push(`manual cleanup required: ${laneWorktree.path}`);
-  }
-  const cleanupValue = {
-    kind: 'authoring', candidateId: 'lane-a', attemptId: null, path: laneWorktree.path,
-    status: cleanup.removed === true && cleanup.unregistered === true ? 'removed' : 'reaper_pending',
-    recoveryPath: cleanup.removed === true && cleanup.unregistered === true ? null : laneWorktree.path,
-  };
-  const logicalCleanupPath = `worktrees/${laneWorktree.worktreeId ?? runId}`;
-  if (cleanup.removed === true && cleanup.unregistered === true || cleanup.tracked === true) {
-    const cleanupEvent = await checkpoint(artifactStore, {
-      eventId: `cleanup:authoring:lane-a:000:${qualityHash(Buffer.from(logicalCleanupPath, 'utf8')).slice(0, 12)}`,
-      type: 'cleanup_recorded', value: cleanupValue,
-    });
-    if (isBlocked(cleanupEvent)) cleanupNotices.push('cleanup manifest pending');
-  }
-  const terminalDeadline = deadline?.aborted === true && !selected;
-  const projectionStopReason = terminalDeadline ? 'deadline_exceeded' : candidate.stopReason;
-  const issues = [contentIssue(candidate)];
-  const omittedCounts = {
-    issues: issues[0].resolvedOmittedCount,
-    attempts: 0,
-    evidence: laneResult.contentFacts.evidenceOmittedCount,
-    files: 0,
-    artifacts: 0,
-  };
-  const payload = {
-    runId, stopReason: projectionStopReason,
-    stepCount: candidate.attempts.length,
-    ...(winner?.ref ? { patch: { path: winner.ref.path, bytes: winner.ref.bytes, empty: winner.ref.bytes === 0, files: candidate.patch?.files ?? [], ignoredPaths: [], gitlinks: [] } } : {}),
-    scope: { flagged: candidate.scope.flagged, reasons: [], omitted: candidate.scope.omittedReasonCount ?? 0 },
-    worktree: { transplanted: laneWorktree.transplanted, ignoredPaths: laneWorktree.ignoredPaths, sharedRules: laneWorktree.sharedRules, cleanup },
-    blockers: candidate.terminalClass === 'blocked' ? [{ where: candidate.stopReason, error: candidate.stopReason }] : [],
-    learning: { taskClass, decisions, sources: decisionSources, applied: { grade: learning.grade, axes: learning.appliedAxes } },
-    plan: { provider: plannerProvider.id, content: '' },
-    steps: selected ? candidate.attempts.map((attempt) => ({ step: attempt.ordinal, laneId: candidate.candidateId, attemptId: attempt.attemptId, retryOf: attempt.retryOf })) : [],
-    verdict: selected ? contentVerdict(candidate) : null,
-    issues,
-    candidates: [contentCandidate(candidate)],
-    attempts: laneResult.contentFacts.attempts,
-    regressionProof: {
-      status: candidate.regressionProof.status,
-      selectedCandidateId: selected ? candidate.candidateId : null,
-      evidenceRefs: laneResult.contentFacts.evidenceRefs,
-      omittedEvidenceCount: laneResult.contentFacts.evidenceOmittedCount,
-    },
-    selection,
-    artifacts: {
-      manifestPath: latestManifestRef?.path ?? pathBudget.paths.manifestPath,
-      expiresAt: latestManifestRef?.expiresAt ?? candidate.patch?.ref?.expiresAt ?? winner?.ref?.expiresAt ?? 0,
-      candidatePaths: candidate.patch === null ? [] : [candidate.patch.ref.path],
-      omittedCount: 0,
-    },
-    omittedCounts,
-    aliasDurable: typeof winner?.ref?.path === 'string',
-    fixedFloorInput: fixedFloorInput({
-      runId, stopReason: projectionStopReason, candidateCount: 1, selection, pathBudget,
-      candidates: [candidate], issues, omittedCounts,
-    }),
-  };
-  const { content, contentFallback } = (deps.renderContentParts ?? renderContentParts)(qualityFreeze(payload));
-  const notice = joinNotices([
-    ...(sweepSummaries.length ? [`retention ${sweepSummaries.join(',')}`] : []),
-    ...plannerNotices,
-    ...(laneResult.userPrivilegeObserved === true ? [USER_PRIVILEGE_NOTE] : []),
-    ...(cleanup.tracked ? [`워크트리 정리를 리퍼에 넘겼습니다: ${laneWorktree.path}`] : []),
-    ...cleanupNotices,
-    ...learning.notices,
-  ]);
-  if (terminalDeadline) {
-    return failure({ status: 'deadline_exceeded', confidence: 'unverified', content, contentFallback, runId, stopReason: 'deadline_exceeded', error: `데드라인(${effectiveWaitMs}ms)이 지났습니다.`, recovery: candidate.recovery?.path ?? 'wait_ms를 늘려 다시 시도하세요.', ...(notice ? { notice } : {}) });
-  }
-  if (selected) {
-    const independent = laneBinding.writer.providerId !== laneBinding.verifier.providerId;
-    const cleanupRecovery = cleanup.removed === true && cleanup.unregistered === true
-      ? null : laneWorktree.path;
-    return success({ content, contentFallback, confidence: candidate.terminalClass === 'verified' && independent ? 'verified' : 'unverified', runId, stopReason: candidate.stopReason, ...(cleanupRecovery ? { recovery: cleanupRecovery } : {}), ...(notice ? { notice } : {}) });
-  }
-  return failure({ status: candidate.stopReason === 'deadline_exceeded' ? 'deadline_exceeded' : candidate.terminalClass === 'rejected' ? 'failed' : 'blocked', confidence: candidate.terminalClass === 'rejected' ? 'disputed' : 'unverified', content, contentFallback, runId, stopReason: candidate.stopReason, error: `품질 게이트를 완료하지 못했습니다: ${candidate.stopReason}`, recovery: candidate.recovery?.path ?? '새 runId로 다시 시도하세요.', ...(notice ? { notice } : {}) });
-}
-
-async function orchestrateFinalC2(context) {
-  const preparation = await prepareRunNamespace(context, context.deps);
-  if (preparation.ok !== true) return preparation.envelope;
-  const {
-    runId, stateRoot, deadlineAt, frozenTestPlan, baseline, laneWorktrees, proofRequirement,
-    laneBindings, plan, artifactStore, testQueue, evidenceCache, usageAccumulator,
-  } = preparation;
-  const {
-    taskClass, decisions, decisionSources, plannerProvider, laneProviders, judgeBindings, tier,
-    plannerNotices, callProvider, pathBudget, progress, effectiveChoices,
-  } = PREPARATION_PRIVATE.get(preparation);
-  const {
-    options, deps, task, budget, deadline, effectiveWaitMs, now, stage, recoveryStage,
-    onSpawn, killLiveChildren, isWorktreeEffectUnknown,
-  } = context;
-  const laneIds = ['lane-a', 'lane-b'];
-  const preparationNotices = [
-    ...(preparation.sweepNotice === null ? [] : [preparation.sweepNotice]),
-    ...plannerNotices,
-  ];
-  let judgePromptNonces;
-  try {
-    const nonceSource = typeof deps.judgeBlindNonce === 'function'
-      ? deps.judgeBlindNonce
-      : () => randomBytes(16).toString('hex');
-    judgePromptNonces = [1, 2].map((judgeIndex) => {
-      const value = nonceSource({ runId, judgeIndex });
-      if (!/^[0-9a-f]{32}$/.test(value ?? '')) throw new Error('invalid_judge_blind_nonce');
-      return value;
-    });
-    if (judgePromptNonces[0] === judgePromptNonces[1]) throw new Error('duplicate_judge_blind_nonce');
-  } catch {
-    const notices = [...preparationNotices];
-    for (const worktree of laneWorktrees) {
-      const childrenProven = await killLiveChildren(worktree.path);
-      const removed = childrenProven
-        ? snapshotRemovalResult(await recoveryStage('judge nonce preparation cleanup', () =>
-          (deps.removeWorktree ?? defaultRemoveWorktree)(worktree)).catch(() => null))
-        : UNPROVEN_REMOVAL;
-      if (removed.ok !== true || removed.removed !== true || removed.unregistered !== true) {
-        const tracked = await recoveryStage('judge nonce preparation handoff', () =>
-          (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: worktree.path })).catch(() => false);
-        notices.push(tracked === true
-          ? `워크트리 정리를 리퍼에 넘겼습니다: ${worktree.path}`
-          : `manual cleanup required: ${worktree.path}`);
-      }
-    }
-    return artifactBlocked(runId, 'judge_nonce_preparation_failed', laneWorktrees.map((value) => value.path).join(', '), joinNotices(notices));
-  }
-  const checkpointRaw = deps.checkpointManifest ?? checkpointManifest;
-  const writeAttempt = deps.writeAttemptArtifact ?? writeAttemptArtifact;
-  const writeEvidence = deps.writeEvidenceArtifact ?? writeEvidenceArtifact;
-  const writeCandidate = deps.writeCandidatePatch ?? writeCandidatePatch;
-  let latestManifestRef = null;
-  const runArtifactFailures = new Set();
-  const storeAuthorityFailures = new Set();
-  const affectedArtifactLanes = new Set();
-  let storeAuthorityLost = false;
-  let deadlineAuthorityLost = false;
-  const poisonArtifactStore = (reason, { authorityLost = false, deadlineLost = false, laneId = null } = {}) => {
-    const normalized = typeof reason === 'string' && reason !== '' ? reason : 'artifact_store_authority_lost';
-    runArtifactFailures.add(normalized);
-    if (laneId === 'lane-a' || laneId === 'lane-b') affectedArtifactLanes.add(laneId);
-    if (authorityLost || normalized.includes('authority_lost')) {
-      storeAuthorityLost = true;
-      storeAuthorityFailures.add(normalized);
-    }
-    if (deadlineLost) deadlineAuthorityLost = true;
-  };
-  const artifactStorePoison = () => [...runArtifactFailures].sort((left, right) =>
-    Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8')))[0] ?? null;
-  const storeAuthorityPoison = () => [...storeAuthorityFailures].sort((left, right) =>
-    Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8')))[0] ?? null;
-  const terminalArtifactPoison = () => storeAuthorityLost
-    ? storeAuthorityPoison() ?? 'artifact_store_authority_lost'
-    : artifactStorePoison();
-  const poisonedArtifactResult = () => ({ blocked: true, error: terminalArtifactPoison() ?? 'artifact_store_authority_lost' });
-  const checkpoint = async (store, event) => {
-    if (storeAuthorityLost) return poisonedArtifactResult();
-    const rawResult = await stage(`manifest ${event.type}`, () => checkpointRaw(store, event))
-      .catch(() => ({ blocked: true, error: 'manifest_checkpoint_failed' }));
-    const settlement = classifyArtifactSettlement(rawResult, {
-      kind: 'checkpoint', authority: preparation.manifestAuthority,
-    });
-    const result = settlement.result;
-    if (settlement.kind === 'success' && !acceptArtifactRevision(result, preparation.artifactRevisionAuthority)) {
-      poisonArtifactStore('artifact_store_authority_lost', {
-        authorityLost: true, laneId: event.laneId ?? event.value?.candidateId ?? null,
-      });
-      return unknownArtifactSettlement();
-    }
-    if (settlement.kind === 'unknown') poisonArtifactStore('artifact_store_authority_lost', {
-      authorityLost: true, laneId: event.laneId ?? event.value?.candidateId ?? null,
-    });
-    if (artifactAuthorityLost(result)) poisonArtifactStore(
-      result?.error ?? 'artifact_store_authority_lost', {
-        authorityLost: true,
-        deadlineLost: result?.hardStopped === true,
-        laneId: event.laneId ?? event.value?.candidateId ?? null,
-      },
-    );
-    else if (isBlocked(result) && event.type !== 'candidate_recorded' && event.type !== 'issues_recorded') {
-      poisonArtifactStore(result?.error ?? 'manifest_checkpoint_failed', {
-        laneId: event.laneId ?? event.value?.candidateId ?? null,
-      });
-    }
-    if (result?.manifestRef) latestManifestRef = result.manifestRef;
-    return result;
-  };
-  const handoffWorktree = async (path, label = 'worktree handoff') => {
-    const result = await recoveryStage(label, () =>
-      (deps.trackWorktree ?? defaultTrackWorktree)({ stateRoot, runId, worktree: path })).catch(() => false);
-    return result === true;
-  };
-
-  const artifactAuthority = {
-    checkpoint,
-    artifactStorePoison,
-    isStoreAuthorityLost: () => storeAuthorityLost,
-    poisonedArtifactResult,
-    poisonArtifactStore,
-    handoffWorktree,
-    getLatestManifestRef: () => latestManifestRef,
-    setLatestManifestRef: (value) => { if (value) latestManifestRef = value; },
-    writeAttempt,
-    writeEvidence,
-    writeCandidate,
-  };
-
-  const runLane = async (laneIndex) => {
-    const laneId = laneIds[laneIndex];
-    const laneResult = await runPreparedLane({
-      preparation,
-      laneIndex,
-      context,
-      artifactAuthority,
-      judgeViewProjector: ({ candidate: provisional, privateFacts }) => judgePromptNonces.map((blindNonce) =>
-        createJudgeView({ candidate: provisional, blindNonce, privateFacts })),
-    });
-    const candidate = laneResult.candidate;
-    let finalFailure = null;
-    if (!storeAuthorityLost && !affectedArtifactLanes.has(laneId)) {
-      const expectedCandidatePath = pathBudget.paths?.candidatePaths?.[laneId];
-      if (candidate.patch !== null && candidate.patch.ref?.path !== expectedCandidatePath) {
-        finalFailure = qualityFreeze({
-          laneId,
-          phase: 'candidate_path',
-          reason: 'candidate_path_authority_mismatch',
-        });
-      } else {
-        const candidateCheckpoint = await checkpoint(artifactStore, {
-          eventId: `candidate:${laneId}:recorded`,
-          type: 'candidate_recorded',
-          value: candidateRefFromSummary(candidate),
-        });
-        const issuesCheckpoint = isBlocked(candidateCheckpoint) ? candidateCheckpoint : await checkpoint(artifactStore, {
-          eventId: `issues:${laneId}:recorded`,
-          type: 'issues_recorded',
-          value: {
-            candidateId: laneId,
-            openIssueIds: candidate.issues.openIds,
-            openIssueCount: candidate.issues.count,
-            limitExceeded: candidate.issues.limitExceeded,
-          },
-        });
-        if (isBlocked(candidateCheckpoint) || isBlocked(issuesCheckpoint)) {
-          finalFailure = qualityFreeze({
-            laneId,
-            phase: isBlocked(candidateCheckpoint) ? 'candidate' : 'issues',
-            reason: 'candidate_manifest_failed',
-          });
-        }
-      }
-    }
-    return qualityFreeze({
-      candidate,
-      judgeViews: laneResult.judgeViews,
-      contentFacts: laneResult.contentFacts,
-      userPrivilegeObserved: laneResult.userPrivilegeObserved === true,
-      finalFailure,
-    });
-  };
-
-  const laneResults = await Promise.all([0, 1].map((index) => runLane(index)));
-  const candidates = laneResults.map(({ candidate }) => candidate);
-  const candidateRefs = candidates.map(candidateRefFromSummary);
-  const alternateCandidates = laneResults.map(({ candidate, judgeViews }) => qualityFreeze({
-    ...qualityClone(candidate),
-    judgeView: Array.isArray(judgeViews) ? judgeViews[1] : null,
-  }));
-  judgePromptNonces.fill(null);
-  const cleanupArtifactFailure = async (error, priorNotices = []) => {
-    const recoveryPaths = [];
-    const cleanupNotices = [...preparationNotices, ...priorNotices];
-    for (let index = 0; index < laneWorktrees.length; index += 1) {
-      const laneId = laneIds[index];
-      const worktree = laneWorktrees[index];
-      const childrenProven = await killLiveChildren(worktree.path);
-      const preserve = storeAuthorityLost || affectedArtifactLanes.has(laneId) ||
-        candidates[index].recovery !== null || isWorktreeEffectUnknown?.(worktree.path) === true;
-      let removed = null;
-      if (childrenProven && !preserve) {
-        removed = snapshotRemovalResult(await recoveryStage(`${laneId} artifact failure peer cleanup`, () =>
-          (deps.removeWorktree ?? defaultRemoveWorktree)(worktree)).catch(() => null));
-      }
-      removed ??= UNPROVEN_REMOVAL;
-      if (removed.ok !== true || removed.removed !== true || removed.unregistered !== true) {
-        const tracked = await handoffWorktree(worktree.path, `${laneId} artifact failure worktree handoff`);
-        recoveryPaths.push(worktree.path);
-        cleanupNotices.push(tracked
-          ? `워크트리 정리를 리퍼에 넘겼습니다: ${worktree.path}`
-          : `manual cleanup required: ${worktree.path}`);
-      }
-    }
-    const recovery = recoveryPaths.join(', ') || GENERIC_RECOVERY;
-    const notice = joinNotices(cleanupNotices);
-    return deadlineAuthorityLost
-      ? failure({
-          status: 'deadline_exceeded', confidence: 'unverified', runId,
-          stopReason: 'deadline_exceeded', error: `데드라인(${effectiveWaitMs}ms)이 지났습니다.`,
-          recovery, ...(notice ? { notice } : {}),
-        })
-      : artifactBlocked(runId, error, recovery, notice);
-  };
-  if (storeAuthorityLost) return cleanupArtifactFailure(terminalArtifactPoison() ?? 'artifact_store_authority_lost');
-  const candidateFinalFailures = laneResults.flatMap(({ finalFailure }) => finalFailure === null ? [] : [finalFailure]);
-  for (const failure of candidateFinalFailures) affectedArtifactLanes.add(failure.laneId);
-  const preFinalArtifactPoison = artifactStorePoison();
-  if (preFinalArtifactPoison !== null) return cleanupArtifactFailure(terminalArtifactPoison() ?? preFinalArtifactPoison);
-  if (candidateFinalFailures.length > 0) {
-    candidateFinalFailures.sort((left, right) => {
-      const lane = Buffer.compare(Buffer.from(left.laneId, 'utf8'), Buffer.from(right.laneId, 'utf8'));
-      return lane !== 0 ? lane : Buffer.compare(Buffer.from(left.phase, 'utf8'), Buffer.from(right.phase, 'utf8'));
-    });
-    return cleanupArtifactFailure(storeAuthorityLost ? terminalArtifactPoison() : candidateFinalFailures[0].reason);
-  }
-
-  let selection = selectCandidates({ candidates, judgeDecisions: [] });
-  let judgeNotices = [];
-  let judgeFailure = null;
-  if (selection.objectiveComparison?.result === 'tie') {
-    const pairs = [
-      makeBlindPair(candidates[0], candidates[1], { reverse: false }),
-      makeBlindPair(alternateCandidates[0], alternateCandidates[1], { reverse: true }),
-    ];
-    if (pairs.some((pair) => pair === null)) {
-      judgeFailure = 'judge_view_unavailable';
-      const judgeDecisions = [1, 2].map((judgeIndex) => qualityFreeze({
-        status: 'invalid',
-        judgeIndex,
-        corrected: false,
-        code: 'judge_view_unavailable',
-      }));
-      selection = selectCandidates({ candidates, judgeDecisions });
-    } else {
-      const judgesRoot = join(stateRoot, 'judges');
-      const runJudge = async (judgeIndex) => {
-        const pair = pairs[judgeIndex - 1];
-        const provider = laneProviders[judgeIndex - 1].writer;
-        const binding = judgeBindings[judgeIndex - 1];
-        let scratch = null;
-        let identity = null;
-        let localFailure = null;
-        const localNotices = [];
-        let decision;
-        try {
-          await mkdir(judgesRoot, { recursive: true });
-          const expectedJudgesRoot = resolve(stateRoot, 'judges');
-          const canonicalJudgesRoot = await canonical(judgesRoot);
-          if (canonicalJudgesRoot === null || relative(canonicalJudgesRoot, expectedJudgesRoot) !== '' ||
-              relative(canonicalJudgesRoot, stateRoot) === '' || !pathContains(stateRoot, canonicalJudgesRoot)) {
-            throw new Error('judge_scratch_root_untrusted');
-          }
-          scratch = await mkdtemp(join(judgesRoot, `${runId}-judge-${judgeIndex}-`));
-          const returnedScratch = resolve(scratch);
-          const [actual, stat, root] = await Promise.all([
-            canonical(scratch), lstat(scratch, { bigint: true }), canonical(judgesRoot),
-          ]);
-          if (actual === null || root === null || relative(root, expectedJudgesRoot) !== '' ||
-              relative(actual, returnedScratch) !== '' || !pathContains(root, actual) || actual === root ||
-              stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('judge_scratch_identity_unavailable');
-          scratch = actual;
-          identity = { path: actual, dev: stat.dev, ino: stat.ino };
-          let parsed;
-          let corrected = false;
-          try {
-            const result = await callProvider({
-              provider, binding, kind: 'judge', laneId: null, attemptId: null, judgeIndex,
-              instruction: judgeInstruction(pair.promptInput), workspace: scratch, tools: undefined, nonWorktree: true,
-            });
-            if (deadline?.aborted === true || now() >= deadlineAt) {
-              localFailure = 'deadline_exceeded';
-              parsed = { ok: false, kind: 'invalid', code: localFailure };
-            } else if (qualityProviderFailure(result) || result?.hardStopped === true || result?.truncated === true ||
-                result?.doneReason === 'timeout' || result?.doneReason === 'aborted') {
-              localFailure = result?.hardStopped === true || deadline?.aborted === true
-                ? 'deadline_exceeded'
-                : 'judge_provider_failure';
-              parsed = { ok: false, kind: 'invalid', code: localFailure };
-            } else {
-              parsed = parseJudgeDecision(result?.content);
-              if (parsed.ok !== true && deadline?.aborted !== true && now() < deadlineAt) {
-                corrected = true;
-                const correction = await callProvider({
-                  provider, binding, kind: 'judge_format', laneId: null, attemptId: null, judgeIndex,
-                  instruction: judgeInstruction(pair.promptInput, { formatOnly: true }), workspace: scratch,
-                  tools: undefined, nonWorktree: true,
-                });
-                if (deadline?.aborted === true || now() >= deadlineAt) {
-                  localFailure = 'deadline_exceeded';
-                  parsed = { ok: false, kind: 'invalid', code: localFailure };
-                } else if (qualityProviderFailure(correction) || correction?.hardStopped === true || correction?.truncated === true ||
-                    correction?.doneReason === 'timeout' || correction?.doneReason === 'aborted') {
-                  localFailure = correction?.hardStopped === true || deadline?.aborted === true
-                    ? 'deadline_exceeded'
-                    : 'judge_provider_failure';
-                  parsed = { ok: false, kind: 'invalid', code: localFailure };
-                } else {
-                  parsed = parseJudgeDecision(correction?.content);
-                }
-              } else if (parsed.ok !== true && (deadline?.aborted === true || now() >= deadlineAt)) {
-                localFailure = 'deadline_exceeded';
-                parsed = { ok: false, kind: 'invalid', code: localFailure };
-              }
-            }
-          } catch (error) {
-            localFailure = deadline?.aborted === true || now() >= deadlineAt
-              ? 'deadline_exceeded'
-              : 'judge_provider_failure';
-            parsed = { ok: false, kind: 'invalid', code: localFailure };
-          }
-          decision = remapJudgeDecision(parsed, pair.mapping, { judgeIndex, corrected }) ??
-            qualityFreeze({ status: 'invalid', judgeIndex, corrected, code: 'invalid_format' });
-        } catch {
-          localFailure = deadline?.aborted === true || now() >= deadlineAt ? 'deadline_exceeded' : 'judge_scratch_failed';
-          decision = qualityFreeze({ status: 'invalid', judgeIndex, corrected: false, code: localFailure });
-        } finally {
-          if (scratch !== null && identity !== null) {
-            let removed = false;
-            const childrenProven = await killLiveChildren(identity.path);
-            if (childrenProven) {
-              try {
-                const [actual, stat] = await Promise.all([canonical(scratch), lstat(scratch, { bigint: true })]);
-                if (actual === identity.path && stat.dev === identity.dev && stat.ino === identity.ino &&
-                    stat.isDirectory() && !stat.isSymbolicLink()) {
-                  const result = await recoveryStage(`judge ${judgeIndex} scratch cleanup`, () =>
-                    (deps.removeJudgeScratch ?? rm)(identity.path, { recursive: true, force: false }));
-                  if (result?.hardStopped !== true) {
-                    removed = await lstat(identity.path).then(() => false, (error) => error?.code === 'ENOENT');
-                  }
-                }
-              } catch (error) {
-                removed = error?.code === 'ENOENT';
-              }
-            }
-            if (!removed) localNotices.push(`manual cleanup required: ${identity.path}`);
-          } else if (scratch !== null) {
-            localNotices.push(`manual cleanup required: ${scratch}`);
-          }
-        }
-        return qualityFreeze({ decision, failure: localFailure, notices: localNotices });
-      };
-      const judgeOutcomes = await Promise.all([runJudge(1), runJudge(2)]);
-      judgeNotices = judgeOutcomes.flatMap((outcome) => outcome.notices);
-      const judgeDecisions = judgeOutcomes.map((outcome) => outcome.decision);
-      selection = selectCandidates({ candidates, judgeDecisions });
-      judgeFailure = judgeOutcomes.some((outcome) => outcome.failure === 'deadline_exceeded')
-        ? 'deadline_exceeded'
-        : judgeOutcomes.find((outcome) => outcome.failure !== null)?.failure ?? null;
-      if (selection.outcome === 'none' && judgeFailure === null) judgeFailure = 'judge_invalid';
-    }
-  }
-
-  const usage = usageAccumulator.finalize();
-  const usageCheckpoint = await checkpoint(artifactStore, {
-    eventId: 'usage:run:final', type: 'usage_recorded', value: usage,
-  });
-  const selectionCheckpoint = isBlocked(usageCheckpoint) ? usageCheckpoint : await checkpoint(artifactStore, {
-    eventId: 'selection:run:recorded', type: 'selection_recorded', value: selection,
-  });
-  if (isBlocked(usageCheckpoint) || isBlocked(selectionCheckpoint)) {
-    for (const laneId of laneIds) affectedArtifactLanes.add(laneId);
-    return cleanupArtifactFailure('selection_manifest_failed', judgeNotices);
-  }
-
-  const selectedIndex = selection.selectedCandidateId === null ? -1 : laneIds.indexOf(selection.selectedCandidateId);
-  const selectedCandidate = selectedIndex < 0 ? null : candidates[selectedIndex];
-  let terminalDeadline = judgeFailure === 'deadline_exceeded' ||
-    selectedCandidate === null && (deadline?.aborted === true || candidates.some((candidate) => candidate.stopReason === 'deadline_exceeded'));
-  let winner = null;
-  let aliasFailure = false;
-  if (selectedCandidate !== null && !terminalDeadline) {
-    const rawWinner = await recoveryStage('winner alias', () =>
-      (deps.writeWinnerAlias ?? writeWinnerAlias)(artifactStore, { candidateId: selectedCandidate.candidateId }))
-      .catch(() => {
-        poisonArtifactStore('artifact_store_authority_lost', { authorityLost: true, laneId: selectedCandidate.candidateId });
-        return { blocked: true, error: 'artifact_store_authority_lost' };
-      });
-    const candidatePatchRef = selectedCandidate.patch?.ref;
-    const settlement = classifyArtifactSettlement(rawWinner, {
-      kind: 'writer',
-      authority: {
-        writer: {
-          kind: 'winner', candidateId: selectedCandidate.candidateId,
-          path: pathBudget.paths?.winnerAliasPath,
-          bytes: candidatePatchRef?.bytes, sha256: candidatePatchRef?.sha256,
-        },
-        manifest: preparation.manifestAuthority,
-      },
-    });
-    winner = settlement.kind === 'success' && !acceptArtifactRevision(settlement.result, preparation.artifactRevisionAuthority)
-      ? unknownArtifactSettlement() : settlement.result;
-    if (settlement.kind === 'success' && winner !== settlement.result) {
-      poisonArtifactStore('artifact_store_authority_lost', {
-        authorityLost: true, laneId: selectedCandidate.candidateId,
-      });
-    }
-    if (settlement.kind === 'unknown') {
-      poisonArtifactStore('artifact_store_authority_lost', {
-        authorityLost: true, laneId: selectedCandidate.candidateId,
-      });
-    }
-    if (artifactAuthorityLost(winner)) {
-      poisonArtifactStore(winner?.error ?? 'artifact_store_authority_lost', {
-        authorityLost: true,
-        laneId: selectedCandidate.candidateId,
-      });
-    }
-    if (winner?.hardStopped === true) {
-      terminalDeadline = true;
-    }
-    const winnerRef = winner?.ref;
-    if (isBlocked(winner) || winner?.ok !== true || winnerRef?.kind !== 'winner' ||
-        winnerRef?.candidateId !== selectedCandidate.candidateId ||
-        winnerRef?.path !== pathBudget.paths?.winnerAliasPath || winnerRef.path === candidatePatchRef?.path ||
-        winnerRef?.sha256 !== candidatePatchRef?.sha256 || winnerRef?.bytes !== candidatePatchRef?.bytes ||
-        !Number.isSafeInteger(winnerRef?.bytes) || winnerRef.bytes <= 0 ||
-        !Number.isSafeInteger(winnerRef?.expiresAt) || winnerRef.expiresAt <= 0) {
-      winner = null;
-      aliasFailure = !terminalDeadline;
-    }
-    if (winner?.manifestRef) latestManifestRef = winner.manifestRef;
-  }
-
-  const allRejected = candidates.every((candidate) => candidate.terminalClass === 'rejected');
-  const allBlocked = candidates.every((candidate) => candidate.terminalClass === 'blocked');
-  let stopReason = aliasFailure ? 'winner_alias_failed' : terminalDeadline ? 'deadline_exceeded' : selectedCandidate?.stopReason ??
-    (selection.outcome === 'tie' ? 'judge_tie' : judgeFailure ?? (allRejected ? 'all_candidates_rejected' : allBlocked ? 'all_candidates_blocked' : 'selection_unavailable'));
-  // Selection and the alias attempt are durable; commit the one learning
-  // transaction before cleanup so a cleanup fault cannot change the grade.
-  const learning = await commitRunLearning({
-    deps, stage, stateRoot, runId, taskClass, decisions, candidateCount: 2,
-    stopReason, selection, candidates, effectiveChoices,
-    attemptRefs: learningAttemptRefs(candidates),
-    artifactRefs: learningArtifactRefs({ manifestRef: latestManifestRef, candidates, winnerRef: winner?.ref ?? null }),
-  });
-
-  const cleanups = [];
-  const cleanupNotices = [];
-  for (let index = 0; index < laneWorktrees.length; index += 1) {
-    const worktree = laneWorktrees[index];
-    const candidate = candidates[index];
-    const childrenProven = await killLiveChildren(worktree.path);
-    const preserve = (aliasFailure || terminalDeadline && selectedCandidate !== null) && index === selectedIndex || candidate.recovery !== null ||
-      isWorktreeEffectUnknown?.(worktree.path) === true;
-    const removal = childrenProven === true && !preserve
-      ? snapshotRemovalResult(await stage(`${laneIds[index]} authoring cleanup`, () =>
-        (deps.removeWorktree ?? defaultRemoveWorktree)(worktree)).catch(() => null))
-      : UNPROVEN_REMOVAL;
-    const removed = removal.ok === true && removal.removed === true;
-    const unregistered = removal.ok === true && removal.unregistered === true;
-    let tracked = false;
-    if (!removed || !unregistered) {
-      tracked = await handoffWorktree(worktree.path, `${laneIds[index]} authoring cleanup handoff`);
-      if (!tracked) cleanupNotices.push(`manual cleanup required: ${worktree.path}`);
-    }
-    const cleanup = { removed, unregistered, tracked };
-    cleanups.push(cleanup);
-    if ((removed && unregistered || tracked) && !storeAuthorityLost) {
-      const logicalCleanupPath = `worktrees/${worktree.worktreeId ?? `${runId}-${laneIds[index]}`}`;
-      let cleanupCheckpointThrew = false;
-      const rawEvent = await stage(`cleanup manifest ${laneIds[index]}`, () => checkpointRaw(artifactStore, {
-        eventId: `cleanup:authoring:${laneIds[index]}:000:${qualityHash(Buffer.from(logicalCleanupPath, 'utf8')).slice(0, 12)}`,
-        type: 'cleanup_recorded',
-        value: {
-          kind: 'authoring',
-          candidateId: laneIds[index],
-          attemptId: null,
-          path: worktree.path,
-          status: removed && unregistered ? 'removed' : 'reaper_pending',
-          recoveryPath: removed && unregistered ? null : worktree.path,
-        },
-      })).catch(() => {
-        cleanupCheckpointThrew = true;
-        return { blocked: true, error: 'manifest_checkpoint_failed' };
-      });
-      const settlement = classifyArtifactSettlement(rawEvent, {
-        kind: 'checkpoint', authority: preparation.manifestAuthority,
-      });
-      const event = settlement.result;
-      if (settlement.kind === 'success' && !acceptArtifactRevision(event, preparation.artifactRevisionAuthority)) {
-        storeAuthorityLost = true;
-        cleanupNotices.push(`cleanup manifest pending: ${worktree.path}`);
-        continue;
-      }
-      if (event?.manifestRef) latestManifestRef = event.manifestRef;
-      if (cleanupCheckpointThrew || settlement.kind === 'unknown' || artifactAuthorityLost(event)) {
-        storeAuthorityLost = true;
-      }
-      if (isBlocked(event)) cleanupNotices.push(`cleanup manifest pending: ${worktree.path}`);
-    }
-  }
-
-  const selectedRef = selectedIndex < 0 ? null : candidateRefs[selectedIndex];
-  const attempts = laneResults.flatMap((result) => result.contentFacts.attempts);
-  const recoveryPaths = laneWorktrees.filter((_, index) =>
-    cleanups[index].removed !== true || cleanups[index].unregistered !== true).map((worktree) => worktree.path);
-  const issues = candidates.map(contentIssue);
-  const allEvidenceRefs = laneResults.flatMap((result) => result.contentFacts.evidenceRefs);
-  const invalidEvidenceCount = laneResults.reduce((sum, result) =>
-    sum + result.contentFacts.evidenceOmittedCount, 0);
-  const evidenceRefs = selectedCandidate === null
-    ? allEvidenceRefs
-    : allEvidenceRefs.filter((entry) => entry.evidenceId.includes(`/${selectedCandidate.candidateId}/`));
-  const omittedCounts = {
-    issues: issues.reduce((sum, issue) => sum + issue.resolvedOmittedCount, 0),
-    attempts: 0,
-    evidence: allEvidenceRefs.length - evidenceRefs.length + invalidEvidenceCount,
-    files: 0,
-    artifacts: 0,
-  };
-  const payload = {
-    runId,
-    stopReason,
-    stepCount: selectedCandidate?.attempts.length ?? attempts.length,
-    ...(winner?.ref ? { patch: {
-      path: winner.ref.path,
-      bytes: winner.ref.bytes,
-      empty: winner.ref.bytes === 0,
-      files: selectedCandidate.patch?.files ?? [],
-      ignoredPaths: [],
-      gitlinks: [],
-    } } : {}),
-    scope: selectedCandidate === null
-      ? { flagged: candidates.some((candidate) => candidate.scope.flagged), reasons: [], omitted: candidates.reduce((sum, candidate) => sum + (candidate.scope.omittedReasonCount ?? 0), 0) }
-      : { flagged: selectedCandidate.scope.flagged, reasons: [], omitted: selectedCandidate.scope.omittedReasonCount ?? 0 },
-    worktree: {
-      transplanted: laneWorktrees.some((worktree) => worktree.transplanted === true),
-      ignoredPaths: [...new Set(laneWorktrees.flatMap((worktree) => worktree.ignoredPaths ?? []))],
-      sharedRules: [...new Set(laneWorktrees.flatMap((worktree) => worktree.sharedRules ?? []))],
-      cleanup: { removed: cleanups.every((value) => value.removed), unregistered: cleanups.every((value) => value.unregistered), tracked: cleanups.some((value) => value.tracked) },
-    },
-    blockers: candidates.filter((candidate) => candidate.terminalClass === 'blocked').map((candidate) => ({ candidateId: candidate.candidateId, where: candidate.stopReason, error: candidate.stopReason })),
-    learning: { taskClass, decisions, sources: decisionSources, applied: { grade: learning.grade, axes: learning.appliedAxes } },
-    plan: { provider: plannerProvider.id, content: '' },
-    steps: selectedCandidate?.attempts.map((attempt) => ({ step: attempt.ordinal, laneId: attempt.laneId, attemptId: attempt.attemptId, retryOf: attempt.retryOf })) ?? [],
-    verdict: contentVerdict(selectedCandidate),
-    issues,
-    candidates: candidates.map(contentCandidate),
-    attempts,
-    regressionProof: {
-      status: selectedCandidate?.regressionProof.status ?? 'unavailable',
-      selectedCandidateId: selection.selectedCandidateId,
-      evidenceRefs,
-      omittedEvidenceCount: allEvidenceRefs.length - evidenceRefs.length + invalidEvidenceCount,
-    },
-    selection,
-    artifacts: {
-      manifestPath: latestManifestRef?.path ?? pathBudget.paths.manifestPath,
-      expiresAt: latestManifestRef?.expiresAt ?? candidates.find((candidate) => candidate.patch !== null)?.patch.ref.expiresAt ?? winner?.ref?.expiresAt ?? 0,
-      candidatePaths: candidates.flatMap((candidate) => candidate.patch === null ? [] : [candidate.patch.ref.path]),
-      omittedCount: 0,
-    },
-    omittedCounts,
-    aliasDurable: typeof winner?.ref?.path === 'string',
-    fixedFloorInput: fixedFloorInput({
-      runId, stopReason, candidateCount: 2, selection, pathBudget, candidates, issues, omittedCounts,
-    }),
-  };
-  const { content, contentFallback } = (deps.renderContentParts ?? renderContentParts)(qualityFreeze(payload));
-  const notice = joinNotices([
-    ...(preparation.sweepNotice === null ? [] : [preparation.sweepNotice]),
-    ...plannerNotices,
-    // 두 레인 중 하나만 돌았어도 사용자 코드는 사용자 권한으로 돌았다. 신고는 런당 한 번이다.
-    ...(laneResults.some((lane) => lane.userPrivilegeObserved === true) ? [USER_PRIVILEGE_NOTE] : []),
-    ...judgeNotices,
-    ...cleanupNotices,
-    ...laneWorktrees.flatMap((worktree, index) => cleanups[index].tracked
-      ? [`워크트리 정리를 리퍼에 넘겼습니다: ${worktree.path}`]
-      : []),
-    ...learning.notices,
-  ]);
-  if (terminalDeadline) {
-    return failure({
-      status: 'deadline_exceeded', confidence: 'unverified', content, contentFallback, runId,
-      stopReason: 'deadline_exceeded', error: `데드라인(${effectiveWaitMs}ms)이 지났습니다.`,
-      recovery: recoveryPaths.join(', ') || 'wait_ms를 늘려 다시 시도하세요.',
-      ...(notice ? { notice } : {}),
-    });
-  }
-  if (aliasFailure) {
-    return failure({
-      status: 'blocked', confidence: 'unverified', content, contentFallback, runId,
-      stopReason: 'winner_alias_failed', error: 'winner_alias_failed',
-      recovery: recoveryPaths.join(', ') || laneWorktrees[selectedIndex].path,
-      ...(notice ? { notice } : {}),
-    });
-  }
-  if (selectedCandidate !== null) {
-    return success({
-      content, contentFallback,
-      confidence: selectedCandidate.terminalClass === 'verified' ? 'verified' : 'unverified',
-      runId,
-      stopReason,
-      ...(recoveryPaths.length ? { recovery: recoveryPaths.join(', ') } : {}),
-      ...(notice ? { notice } : {}),
-    });
-  }
-  if (selection.outcome === 'tie' || allRejected) {
-    return failure({
-      status: 'failed', confidence: 'disputed', content, contentFallback, runId, stopReason,
-      error: `후보 경쟁을 완료하지 못했습니다: ${stopReason}`,
-      recovery: recoveryPaths.join(', ') || '두 후보 artifact를 검토한 뒤 새 runId로 다시 시도하세요.',
-      ...(notice ? { notice } : {}),
-    });
-  }
-  return failure({
-    status: 'blocked', confidence: 'unverified', content, contentFallback, runId, stopReason,
-    error: `후보 선택을 완료하지 못했습니다: ${stopReason}`,
-    recovery: recoveryPaths.join(', ') || '새 runId로 다시 시도하세요.',
-    ...(notice ? { notice } : {}),
-  });
-}
-
-async function orchestrateQuality(options) {
+async function orchestrateQuality(options, onLogOpened = null) {
   const inputFailure = validateQualityRequest(options);
   if (inputFailure !== null) return inputFailure;
   const candidateCount = options.candidateCount === undefined ? 1 : options.candidateCount;
@@ -3590,7 +962,10 @@ async function orchestrateQuality(options) {
   for (const role of ['planner', 'worker', 'verifier']) {
     const wanted = options[role];
     if (wanted !== undefined && wanted !== null && !ids.includes(wanted)) {
-      return failure({ status: 'invalid', error: `모르는 프로바이더 id 입니다 (${role}): ${show(wanted)}`, recovery: `쓸 수 있는 프로바이더: ${ids.join(', ') || '(없음)'}` });
+      return failure({
+        status: 'invalid', reasonCode: REASON.config_provider_unknown,
+        params: { role, vendor: show(wanted), vendors: ids.join(', ') || NO_VENDORS },
+      });
     }
   }
 
@@ -3598,20 +973,72 @@ async function orchestrateQuality(options) {
   const effectiveWaitMs = waitMs > 0 ? Math.ceil(Math.min(waitMs, MAX_WAIT_MS)) : MAX_WAIT_MS;
   const startedAt = now();
   if (!Number.isSafeInteger(startedAt) || !Number.isSafeInteger(startedAt + effectiveWaitMs)) {
-    return failure({ status: 'invalid', error: 'deadlineAt 을 안전한 정수로 표현할 수 없습니다.', recovery: '시계와 waitMs 값을 확인하세요.' });
+    return failure({ status: 'invalid', reasonCode: REASON.run_deadline_unrepresentable });
   }
   const deadlineAt = startedAt + effectiveWaitMs;
-  const deadline = timeoutSignal(effectiveWaitMs);
+  // ★★ 정지 권위는 **접힌 신호 하나**다(WS3 §0-C1). 벤더도, 이음매의 하드스톱도, 자식 회수도
+  //   전부 `deadline` 을 보므로 호스트 취소가 마감과 **정확히 같은 만큼** 잘 듣는다 — 취소용
+  //   두 번째 경로를 만들면 그 경로가 안 닿는 이음매가 반드시 생긴다.
+  // ★★ 그런데 「누가 껐는가」는 접힌 신호가 답하지 못한다. 그 답의 유일한 권위는 **소스**이고
+  //   (`hostSignal.aborted`), 그것을 읽는 자리가 아래 `haltReasonCode` 하나다. 결함 문구를 보고
+  //   가르는 자리는 어디에도 없다 — 우리가 자른 실행은 POSIX 에서 시그널 킬이라, 사유를 신호
+  //   **앞에** 두지 않으면 우리 마감이 벤더 결함으로 읽힌다(WS2 §14).
+  const hostSignal = options.hostSignal;
+  const deadlineSignal = timeoutSignal(effectiveWaitMs);
+  const deadline = haltSignal(deadlineSignal, hostSignal);
   const hardStopGraceMs = Number.isFinite(deps.hardStopGraceMs) && deps.hardStopGraceMs > 0
     ? deps.hardStopGraceMs
     : HARD_STOP_GRACE_MS;
-  let addNotice = () => {};
+  // ── 실행별 로그(WS2 §5) · 벤더 결함 장부와 같은 자리(`src/run-faults.mjs`)에 산다 ──────
+  // 핸들은 상태 루트가 정해진 뒤에 열린다. 열리기 전의 봉투는 `log` 를 안 달고 나가고, 그것이
+  // "로그가 없다" 의 유일한 정당한 경우다. 열기 실패는 실행을 떨어뜨리지 않고 알림 하나가 된다.
+  const { openLog, logLine, closeLog, addNotice, envelopeExtras, redact: redactText } = createRunLog({ onLogOpened });
   let runStateRoot = null;
   let worktreePath = null;
   const authoringWorktreePaths = new Set();
   let activeRunId = null;
+  let runProjectPath = projectPath;
+  // ★ 재개의 출처. 저널 행에 실려야 하는 이유(최종 리뷰 I5·M17): 오늘 이 사실이 남는 유일한
+  //   영구 채널은 로그의 `info` 한 줄인데, 그 레벨은 `orch_status` 의 꼬리 필터가 걸러 낸다 —
+  //   그래서 재구성 본문은 서수가 3 부터 시작하는 이유를 어디에서도 말하지 못했다.
+  let runResumedFrom = null;
+  let runJournaled = false;
   let worktreeEffectUnknown = false;
   const effectUnknownPaths = new Set();
+  let intentArmFailure = null;
+  let intentArmNotice = null;
+
+  /**
+   * 이 실행이 멈춘다면 **누가 껐는가**(WS3 §0-C1/C2). 벤더에게 간 신호는 접힌 하나라 그 뒤에는
+   * 소스만이 답을 안다 — 그래서 가르는 자리가 저장소 전체에 이 한 줄뿐이다.
+   */
+  const haltReasonCode = () => (hostSignal?.aborted === true ? REASON.run_cancelled : REASON.run_deadline_exceeded);
+  /**
+   * 종료 봉투 둘 중 하나. 열 자리(사전 점검 halt 넷 · 레인 halt 하나 · C1 둘 · C2 셋)가 이것을
+   * 부르고, 그 열 자리 어디에도 코드를 고르는 삼항이 없다 — 있으면 한 자리만 고쳐지는 날이 온다.
+   */
+  const runHalt = ({ runId, extras = {}, content, contentFallback }) => {
+    const reasonCode = haltReasonCode();
+    // 「왜 멈췄나」의 진단 한 줄. 종료 sink 의 `run_finished` 는 판정을 적고, 이 줄은 **소스**를
+    // 적는다 — 취소가 왔는데 마감으로 끝난(또는 그 반대의) 실행을 로그만 보고 가릴 수 있어야 한다.
+    logLine('warn', reasonCode, 'run halted', {
+      runId: runId ?? '', source: reasonCode === REASON.run_cancelled ? hostAbortReason() : 'deadline',
+    });
+    return reasonCode === REASON.run_cancelled
+      ? runCancelled({ runId, extras, content, contentFallback })
+      : runDeadline({ runId, effectiveWaitMs, extras, content, contentFallback });
+  };
+  /** 호스트가 abort 에 실은 이유(`host_cancel`/`host_shutdown`). 문자열이 아니면 로그에 안 적는다. */
+  const hostAbortReason = () => (typeof hostSignal?.reason === 'string' ? hostSignal.reason : 'host');
+  /**
+   * 이음매가 신호를 무시해 유예까지 간 자리의 실패. 코드는 여기서도 **소스**가 정한다 —
+   * 호스트가 끊었는데 로그와 장부가 "마감이 지났다" 고 적으면 두 채널이 다른 말을 한다.
+   */
+  const haltFail = (label, message) => {
+    const reasonCode = haltReasonCode();
+    logLine('warn', reasonCode, message, { stage: label });
+    return fail(reasonCode, reasonCode === REASON.run_deadline_exceeded ? { waitMs: effectiveWaitMs } : {}, { hardStopped: true });
+  };
 
   /** 한 이음매가 AbortSignal 을 무시해도 데드라인+유예 뒤에는 권위를 회수한다. */
   const raceHardStop = (work) => {
@@ -3636,25 +1063,84 @@ async function orchestrateQuality(options) {
     });
   };
   const stage = async (label, call, { mayTouchWorktree = false, onHardStop = null, worktreePath: touchedPath = null } = {}) => {
+    const affectedPath = touchedPath ?? worktreePath;
+    let intentToken = null;
+    if (mayTouchWorktree && affectedPath !== null) {
+      const observed = now();
+      const retainUntil = Number.isSafeInteger(observed) && observed >= 0 &&
+        observed <= Number.MAX_SAFE_INTEGER - RUN_ARTIFACT_RETENTION_MS
+        ? observed + RUN_ARTIFACT_RETENTION_MS
+        : Number.MAX_SAFE_INTEGER;
+      const armed = await raceHardStop(Promise.resolve().then(() =>
+        (deps.armEffectUnknownIntent ?? defaultArmEffectUnknownIntent)({
+          stateRoot: runStateRoot,
+          runId: activeRunId,
+          worktree: affectedPath,
+          projectPath: runProjectPath,
+          retainUntil,
+        })).catch(() => ({ ok: false, status: 'write_failed' })));
+      if (armed === HARD_STOP) {
+        addNotice(renderNotice('stage_authority_revoked', { stage: label }));
+        return haltFail(label, 'recovery intent arm authority lost');
+      }
+      // The arm can settle during the hard-stop grace after the run has already lost
+      // authority. In that ordering the effect has not started, and must stay uncalled.
+      if (deadline?.aborted === true) {
+        addNotice(renderNotice('stage_authority_revoked', { stage: label }));
+        return haltFail(label, 'recovery intent arm authority lost');
+      }
+      const schemaNotice = stateSchemaNotice(armed?.stateSchema);
+      // Fatal arm failures are rebuilt into a blocked envelope after common finalization.
+      // Keep this notice separate so it is not appended to an envelope that already contains it.
+      if (schemaNotice !== null) intentArmNotice ??= schemaNotice;
+      if (armed?.ok !== true || !/^[0-9a-f]{64}$/.test(armed?.token ?? '')) {
+        intentArmFailure ??= stateSchemaReason(armed?.stateSchema) ?? {
+          reasonCode: REASON.state_recovery_intent_unavailable,
+          params: {},
+        };
+        logLine('warn', intentArmFailure.reasonCode, 'recovery intent arm failed', { stage: label });
+        return fail(intentArmFailure.reasonCode, intentArmFailure.params, { hardStopped: true });
+      }
+      intentToken = armed.token;
+    }
+
+    const disarmIntent = async () => {
+      if (intentToken === null) return true;
+      const disarmed = await raceHardStop(Promise.resolve().then(() =>
+        (deps.disarmEffectUnknownIntent ?? defaultDisarmEffectUnknownIntent)({
+          stateRoot: runStateRoot,
+          runId: activeRunId,
+          worktree: affectedPath,
+          token: intentToken,
+        })).catch(() => ({ ok: false, status: 'write_failed' })));
+      const notice = stateSchemaNotice(disarmed?.stateSchema);
+      if (notice !== null) addNotice(notice);
+      return disarmed !== HARD_STOP && disarmed?.ok === true;
+    };
+
     const pending = Promise.resolve().then(call);
-    const settled = await raceHardStop(pending);
-    if (settled !== HARD_STOP) return settled;
+    let settled;
+    try {
+      settled = await raceHardStop(pending);
+    } catch (error) {
+      await disarmIntent();
+      throw error;
+    }
+    if (settled !== HARD_STOP) {
+      await disarmIntent();
+      return settled;
+    }
     try {
       onHardStop?.(pending);
     } catch {
       // 늦은 결과를 맡기는 부가 경로가 본 실행의 데드라인 봉투를 막아서는 안 된다.
     }
-    if (mayTouchWorktree && (touchedPath ?? worktreePath) !== null) {
+    if (mayTouchWorktree && affectedPath !== null) {
       worktreeEffectUnknown = true;
-      effectUnknownPaths.add(touchedPath ?? worktreePath);
+      effectUnknownPaths.add(affectedPath);
     }
-    addNotice(`${label} 단계가 데드라인 뒤에도 끝나지 않아 결과 권위를 회수했습니다.`);
-    return {
-      blocked: true,
-      hardStopped: true,
-      error: `${label} 단계가 데드라인 뒤에도 끝나지 않았습니다.`,
-      recovery: 'wait_ms 를 늘리거나 대상 저장소와 프로바이더 상태를 확인하세요.',
-    };
+    addNotice(renderNotice('stage_authority_revoked', { stage: label }));
+    return haltFail(label, 'stage authority revoked');
   };
   const recoveryStage = async (label, call) => {
     const pending = Promise.resolve().then(call);
@@ -3665,15 +1151,20 @@ async function orchestrateQuality(options) {
     });
     const settled = await Promise.race([pending, guard]);
     (deps.recoveryClearTimer ?? clearTimeout)(timer);
-    return settled === HARD_STOP
-      ? { blocked: true, hardStopped: true, error: `${label} recovery authority lost` }
-      : settled;
+    if (settled !== HARD_STOP) return settled;
+    return haltFail(label, 'recovery authority lost');
   };
 
   const treeKill = deps.treeKill ?? defaultTreeKill;
-  const trackChild = deps.trackChild ?? defaultTrackChild;
+  const rawTrackChild = deps.trackChild ?? defaultTrackChild;
   const usesDefaultTrackChild = deps.trackChild === undefined;
-  const trackWorktree = deps.trackWorktree ?? defaultTrackWorktree;
+  const rawTrackWorktree = deps.trackWorktree ?? defaultTrackWorktree;
+  const trackWorktree = async (input) => {
+    const result = await rawTrackWorktree(input);
+    const notice = stateSchemaNotice(result?.stateSchema);
+    if (notice !== null) addNotice(notice);
+    return result === true;
+  };
   const liveChildren = new Map();
   const killPromises = new Map();
   const pendingChildTracks = new Map();
@@ -3745,20 +1236,32 @@ async function orchestrateQuality(options) {
           if (reportIdentity) {
             try {
               options.onProgress?.({
-                phase: role ?? 'child',
+                // ★ 폴백은 등재된 어휘여야 한다(리뷰 소견 1). 'child' 는 phase 표 밖이라 리포터의
+                //   접힘에 기대어만 살았다 — 오늘 두 호출부 모두 role 을 채우므로 죽은 가지지만,
+                //   죽은 가지가 표 밖 값을 들고 있으면 표를 넓힌 사람이 이 자리를 못 찾는다.
+                phase: role ?? 'infra',
                 step: attemptId === null ? judgeIndex ?? 0 : Number(attemptId.slice(-3)),
                 laneId,
                 attemptId,
                 role,
                 judgeIndex,
+                // 자식 spawn 줄도 같은 실행 사실 셋을 싣는다 — 이 채널만 runId 없이 오면
+                // 알림 한 줄이 어느 실행의 것인지 못 말한다(WS3 §0-P1).
+                runId: activeRunId,
+                budget,
+                candidates: candidateCount,
                 event: { type: 'spawn', laneId, attemptId, role, judgeIndex },
               });
             } catch {
               // Progress is advisory.
             }
           }
-          return Promise.resolve(trackChild({ stateRoot: runStateRoot, child, runId: activeRunId, worktree: childWorktree }))
-            .then((value) => usesDefaultTrackChild ? value === undefined || value === true : value === true, () => false);
+          return Promise.resolve(rawTrackChild({ stateRoot: runStateRoot, child, runId: activeRunId, worktree: childWorktree }))
+            .then((value) => {
+              const notice = stateSchemaNotice(value?.stateSchema);
+              if (notice !== null) addNotice(notice);
+              return usesDefaultTrackChild ? value === undefined || value === true : value === true;
+            }, () => false);
         })).catch(() => HARD_STOP);
         pendingChildTracks.set(pending, ownerWorktreePath ?? null);
         pending.finally(() => pendingChildTracks.delete(pending));
@@ -3793,9 +1296,13 @@ async function orchestrateQuality(options) {
     }
     return true;
   };
-  const setRunIdentity = ({ runId, stateRoot, worktreePath: path, worktreePaths = [] } = {}) => {
+  const setRunIdentity = ({ runId, stateRoot, projectPath: project, resumedFrom, worktreePath: path, worktreePaths = [] } = {}) => {
     if (typeof runId === 'string') activeRunId = runId;
     if (typeof stateRoot === 'string') runStateRoot = stateRoot;
+    if (typeof resumedFrom === 'string') runResumedFrom = resumedFrom;
+    // ★ 정준화된 프로젝트 경로는 사전 점검보다 **뒤**에 정해진다 — 거기까지 못 간 실행의 종료
+    //   행에는 호출자가 준 경로가 실린다(둘 다 절대 경로이고, 갈리는 것은 심볼릭 링크뿐이다).
+    if (typeof project === 'string') runProjectPath = project;
     if (typeof path === 'string') {
       worktreePath = path;
       authoringWorktreePaths.add(path);
@@ -3805,31 +1312,113 @@ async function orchestrateQuality(options) {
     }
   };
 
+  /** 종료 기록 여덟 키. 학습 행과 종료 sink 가 같은 값을 내야 하므로 짓는 자리는 하나다. */
+  const terminalRow = (outcome) => runTerminalKeys({
+    projectPath: runProjectPath, task, startedAt, finishedAt: now(), resumedFrom: runResumedFrom,
+    outcome, redact: redactText,
+  });
+  /**
+   * ★★ 종료 sink — 실행마다 **정확히 한 번**(최상위 catch 경로 포함). 봉투는 디스크에 남지
+   *   않으므로(WS3 §0-D1) 저널 행 하나와 이 로그 줄 하나가 실행의 유일한 영구 기록이고,
+   *   `orch_status` 가 읽는 것이 그것이다.
+   * ★ 저널 쓰기가 `closeLog()` **앞**인 이유 둘: 세척기는 로그 핸들과 같은 수명이라 닫은 뒤의
+   *   `redact` 는 항등이다(세척한 적 없는 taskPreview 가 디스크에 남는다). 그리고 쓰기 실패를
+   *   적을 채널이 그때는 없다.
+   * ★ 학습이 이미 행을 썼으면 여기서는 **안 쓴다** — 저널은 runId 당 마지막 줄이 이기므로 한
+   *   줄을 더 얹으면 그 행의 학습 키가 통째로 사라진다. 그 실행의 종료 키는 학습 행에 탄다.
+   */
+  const settleRun = async (envelope, thrownCode = null) => {
+    const outcome = envelope === null
+      ? terminalOutcome({ reasonCode: thrownCode })
+      : terminalOutcomeOf(envelope);
+    logLine(outcome.status === 'succeeded' ? 'info' : 'error', outcome.reasonCode, 'run_finished', {
+      runId: activeRunId ?? '', status: outcome.status, stopReason: outcome.stopReason ?? '',
+      reasonCode: outcome.reasonCode ?? '', confidence: envelope?.confidence ?? '',
+    });
+    if (runJournaled || activeRunId === null || runStateRoot === null) return;
+    // 기록 실패는 봉투를 막지 않는다(학습과 같은 등급의 부가 채널). 밖에서 온 값이라 던지든
+    // `{ok:false}` 를 내든 한 갈래로 접고, 사연은 `errorText` 를 지난다(bare `String()` 금지).
+    const wrote = await Promise.resolve()
+      .then(() => (deps.appendRun ?? appendRun)(runStateRoot, { runId: activeRunId, ...terminalRow(outcome) }))
+      .catch((error) => ({ ok: false, error }));
+    if (wrote?.ok !== true) {
+      logLine('warn', reasonCodeOf(wrote, REASON.learning_journal_record_invalid), 'run_record_incomplete', { detail: errorText(wrote?.error) });
+    }
+  };
+
   deadline?.addEventListener?.('abort', onDeadlineAbort, { once: true });
   if (deadline?.aborted === true) onDeadlineAbort();
   try {
     const sharedContext = {
       options,
-      deps,
+      deps: { ...deps, trackWorktree },
       task,
       projectPath,
       budget,
       deadlineAt,
+      // ★ 이 실행이 시작한 시각. 마감을 짓느라 이미 읽어 둔 값이고(같은 함수가 그 위에서 `deadlineAt`
+      //   을 세운다), 종료 조립이 봉투의 `cost.elapsedMs` 를 재는 유일한 기준점이다 — 저 아래
+      //   저널 행이 쓰는 것과 **같은** 시작 시각이라 두 채널이 다른 실행 시간을 말하지 않는다.
+      startedAt,
       deadline,
       effectiveWaitMs,
       registered,
       now,
       stage,
       recoveryStage,
+      // 취소·마감의 갈림은 여기서 **닫힌 두 함수**로만 나간다 — 하위 자리가 `hostSignal` 자체를
+      // 받으면 각자 다른 판정 규칙을 쓰게 된다.
+      haltReasonCode,
+      runHalt,
       onSpawn,
       killLiveChildren,
       setRunIdentity,
       isWorktreeEffectUnknown: (path = null) => path === null ? worktreeEffectUnknown : effectUnknownPaths.has(path),
+      openLog,
+      logLine,
+      // 준비 단계도 알림 통에 직접 넣는다 — 크레딧 전 예측의 경고 넷이 그 첫 소비자다.
+      addNotice,
+      envelopeExtras,
+      redact: redactText,
+      terminalRow,
+      noteRunJournaled: () => { runJournaled = true; },
+      /**
+       * ★ WS3 §0-M2 strangler 이음매. 종료 경로는 `src/run-finalization.mjs` 에 살고, 아직
+       *   엔진이 소유한 준비·레인 두 단계와 그 비공개 상태를 여기서 **넘겨준다**. 셋 다
+       *   복제할 수 없는 것들이다: 두 단계는 C2 도 부르는 700줄짜리 함수이고,
+       *   `PREPARATION_PRIVATE` 는 준비 단계가 채운 바로 **그** WeakMap 이어야 한다.
+       *   반대 방향(run-finalization → engine)의 수입은 순환이라 존재할 수 없으므로, 이 객체가
+       *   그 방향의 유일한 통로다. 후보 1개·2개가 **같은** 셋을 쓰므로 접을 때도 안 자랐다.
+       */
+      finalizationSeam: { prepareRunNamespace, runPreparedLane, PREPARATION_PRIVATE },
     };
-    return candidateCount === 1
-      ? await orchestrateFinalC1(sharedContext)
-      : await orchestrateFinalC2(sharedContext);
+    // ★ 호출부는 하나다. 후보 수로 갈리던 삼항은 WS3 태스크 10 이 없앴다 — 종료 경로는 그 수를
+    //   `preparation.candidateCount` 에서 데이터로 읽는다(`src/run-finalization.mjs` 머리말).
+    let envelope = await finalizeRun(sharedContext);
+    if (intentArmFailure !== null) {
+      const notice = joinNotices([
+        ...(typeof envelope?.notice === 'string' ? [envelope.notice] : []),
+        ...(intentArmNotice === null ? [] : [intentArmNotice]),
+      ]);
+      envelope = failure({
+        status: 'blocked',
+        runId: activeRunId,
+        ...intentArmFailure,
+        ...(envelope?.log === undefined ? {} : { log: envelope.log }),
+        ...(notice === null ? {} : { notice }),
+      });
+    }
+    // ★ 실행이 **왜** 그렇게 끝났는지는 로그의 마지막 줄이다. 앞선 줄들은 단계별 사실이고, 이
+    //   줄만이 봉투가 실제로 낸 판정을 적는다 — 둘이 갈리면 로그를 읽는 쪽이 먼저 안다.
+    await settleRun(envelope);
+    return envelope;
+  } catch (error) {
+    // 최상위 catch(`runOrchestration`)가 낼 봉투와 **같은 코드**로 기록하고 그대로 다시 던진다 —
+    // 여기서 삼키면 그 봉투의 바이트가 이 자리로 옮겨 온다.
+    await settleRun(null, REASON.run_orchestration_failed);
+    throw error;
   } finally {
+    closeLog();
     await killLiveChildren();
     try {
       deadline?.removeEventListener?.('abort', onDeadlineAbort);
