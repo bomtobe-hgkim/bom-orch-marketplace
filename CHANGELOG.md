@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.1 - 2026-08-27
+
+A documentation fix. There is no code change in this release: the server, the tool surface and
+the state format are byte-identical to 1.0.0.
+
+- **Corrected: the 1.0.0 notes announced themselves as `0.5.0`.** The heading above the feature
+  list read "What you will notice in 0.5.0" — a version that was never published and cannot be
+  installed. The entry had been written while this release was still numbered 0.5.0, and the
+  renumbering to 1.0.0 missed that one line. It shipped in all three copies of the changelog
+  (the marketplace root and both plugin roots) and in the v1.0.0 tag.
+
+  The v1.0.0 tag is left exactly as it is. Moving or deleting a published tag would break anyone
+  who already pinned it, so the correction ships forward as 1.0.1 instead. If you installed
+  1.0.0, you lose nothing by staying on it except that one wrong version number in the notes.
+
 ## 1.0.0 - 2026-08-27
 
 This is the first public release since 0.2.2. The `0.4.0` and `0.3.0` entries below were internal
@@ -16,7 +31,7 @@ Both host applications must run on the same machine and the state root must be o
 filesystem. Do not put `BOM_ORCH_HOME` on a network share or use one root from different machines;
 remote process identity and distributed-filesystem locking are not supported.
 
-What you will notice in 0.5.0:
+What you will notice in 1.0.0:
 
 - **Shared state files carry a schema version, and a newer one is never rewritten.** `children.json`,
   `posteriors.json` and `settings.ini` record the version that wrote them. A server that meets a

@@ -183,8 +183,8 @@ remote process identity and distributed-filesystem locking are not supported.
 Pin a released tag instead of tracking `main`:
 
 ```powershell
-claude plugin marketplace add bomtobe-hgkim/bom-orch-marketplace@v1.0.0 --scope user
-codex plugin marketplace add bomtobe-hgkim/bom-orch-marketplace --ref v1.0.0
+claude plugin marketplace add bomtobe-hgkim/bom-orch-marketplace@v1.0.1 --scope user
+codex plugin marketplace add bomtobe-hgkim/bom-orch-marketplace --ref v1.0.1
 ```
 
 Claude Code:
