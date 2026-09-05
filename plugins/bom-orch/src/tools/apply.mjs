@@ -11,13 +11,13 @@
  *   나뉜 이유는 폐포다 — 판정기는 진짜 저장소 하나만 있으면 전부 잴 수 있고, 실행이 무엇인지
  *   알게 되는 순간 그 성질이 사라진다.
  *
- * ★ 실측 폐포: **50개 모듈 / 19,700줄**(자기 자신 489 포함) — 리더 열(`run-read`·`run-manifest`·`manifest-selection`·
- *   `manifest-vocabulary`·`candidate-selection`·`verdict`·`preflight`·`run-records`·`run-store-fs`·`real-path`) 10, 저널 열(`learn/journal`·`learn/learning`·`lockfile`·`diag`) 4,
+ * ★ 실측 폐포: **51개 모듈 / 20,446줄**(자기 자신 557 포함) — 리더 열(`run-read`·`run-manifest`·`manifest-selection`·
+ *   `manifest-vocabulary`·`proof-record`·`candidate-selection`·`verdict`·`preflight`·`run-records`·`run-store-fs`·`real-path`) 11, 저널 열(`learn/journal`·`learn/learning`·`lockfile`·`diag`) 4,
  *   문맥 열(`tools/context`·`run-inspect`) 2, 범위 열(`patch-scope`·`scope-allowlist`·`test-discovery`·
  *   `deps-provision`·`project-config`·`deadline`·`providers/child-env`) 7, 봉투 넷(`envelope`·`reason-codes`·
  *   `reason-text`·`run-faults`), 적용 다섯(`apply-patch`·`git`·`providers/error-catalog`·
  *   `providers/resolve-binary`·`worktree-patch`), `confidence`·`redact`·`state-root` 3, 유틸 일곱
- *   (`util/errors`·`util/freeze`·`util/fs-atomic`·`util/hash`·`util/objects`·`util/paths`·`util/strings`) — 의존 42개 전수다. **`engine` 도 저장소(`run-artifacts`)도 0개다** — 이 관문은
+ *   (`util/errors`·`util/freeze`·`util/fs-atomic`·`util/hash`·`util/objects`·`util/paths`·`util/strings`) — 의존 43개 전수다. **`engine` 도 저장소(`run-artifacts`)도 0개다** — 이 관문은
  *   끝난 실행을 읽어 현재 HEAD 정책으로 범위를 다시 재고 저널의 최신 행을 주석할 뿐 실행을 **만들지** 않으며,
  *   `test/guards/module-directions.test.mjs` 의 방향 표가 오케스트레이터/저장소 수입을 못 박는다.
  *
@@ -41,6 +41,11 @@
  *                      `unverified: "check_only"` 라고 적어 두었다. 그 행이 가리키는 인자가
  *                      없으면 계약의 그 줄은 닿을 수 없는 문장이다(D11 이 없애려는 유령의
  *                      한 종류다).
+ *     · `allow_unproven` — 선택. `contract/envelope.json` 의 `applyBody.proof` 행이 본문의
+ *                      `proof.overridden` 을 이 인자의 흔적으로 못박고, `confidenceByTool.
+ *                      orch_apply` 의 `unverified` 행이 그 뜻을 적는다. 이 인자가 없으면
+ *                      증명 게이트는 **탈출구 없는 문**이다 — 증명을 못 돌리는 저장소에서
+ *                      적용이 영영 막힌다.
  *   WS0 §1.4 가 함께 적어 둔 `three_way`·`candidate_id` 는 **안 받는다.**
  *     · `three_way`: WS5 스펙 §0 D4 는 HEAD 이동만으로 3-way를 고르지 않는다. 현재 작업
  *       트리에 direct를 먼저 시도하고, 그것이 안 붙을 때만 임시 인덱스 3-way와 `ls-files -u`로
@@ -58,8 +63,10 @@ import { confidenceOfApply } from '../confidence.mjs';
 import { failure, success } from '../envelope.mjs';
 import { inspectRepo } from '../git.mjs';
 import { readRuns, recordRunNote } from '../learn/journal.mjs';
+import { PROOF_STATUSES } from '../manifest-vocabulary.mjs';
 import { inspectPatch } from '../patch-scope.mjs';
 import { readProjectConfig } from '../project-config.mjs';
+import { readProofRecord } from '../proof-record.mjs';
 import { REASON } from '../reason-codes.mjs';
 import { renderNotice } from '../reason-text.mjs';
 import { statusOfReasonCode } from '../run-faults.mjs';
@@ -175,6 +182,49 @@ function winnerTreeOf(manifest) {
 }
 
 /**
+ * 오버라이드가 **없는** 두 값 — 증명이 돌았고 서지 않았다. 어휘의 정본은 `PROOF_STATUSES` 이고
+ * 여기서 걸러 쓰는 이유는 사본을 만들지 않기 위해서다(어휘가 줄면 이 목록도 같이 준다).
+ */
+const PROOF_FAILED = Object.freeze(PROOF_STATUSES.filter((one) => one === 'not_proven' || one === 'flaky'));
+
+/**
+ * ★★ **증명 게이트**(설계 §1.4). 읽기만 한다 — 이 함수는 아무것도 돌리지 않고 아무것도 쓰지 않는다.
+ *
+ *   proofGate({ stateRoot, runId, manifest, allowUnproven }, wired) ->
+ *     { ok: true, proof: {status, attemptId, overridden} } | { ok: false, reasonCode, params }
+ *
+ * ★★ 왜 이 문이 생겼나(실측): 실행 9(`run-mtcz280y-01xnz4`, 2026-08-28)는 첫 수용 후보를 냈는데도
+ *   봉투가 `unverified` 였다 — 회귀 증명은 전체 스위트 여섯 번이고 이 저장소는 한 번 ~7분이라
+ *   55분 상한이 다섯 번째 실행 뒤에 끊었다. 그래서 증명은 실행에서 떨어져 `orch_prove` 로 갔고,
+ *   「적용 시점에 증명이 아직 없다」가 예외가 아니라 **기본 상태**가 됐다. 그 상태를 조용히
+ *   통과시키면 이 도구는 증명이 있다는 인상만 주고 아무것도 확인하지 않는다.
+ * ★ 정체성은 **트리 해시와 패치 바이트**다(커밋 sha 가 아니다 — resume 게이트와 같은 원칙).
+ *   그 둘이 다르면 그 증명은 이 패치의 것이 아니고, 「증명이 있다」는 문장이 다른 패치를 가리킨다.
+ * ★ 못 읽은 기록은 **없는 기록과 같은 행**이다: 둘 다 「이 패치가 증명됐다」를 못 말한다. 다만
+ *   실패한 증명(`not_proven`·`flaky`)과는 절대 섞지 않는다 — 그쪽은 오버라이드가 없다.
+ */
+async function proofGate({ stateRoot, runId, manifest, allowUnproven }, wired = {}) {
+  if (manifest?.proofRequirement?.required !== true) {
+    return { ok: true, proof: { status: 'not_applicable', attemptId: null, overridden: false } };
+  }
+  const read = typeof wired.readProofRecord === 'function' ? wired.readProofRecord : readProofRecord;
+  const got = await read({ stateRoot, runId });
+  const record = got?.ok === true ? got.record : null;
+  const status = PROOF_STATUSES.includes(record?.status) ? record.status : null;
+  const attemptId = typeof record?.attemptId === 'string' ? record.attemptId : null;
+  if (PROOF_FAILED.includes(status)) {
+    return { ok: false, reasonCode: REASON.apply_proof_failed, params: { runId } };
+  }
+  if (status === 'proved' && record.treeHash === winnerTreeOf(manifest) &&
+      record.patchSha256 === manifest.winnerAlias?.sha256) {
+    return { ok: true, proof: { status, attemptId, overridden: false } };
+  }
+  return allowUnproven === true
+    ? { ok: true, proof: { status: status ?? 'unavailable', attemptId, overridden: true } }
+    : { ok: false, reasonCode: REASON.apply_proof_missing, params: { runId } };
+}
+
+/**
  * 후보의 **post-patch tree**를 stateRoot 임시 index로 읽어 scope를 다시 잰다.
  * 대상 작업 트리를 그대로 읽으면 새 symlink와 바뀐 package scripts가 아직 없어서 fail-open이다.
  * 승인 권위는 대상 저장소의 현재 HEAD에 커밋된 `.bom-orch.json`뿐이다. 일회성 `scope_allow`는
@@ -278,6 +328,8 @@ const carryFailure = (source, runId) => failure({
  *                  행이 아니다(그 행은 고지일 뿐이다).
  *   · `patchPath`  존재가 확인된 대표 패치의 절대 경로.
  *   · `checkOnly`  참이면 저장소를 바꾸지 않고 「무엇을 했을 것인가」만 보고한다.
+ *   · `proof`      `proofGate` 가 낸 `{status, attemptId, overridden}`. 이 함수는 그것을 **나르기만**
+ *                  한다 — 판정은 이미 관문에서 끝났고, 여기서 다시 재면 두 곳이 갈린다.
  *
  * 관문 셋(전부 저장소를 열기 **전**이다):
  *   1. **이 바이트가 그 실행의 패치인가** — WS0 §1.4 절차 (1). 매니페스트가 적어 둔 sha256·
@@ -294,7 +346,7 @@ const carryFailure = (source, runId) => failure({
  *   둘을 같은 거절에 묶어 두었고(적용기가 없었으므로) `unverified: "check_only"` 는 닿을 수
  *   없는 문장이었다 — 이 커밋에서 닿는다.
  */
-async function applyRun({ stateRoot, runId, manifest, patchPath, checkOnly }, wired = {}) {
+async function applyRun({ stateRoot, runId, manifest, patchPath, checkOnly, proof }, wired = {}) {
   let patchBytes = null;
   try {
     patchBytes = await readFile(patchPath);
@@ -368,6 +420,7 @@ async function applyRun({ stateRoot, runId, manifest, patchPath, checkOnly }, wi
     runId,
     applied: outcome.applied,
     checkOnly,
+    proof,
     mode: outcome.mode,
     staged: outcome.staged,
     verifiedBy: outcome.verifiedBy,
@@ -406,7 +459,7 @@ async function applyRun({ stateRoot, runId, manifest, patchPath, checkOnly }, wi
     // 바닥 한 장 — 긴 경로·긴 목록이 상한을 넘겨도 **무엇을 했는가**는 남는다. 이것이 없으면
     // `success()` 가 본문을 `{"truncatedReport:true"}` 로 조용히 갈아치운다.
     contentFallback: JSON.stringify({
-      runId, applied: outcome.applied, checkOnly, mode: outcome.mode, staged: outcome.staged,
+      runId, applied: outcome.applied, checkOnly, proof, mode: outcome.mode, staged: outcome.staged,
       verifiedBy: outcome.verifiedBy, head: outcome.head,
       scope: {
         flagged: scope.flagged,
@@ -419,7 +472,12 @@ async function applyRun({ stateRoot, runId, manifest, patchPath, checkOnly }, wi
     }),
     // ★ 값을 여기서 **고르지 않는다**(WS2 §3): `src/confidence.mjs` 가 도구별 표의 정본이고,
     //   `test/guards/confidence-literals.test.mjs` 가 이 자리의 리터럴을 금지한다.
-    confidence: confidenceOfApply({ applied: outcome.applied, verified: outcome.verifiedBy !== null }),
+    // ★ 리뷰 확인(Task 7 수정): `overridden` 을 나르지 않으면 `allow_unproven` 이 연 REAL apply가
+    //   git apply 성공 + 사후 확인 통과만으로 `verified` 를 낸다 — 증명된 적용과 구별되지 않는다.
+    //   `proof.overridden` 이 `proofGate` 가 이미 낸 값이므로 여기서는 나르기만 한다.
+    confidence: confidenceOfApply({
+      applied: outcome.applied, verified: outcome.verifiedBy !== null, overridden: proof.overridden === true,
+    }),
     notice,
     runId,
   });
@@ -434,7 +492,9 @@ async function applyRun({ stateRoot, runId, manifest, patchPath, checkOnly }, wi
  *   4. 기록을 못 읽는다   → `apply_run_unreadable`
  *   5. 패치가 없다       → `apply_patch_missing`
  *   6. 패치가 파일이 아니다/못 읽는다 → `apply_patch_unreadable`
- *   7. 적용             → `applyRun`(바이트 대조 · 저장소 확정 · `src/apply-patch.mjs`)
+ *   7. 증명이 없다/이 패치의 것이 아니다 → `apply_proof_missing`(`allow_unproven` 이 연다)
+ *      증명이 돌았고 서지 않았다        → `apply_proof_failed`(**아무것도 못 연다**)
+ *   8. 적용             → `applyRun`(바이트 대조 · 저장소 확정 · `src/apply-patch.mjs`)
  *
  * ★ 3 과 4 를 가르는 것은 리더다(`readRunManifest`): 디렉터리가 있으면 「있었는데 못 읽는다」이고
  *   (`status_run_unreadable`), 아무것도 없으면 「없다」다(`status_run_not_found`). 같은 사실을 이
@@ -479,11 +539,19 @@ export async function runOrchApply(value, context) {
   // "그 실행은 대표 패치를 안 남겼다" 고 말하는데, 실제로는 그 자리를 무엇이 차지하고 있다.
   if (!entry.isFile()) return refuse(REASON.apply_patch_unreadable, { runId, params: { path: patchPath } });
 
+  // 7. 증명. `check_only` 도 같은 문을 지난다 — 「무엇을 했을 것인가」의 답에는 「그때 이 증명을
+  //    믿었을 것인가」가 들어 있고, 미리보기만 통과시키면 사용자는 다음 호출이 될 줄 안다.
+  const gate = await proofGate({
+    stateRoot, runId, manifest: read.manifest, allowUnproven: value.allow_unproven === true,
+  }, wired);
+  if (gate.ok !== true) return refuse(gate.reasonCode, { runId, params: gate.params });
+
   return applyRun({
     stateRoot,
     runId,
     manifest: read.manifest,
     patchPath,
     checkOnly: value.check_only === true,
+    proof: gate.proof,
   }, wired);
 }

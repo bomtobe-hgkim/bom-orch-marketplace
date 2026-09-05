@@ -170,23 +170,56 @@ export function confidenceOfReset({ counted = false, readable = false, cleared =
 /**
  * `orch_apply` 의 confidence. WS0 §2.2 · `contract/envelope.json` 의 `confidenceByTool.orch_apply`:
  *
- * > **verified** — 적용 뒤 확인이 통과 / **unverified** — `check_only`
+ * > **verified** — 적용 뒤 확인이 통과 / **unverified** — `check_only`, 또는 `allow_unproven` 이
+ * > 증명 없는 패치를 통과시켰다(본문의 `proof.overridden` 이 어느 쪽인지 말한다)
  *
- * 두 인자가 그 두 행이다. `applied` 는 저장소가 실제로 바뀌었나(`check_only` 면 거짓이다),
+ * 세 인자가 그 두 행이다. `applied` 는 저장소가 실제로 바뀌었나(`check_only` 면 거짓이다),
  * `verified` 는 **사후 확인이 통과했나** — 갈래마다 다른 검사이고(직접은 역방향 `--check`,
  * 3-way 는 예상 트리 대조) 어느 쪽이 돌았는지는 본문의 `verifiedBy` 가 이름으로 말한다.
  *
  * ★ 왜 둘 다 필요한가: 「적용했다」와 「그것이 기록대로 들어갔다」는 다른 사실이다. 적용은 했는데
  *   확인이 안 된 봉투는 성공이 아니라 `apply_verification_failed` 라 여기 오지 않지만, 그때
  *   `applied` 하나로 verified 를 내는 모양을 남겨 두면 다음 갈래가 그 구멍으로 들어온다.
+ * ★ **리뷰 확인(Task 7 수정)**: `overridden` 이 참이면 `applied`·`verified` 값과 무관하게
+ *   `unverified` 다. `allow_unproven` 으로 연 REAL apply 는 git apply 가 성공하고 사후 확인도
+ *   통과할 수 있다 — 그러나 그 성공은 증명이 아니라 게이트를 넘은 것이다. 여기서 `verified` 를
+ *   내면 오버라이드로 통과한 적용과 실제로 증명된 적용이 봉투에서 구별되지 않는다 — 실행 9
+ *   (2026-08-28, `run-mtcz280y-01xnz4`)가 「증명 없이 verified 처럼 읽힌다」로 남긴 것과 같은
+ *   인상을 이 자리가 다시 만들 수는 없다. `overridden` 은 `proofGate` 가 낸 값을 그대로 나른다.
  * ★ `disputed` 는 이 함수에 없다. 계약의 그 행(「scope 미허용 flagged」)은 범위 축이고, 그것은
  *   아래 `confidenceOfScope` 가 낸다 — WS5 태스크 9 가 그 둘을 접는다.
  *
- * @param {{applied?: boolean, verified?: boolean}} [result]
+ * @param {{applied?: boolean, verified?: boolean, overridden?: boolean}} [result]
  * @returns {'verified'|'unverified'}
  */
-export function confidenceOfApply({ applied = false, verified = false } = {}) {
+export function confidenceOfApply({ applied = false, verified = false, overridden = false } = {}) {
+  if (yes(overridden)) return 'unverified';
   return yes(applied) && yes(verified) ? 'verified' : 'unverified';
+}
+
+/**
+ * `orch_prove` 의 confidence. 계약의 `confidenceByTool.orch_prove` 세 행 그대로:
+ *
+ * > **verified** — 여섯 칸이 다 돌았고 판정이 `proved` 다
+ * > **unverified** — 그 밖의 상태(`not_proven`·`flaky`·`unavailable`·`not_applicable`)
+ * > **disputed** — 기록과 재현이 어긋나 돌리지 못했다(환경 지문·후보 트리·테스트 델타)
+ *
+ * ★ `refused` 는 「거부됐다」 전부가 아니라 **재현 불일치**만이다. 「그런 실행이 없다」는
+ *   반박이 아니라 부재이고, 부재를 `disputed` 로 내면 `success()` 가 status 를 `failed` 로
+ *   강등하면서 봉투가 "기계 증거가 성공을 반박한다" 고 말한다 — 아무것도 안 재 본 호출에서.
+ *   그래서 거부 봉투 중 그 셋만 이 함수를 부르고, 나머지는 confidence 를 아예 안 싣는다
+ *   (`src/tools/apply.mjs` 의 거부가 같은 자세다).
+ *
+ * ★ 2026-08-28 실측이 이 함수의 이유다: 실행 9 는 후보를 수용하고도 증명이 55분 상한에
+ *   잘려 `unverified` 였다. 증명이 도구로 떨어져 나온 지금, 「증명했다」를 말할 수 있는
+ *   자리는 이 함수 하나다.
+ *
+ * @param {{status?: string, refused?: boolean}} [proof]
+ * @returns {'verified'|'unverified'|'disputed'}
+ */
+export function confidenceOfProve({ status = 'unavailable', refused = false } = {}) {
+  if (yes(refused)) return 'disputed';
+  return status === 'proved' ? 'verified' : 'unverified';
 }
 
 /**

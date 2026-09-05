@@ -6,7 +6,7 @@ import { validLane } from './manifest-vocabulary.mjs';
 import { deepFreeze } from './util/freeze.mjs';
 import { sha256 } from './util/hash.mjs';
 import { cloneData, exactDenseArray, exactObject, hasExactKeys, ownDataValue } from './util/objects.mjs';
-import { boundedText, compareUtf8, hasForbiddenText as hasForbiddenChars, isSafeCount } from './util/strings.mjs';
+import { boundedText, clipWhole, compareUtf8, hasForbiddenText as hasForbiddenChars, isSafeCount } from './util/strings.mjs';
 
 const TERMINAL_CLASSES = new Set(['verified', 'usable_unverified']);
 const ROLES = new Set(['worker', 'verifier']);
@@ -199,10 +199,14 @@ function candidateEligibilityUnsafe(candidate) {
       candidate.crossVerificationCompleted !== true ||
       !Array.isArray(candidate.issues?.openIds) || candidate.issues.openIds.length !== 0 ||
       candidate.issues?.count !== 0 || candidate.issues?.limitExceeded !== false) return false;
+  // ★★ `deferred` 는 「증명이 실패했다」가 아니라 「아직 안 돌았다」다. 실행 9(2026-08-28)는
+  //   여섯 칸 증명(이 저장소에서 42분)이 55분 상한에 **다섯 번째 스위트 실행에서** 잘려
+  //   `unavailable` 로 접혔고, 이 줄이 그 초록 후보를 자격 없음으로 빼 버렸다. 증명은 이제
+  //   `orch_prove` 것이므로 유예는 통과시키고, 시도했다가 실패한 셋은 그대로 뺀다.
   if (candidate.terminalClass === 'verified' &&
       (candidate.tests?.execution !== 'completed' || candidate.tests?.outcome !== 'pass' || candidate.tests?.stability !== 'stable' || candidate.tests?.trusted !== true ||
        candidate.tests?.complete !== true || candidate.regressionProof?.required === true &&
-       candidate.regressionProof.status !== 'proved')) return false;
+       !['proved', 'deferred'].includes(candidate.regressionProof.status))) return false;
   if (candidate.terminalClass === 'usable_unverified' && candidate.stopReason !== REASON.evidence_unavailable) return false;
   const patch = candidate.patch;
   const ref = patch?.ref;
@@ -252,7 +256,9 @@ export function selectSingleCandidate(candidate) {
 }
 
 const TERMINAL_RANK = Object.freeze({ verified: 1, usable_unverified: 0 });
-const PROOF_RANK = Object.freeze({ proved: 4, not_applicable: 3, not_proven: 2, unavailable: 1, flaky: 0 });
+// ★ `deferred` 와 `not_applicable` 이 **같은 3** 인 것은 의도다: 한 실행의 두 후보는 언제나 같은
+//   증명 상태를 들므로 이 칸은 무승부가 되고, 선택은 안정성·열린 이슈·범위가 가른다.
+const PROOF_RANK = Object.freeze({ proved: 4, not_applicable: 3, deferred: 3, not_proven: 2, unavailable: 1, flaky: 0 });
 const TEST_RANK = Object.freeze({ stable_repeated_full_pass: 3, stable_one_pass: 2, unknown_or_not_run: 1, flaky: 0 });
 const JUDGE_CATEGORIES = new Set(['correctness', 'security', 'requirements', 'scope', 'tests']);
 const MAX_JUDGE_DIFF_BYTES = 12000;
@@ -260,6 +266,8 @@ const MAX_JUDGE_FILES = 32;
 const MAX_JUDGE_ISSUE_FACTS = 20;
 const MAX_JUDGE_EVIDENCE_FACTS = 20;
 const MAX_JUDGE_CLAIM_CHARS = 400;
+/** 원장이 받는 산문의 상한 — `src/verdict.mjs` 의 MAX_FIELD_LENGTH 와 같은 수. 사영기는 이 안의 값을 잘라 싣는다. */
+const MAX_LEDGER_PROSE_CHARS = 2_000;
 /**
  * 뷰 하나의 JSON 예산 — 이제 상수가 아니라 **codex 프롬프트 예산에서 거꾸로 나눈 몫**이다.
  *
@@ -462,7 +470,12 @@ function readEntries(value) {
 }
 
 function normalizeMachineLedgerEntry(entry) {
-  const machine = exactObject(entry, ['id', 'namespace', 'status', 'fingerprint', 'observations']).value ?? null;
+  // ★ `label`(2026-08-28): `applyMachineIssues` 가 machine 항목에 실패 테스트 이름을 얹는다 — 프롬프트 전용이라
+  //   여기서는 **버린다**(심판은 눈을 가린 채 본다). 있으면 문자열이거나 null 이어야 하고, 그 밖의 키는 여전히
+  //   거부다. 적대적 리뷰가 잡은 것: 이 관용이 없으면 여섯 번째 키 하나가 두 후보의 심판 뷰를 통째로 없앤다.
+  const { label = null, ...rest } = entry !== null && typeof entry === 'object' && !Array.isArray(entry) ? entry : {};
+  if (label !== null && typeof label !== 'string') return null;
+  const machine = exactObject(rest, ['id', 'namespace', 'status', 'fingerprint', 'observations']).value ?? null;
   const observations = exactDenseArray(machine?.observations, 100);
   return machine !== null && machine.namespace === 'machine' && MACHINE_LEDGER_ID.test(machine.id) &&
     LEDGER_STATUSES.has(machine.status) && SHA256.test(machine.fingerprint) && observations !== null
@@ -533,16 +546,19 @@ function normalizeIssueFact(entry, index, nonce) {
   //   하나가 `normalizeIssueFact -> null -> buildJudgeView -> null` 로 번져 **두 레인의
   //   judge view 를 통째로** 없앴다(engine 이 `judge_view_unavailable` 로 c2 를 강등).
   //   집 스타일이 여러 줄 요약인 검증기는 그 자리에서 판정 자체를 잃는다.
-  //   길이 상한(MAX_JUDGE_CLAIM_CHARS)과 나머지 거부(NUL·기타 제어문자·U+FFFD·짝 없는
-  //   서로게이트·경로/정체/자격증명 누출)는 하나도 풀지 않는다. 이스케이프로 늘어나는
-  //   비용은 `normalizeJudgeView` 끝의 MAX_JUDGE_VIEW_ARGV_CHARS 가 그대로 닫는다.
+  //   길이는 **자른다**, 없애지 않는다(2026-08-28 리뷰 실측): 파서는 claim 을 2,000자까지 받는데 여기서
+  //   400자 초과를 null 로 접으면 같은 전파로 두 레인의 view 가 사라진다 — 실제 판정문(실행 8)은 이슈 다섯에
+  //   보통 길이의 문장을 실었다. 주장은 400자에서 자르고(말줄임표), 근거는 보여주지 않고 해시만 싣기 때문에
+  //   원장 상한까지 받는다. 나머지 거부(NUL·기타 제어문자·U+FFFD·짝 없는 서로게이트·경로/정체/자격증명
+  //   누출)는 하나도 풀지 않는다. 이스케이프로 늘어나는 비용은 `normalizeJudgeView` 끝의
+  //   MAX_JUDGE_VIEW_ARGV_CHARS 가 그대로 닫는다.
   if (category === MISSING || claim === MISSING || evidence === MISSING || !JUDGE_CATEGORIES.has(category) ||
-      boundedCleanText(claim, MAX_JUDGE_CLAIM_CHARS, { allowDiffWhitespace: true }) === null ||
-      boundedCleanText(evidence, MAX_JUDGE_CLAIM_CHARS, { allowDiffWhitespace: true }) === null) return null;
+      boundedCleanText(claim, MAX_LEDGER_PROSE_CHARS, { allowDiffWhitespace: true }) === null ||
+      boundedCleanText(evidence, MAX_LEDGER_PROSE_CHARS, { allowDiffWhitespace: true }) === null) return null;
   return {
     anonymousId: `I${String(index + 1).padStart(2, '0')}`,
     category,
-    claim,
+    claim: clipWhole(claim, MAX_JUDGE_CLAIM_CHARS - 1),
     evidenceDigest: sha256(`${nonce}\0verifier\0${evidence}`),
   };
 }

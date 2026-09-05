@@ -4,7 +4,21 @@ import { deepFreeze } from './util/freeze.mjs';
 import { cloneData, hasExactKeys } from './util/objects.mjs';
 import { boundedText } from './util/strings.mjs';
 
-const MAX_PROVIDER_CONTENT_LENGTH = 2_000;
+/**
+ * 답 **전체**의 상한 — 필드 상한(`MAX_FIELD_LENGTH`)과 다른 수다. 이 검사의 몫은 폭주한 답을 `JSON.parse`
+ * 전에 자르는 것 하나뿐이고, 저장되는 문자열은 전부 필드 상한이 따로 잰다. 테스트가 경계를 재도록 export 한다.
+ *
+ * ★★ 2026-08-28 라이브 실측(실행 8 lane-b): 이 값이 2,000 이었을 때 claude 의 6,682자 판정문(요약 793자·
+ *   이슈 5개·비고 984자, 필드마다 상한 안)이 `content_oversize` 로 거절됐고, 형식 정정 재요청도 같은 답을
+ *   받아 lane 이 `unverified` 로 닫혔다. 계획서(2026-08-12)의 2,000 은 「provider **문자열 하나**」의
+ *   상한인데 답 전체에 옮겨 적혔던 것이다 — 이슈 하나의 세 필드만으로 넘길 수 있는 수라, 이슈를 둘 이상
+ *   적는 판정문은 실제 모델 상대로 한 번도 읽힐 수 없었다.
+ * ★ 왜 1,000,000 인가(리뷰 실측, 같은 날): 64,000 으로 올렸을 때도 스키마가 허용하는 판정문 — 재확인 100개 ×
+ *   근거 2,000자 ≈ 205,000자, 이슈 100개 × 세 필드 + 비고 50개 ≈ 705,000자 — 이 파싱 전에 거절됐다. 같은 결함이
+ *   한 자릿수 위에 남은 것이다. 스키마가 허용하는 가장 큰 평문 판정문 위에 두고, 이스케이프(`\uXXXX`)로
+ *   부풀 여지까지는 쫓지 않는다 — 이 수는 폭주 방지이지 스키마 상한이 아니다. 1M 문자의 `JSON.parse` 는 수 ms 다.
+ */
+export const MAX_PROVIDER_CONTENT_LENGTH = 1_000_000;
 /** 한 후보의 열린 차단 이슈 상한. `verifier_issue_limit_exceeded` 의 문구가 이 수를 말한다. */
 export const MAX_BLOCKING_ISSUES = 100;
 const MAX_NOTES = 50;
@@ -134,20 +148,30 @@ function validateExpected(expected, phase) {
  *   `blocked/unverified` 로 끝났다 — 즉 **품질 게이트가 실제 모델 상대로는 한 번도 통과할 수
  *   없었다.** 단위 스텁은 전부 맨 JSON 을 돌려줘서 스위트 전체가 이 자리를 못 봤다.
  *
- * ★ 관용은 **여는 펜스 한 줄과 닫는 펜스 한 줄뿐**이다. 산문이 섞였거나 블록이 둘이면 그대로
- *   거부한다 — 판정문은 문서 하나여야 하고, 텍스트에서 JSON 을 긁어모으기 시작하면 어느 것이
- *   판정인지 **우리가** 고르게 된다. 그것이 provider 자기보고를 신뢰하지 않겠다는 이 설계의
- *   전제를 무너뜨린다.
+ * ★ 관용은 **펜스 한 블록**이다. 2026-08-28 실행 8 lane-b 실측: 진짜 claude 는 그 펜스 **앞에** 「판정
+ *   결과입니다. (파일은 읽기만 했고 …)」 한 줄을 붙였고, 형식 정정 재요청에도 같았다. 펜스가 정확히 하나이고
+ *   그 밖의 텍스트에 중괄호·대괄호·백틱이 없으면 후보는 하나뿐이라 우리가 고르는 일이 없다 — 그 산문은
+ *   버린다. 블록이 둘이거나 펜스 밖에 JSON 처럼 생긴 것이 있으면 그대로 거부한다: 텍스트에서 JSON 을
+ *   긁어모으기 시작하면 어느 것이 판정인지 **우리가** 고르게 되고, 그것이 provider 자기보고를 신뢰하지
+ *   않겠다는 이 설계의 전제를 무너뜨린다. 펜스 **줄** 위의 텍스트는 밖 검사가 못 보므로, 여는 줄의 태그
+ *   규칙과 닫는 줄의 「백틱뿐」 규칙이 그 자리의 문이다. 펜스 밖 산문이 JSON 스칼라(`"FAIL"`·`true`)여도
+ *   버린다 — 객체가 아닌 것은 애초에 판정 후보가 아니라서(`invalid_json_shape`) 전제가 지켜진다.
+ * ★ 백틱 넷 이상의 펜스도 받는다(값 안에 ``` 가 있으면 모델이 바깥 펜스를 늘린다) — 닫는 줄은 여는 줄과
+ *   같은 길이. 판사 답(`src/candidate-selection.mjs` `parseJudgeDecision`)도 이 함수로 벗긴다 — 같은 관용, 같은 거부.
  */
 export function unfenceProviderJson(text) {
   const trimmed = typeof text === 'string' ? text.trim() : '';
-  if (!trimmed.startsWith('```') || !trimmed.endsWith('```') || trimmed.length < 7) return trimmed;
-  const newline = trimmed.indexOf('\n');
-  if (newline === -1) return trimmed;
+  const lines = trimmed.split('\n');
+  const fences = lines.flatMap((line, index) => (/^```/.test(line.trim()) ? [index] : []));
+  if (fences.length !== 2) return trimmed;
+  const [open, close] = fences;
   // 여는 펜스의 언어 태그는 있어도 되고 없어도 되지만, 그 줄에 다른 것이 오면 손대지 않는다.
-  const opener = trimmed.slice(3, newline).trim();
-  if (opener !== '' && !/^[A-Za-z0-9+-]{1,20}$/.test(opener)) return trimmed;
-  return trimmed.slice(newline + 1, -3).trim();
+  const [, run, opener] = lines[open].trim().match(/^(`{3,})(.*)$/);
+  if (opener.trim() !== '' && !/^[A-Za-z0-9+-]{1,20}$/.test(opener.trim())) return trimmed;
+  if (lines[close].trim() !== run) return trimmed;
+  const outside = [...lines.slice(0, open), ...lines.slice(close + 1)].join('\n');
+  if (/[{}[\]`]/.test(outside)) return trimmed;
+  return lines.slice(open + 1, close).join('\n').trim();
 }
 
 export function parseVerifierVerdict(raw, expected) {
@@ -346,6 +370,12 @@ export function applyMachineIssues(ledger, input) {
   const machineEntries = next.entries.filter((entry) => entry.namespace === 'machine');
   const byFingerprint = new Map(machineEntries.map((entry) => [entry.fingerprint, entry]));
   const incoming = new Set(fingerprints);
+  // ★ 라벨은 지문 옆의 **읽을 수 있는 이름**(`경로 › 이름`, 어댑터가 파싱한 것)이다. 프롬프트 전용이라
+  //   attempt 기록에는 안 실린다(`issueBodies` 가 claim 만 옮긴다). 문자열이 아니면 버리고, 라벨 없이
+  //   온 실행은 있던 라벨을 지우지 않는다 — 이름을 잃는 쪽이 더 나쁘다.
+  const labels = input.labels !== null && typeof input.labels === 'object' && !Array.isArray(input.labels) ? input.labels : {};
+  const labelFor = (fingerprint) => (Object.hasOwn(labels, fingerprint) && typeof labels[fingerprint] === 'string' && labels[fingerprint] !== ''
+    ? labels[fingerprint] : null);
   for (const entry of machineEntries) {
     if (entry.status === 'open' && !incoming.has(entry.fingerprint)) entry.status = 'resolved';
   }
@@ -353,6 +383,7 @@ export function applyMachineIssues(ledger, input) {
     const existing = byFingerprint.get(fingerprint);
     if (existing) {
       existing.status = 'open';
+      if (labelFor(fingerprint) !== null) existing.label = labelFor(fingerprint);
       continue;
     }
     if (sortOpenIds(next.entries).length >= MAX_BLOCKING_ISSUES) return issueLimitExceeded();
@@ -361,6 +392,7 @@ export function applyMachineIssues(ledger, input) {
       namespace: 'machine',
       status: 'open',
       fingerprint,
+      label: labelFor(fingerprint),
       observations: [],
     };
     next.entries.push(entry);

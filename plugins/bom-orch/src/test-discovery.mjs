@@ -13,7 +13,7 @@
  *   실행도 모른다. 러너가 되읽어 대조에 쓰는 넷(`readDefinitionValue`·`readPinValue`·
  *   `contentDigest`·`extractIniSection`)을 함께 내보내는 이유가 그것이다 — **유도할 때 쓴
  *   그 함수로** 워크트리를 다시 읽어야 정상 프로젝트가 위조로 잡히지 않는다.
- * ★ 실측 폐포: **22개 모듈 / 8,868줄**(자기 자신 1,147 포함) — `git`(1,128)과 그것이 끄는 `providers/error-catalog`·`providers/resolve-binary`·`state-root`, `deps-provision`(594)과 그것이 끄는 `deadline`·`providers/child-env`, `project-config`(489), `reason-codes`·`reason-text`, `util/{errors,freeze,strings}`. 저장소 모듈도 `engine` 도 `test-runner` 도 **0개**다. 태스크 7 이 `reason-text` 를 **직접** 수입하던 줄을 걷었지만(알림 생산자가 없어졌다) 모듈 수는 그대로다 — `project-config` 가 여전히 그것을 끈다. T3 재심 N1–N3 수정 파도(올림, 실측): 자기 자신 1,122 -> 1,147(+25 — `GRADLE_WRAPPERS` 에 `gradlew.bat` 한 항목·`detect` 술어 수정·N1(vite.config.* WHY)·N3(Cargo.toml 이유) 정정 주석), 모듈 수는 그대로다.
+ * ★ 실측 폐포: **22개 모듈 / 8,985줄**(자기 자신 1,147 포함) — `git`(1,128)과 그것이 끄는 `providers/error-catalog`·`providers/resolve-binary`·`state-root`, `deps-provision`(594)과 그것이 끄는 `deadline`·`providers/child-env`, `project-config`(489), `reason-codes`·`reason-text`, `util/{errors,freeze,strings}`. 저장소 모듈도 `engine` 도 `test-runner` 도 **0개**다. 태스크 7 이 `reason-text` 를 **직접** 수입하던 줄을 걷었지만(알림 생산자가 없어졌다) 모듈 수는 그대로다 — `project-config` 가 여전히 그것을 끈다. T3 재심 N1–N3 수정 파도(올림, 실측): 자기 자신 1,122 -> 1,147(+25 — `GRADLE_WRAPPERS` 에 `gradlew.bat` 한 항목·`detect` 술어 수정·N1(vite.config.* WHY)·N3(Cargo.toml 이유) 정정 주석), 모듈 수는 그대로다.
  * ★ 수입하는 쪽: 실측 **10**. 규칙은 「이 파일을 가리키는 정적 지정자가 있는 파일」이고 다시 재는
  *   명령은 `git grep -lE "from '[^']*test-discovery\.mjs'"` 다 — 이름을 나열하지 않는 이유는 그
  *   목록이 이 헤더에서 이미 두 번 낡았기 때문이다(「넷뿐」 → 「여섯뿐」, 둘 다 실측은 더 컸다).

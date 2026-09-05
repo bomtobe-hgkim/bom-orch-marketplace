@@ -15596,12 +15596,12 @@ function resolveThroughShim(shimPath, { platform = process.platform } = {}) {
   }
   const dir = dirname(shimPath);
   const windows = platform === "win32";
-  const { isAbsolute: isAbsolute39 } = pathGrammarFor(platform);
+  const { isAbsolute: isAbsolute41 } = pathGrammarFor(platform);
   const PLACEHOLDERS = /^(?:%~?dp0%|\$basedir|\$\{basedir\}|\.)[\\/]?/;
   for (const match of text2.matchAll(/[^\s"'()]+\.(?:js|mjs|cjs)\b/g)) {
     const raw = match[0].replace(PLACEHOLDERS, "");
     if (raw === "") continue;
-    const candidate = isAbsolute39(raw) ? raw : join(dir, ...shimSegments(raw, windows));
+    const candidate = isAbsolute41(raw) ? raw : join(dir, ...shimSegments(raw, windows));
     if (isFile(candidate)) {
       return { command: process.execPath, prefixArgs: [candidate] };
     }
@@ -15673,7 +15673,7 @@ function buildClaudeArgs({
   if (typeof model === "string" && model !== "") args.push("--model", model);
   if (typeof effort === "string" && effort !== "") args.push("--effort", effort);
   if (readOnly) {
-    args.push("--tools", "");
+    args.push("--tools", "", "--strict-mcp-config");
     return args;
   }
   const tools = Array.isArray(allowedTools) ? allowedTools.filter((t) => typeof t === "string" && t !== "") : [];
@@ -15735,7 +15735,8 @@ var SUBJECTS = Object.freeze([
   "resume",
   "preflight",
   "deps",
-  "status"
+  "status",
+  "proof"
 ]);
 var FORBIDDEN_PREFIXES = Object.freeze(["error_", "unknown_", "failed_"]);
 function entry(code, subject, stopReason, meaning, { poison = false, since = "0.2.2" } = {}) {
@@ -15770,6 +15771,8 @@ var REASON_CODES = Object.freeze([
   entry("apply_patch_empty", "apply", "blocked", "The run left a representative patch of zero bytes, which is not a patch that can be applied - git rejects empty input outright. It says the delegate changed no file, which is a fact about the run rather than a fault of this call.", { since: "0.3.0" }),
   entry("apply_patch_missing", "apply", "blocked", "The run read cleanly but the patch orch_apply would apply is not on this state root: the run ended with no representative patch (a tie, or no candidate) or the cleanup has already reclaimed it. It mirrors status_run_not_found - the caller named something that is not there - so the coarse value is blocked and nothing was attempted.", { since: "0.3.0" }),
   entry("apply_patch_unreadable", "apply", "infrastructure_failed", 'Something is at the representative patch path but it is not a readable file. This is not "there is no patch": the difference decides whether the caller looks for another run or looks at what is occupying that path.', { since: "0.3.0" }),
+  entry("apply_proof_failed", "apply", "rejected", "A regression proof for this run exists and did not pass: it ended not_proven or flaky. Nothing was applied, and allow_unproven does not override it - that flag exists for a proof that was never obtained, not for one that ran and disagreed. The coarse value is rejected rather than blocked because the refusal is a judgement about the patch, not about something missing on this state root.", { since: "0.4.0" }),
+  entry("apply_proof_missing", "apply", "blocked", "This run needs a regression proof and none that matches the patch about to be applied is on this state root: no proof record at all, a record whose status is unavailable or not_applicable, or a proved record whose tree hash and patch digest are not the winner this call would apply. All three read the same way to the caller - nothing here vouches for these bytes - so they share one code, and allow_unproven turns every one of them into a pass that carries overridden true in the body. It mirrors apply_patch_missing: the coarse value is blocked and nothing was attempted.", { since: "0.4.0" }),
   entry("apply_run_not_found", "apply", "blocked", "No run of that name is on this state root, so there is nothing to apply. It mirrors status_run_not_found and learning_run_not_found: the caller named something that is not there, the coarse value is blocked, and the handler ships status invalid because the fault is in the value the caller chose. A run id that is not even shaped like one this server makes lands here too, before any path is built from it. So does the reaper-shaped case where the patch alias outlived its run directory (patches are kept longer than what is under runs/): the baseline the patch was written against lives in the manifest, so a patch with no run records is not applicable, only present.", { since: "0.3.0" }),
   entry("apply_project_unknown", "apply", "blocked", "The durable records of this run do not name the repository it was started in, so orch_apply has no target to apply to. The tool takes exactly two arguments and a repository path is not one of them by design: a patch is bound to the repository whose state its baseline captured, and applying it wherever the server happens to be running is the foot-gun that binding exists to prevent.", { since: "0.3.0" }),
   entry("apply_project_unusable", "apply", "blocked", "The repository this run was started in is named in the run records but cannot be used now: the path is gone, it is not a git repository, or it has no commit to compare against. Distinct from not knowing which repository it was, because the next thing to do differs - restoring or renaming a directory rather than reading the run records.", { since: "0.3.0" }),
@@ -15994,6 +15997,24 @@ var REASON_CODES = Object.freeze([
   entry("preflight_gateway_env_unsupported", "preflight", "blocked", "The host environment selects a vendor gateway deployment (Bedrock / Vertex), which this server does not support. The isolated child environment it builds for a delegate drops those variables by design, so the delegate would authenticate as an ordinary subscription user and fail after the run had already spent time and credit; the run is refused before any vendor process is started instead. Adding the variables to the opt-in allow list is a separate, owner-level decision (WS4b spec \xA78) because this repository cannot verify the claim that passing them through makes a gateway deployment work.", { since: "0.3.0" }),
   entry("preflight_no_provider_available", "preflight", "blocked", "No registered vendor CLI answered the preflight, so no role could be filled.", { since: "0.3.0" }),
   entry("preflight_provider_unavailable", "preflight", "blocked", "A role was pinned to a vendor whose preflight reported it unavailable.", { since: "0.3.0" }),
+  // proof — WS9 가 `orch_prove` 를 떼면서 연 주체. 실행이 아니라 **재현**의 어휘다: 끝난 실행의
+  // 선택된 후보 하나를 baseline 워크트리 위에 다시 세워 여섯 칸을 돌리는데, 그 재현의 전제
+  // (baseline 커밋 · 플랜/환경 지문 · 후보 트리 · 테스트 델타)가 하나라도 어긋나면 증명은 시작조차
+  // 하지 않는다. 어긋남 셋(`proof_environment_drift`·`proof_candidate_mismatch`·`proof_delta_mismatch`)만
+  // policy_failure 인 이유: 기록과 재현이 **다른 것을 말한다**는 뜻이고, 그것은 인프라 사고가 아니라
+  // 이 서버가 스스로 거부해야 하는 사실이다(봉투 신뢰도는 disputed 로 나간다).
+  entry("proof_baseline_unavailable", "proof", "blocked", "The baseline commit this run was written against is no longer in the repository at {path}, so there is no tree to build the b0 cells on. Git can discard unreachable objects long before this server's thirty-day retention expires, and a run that started from a dirty tree recorded a synthetic baseline commit that was never referenced by anything. Reproducing a proof from the tree hash alone is not offered: no path in this server builds a worktree from a tree that has no commit.", { since: "0.4.0" }),
+  entry("proof_candidate_mismatch", "proof", "policy_failure", "The winner patch applied to the reproduced baseline does not produce the tree hash the run recorded for that candidate, so the thing about to be proven is not the thing that was selected. Identity is the tree, never the commit sha - the reproduction commits at a different time with a different parent and would never match on sha. This is a policy failure rather than an infrastructure fault: the records and the reproduction disagree, and proving the wrong tree would publish a proof that vouches for bytes nobody chose.", { since: "0.4.0" }),
+  entry("proof_candidate_unavailable", "proof", "blocked", "The run left no single selected candidate to prove: its selection ended in a tie or with no candidate at all, or the representative patch that names the winner is not on this state root any more. It mirrors apply_patch_missing - the proof and the apply gate ask the same question about the same one patch - so the coarse value is blocked and nothing was started.", { since: "0.4.0" }),
+  entry("proof_delta_mismatch", "proof", "policy_failure", "The test-only delta recomputed between the reproduced baseline and the reproduced candidate does not hash to the digest the run recorded in its candidate evidence, so the br cells would be run against a different set of test files than the run measured. Like proof_candidate_mismatch this is a policy failure: the two readings disagree, and the br half of the proof is exactly the half that the delta defines.", { since: "0.4.0" }),
+  entry("proof_environment_drift", "proof", "policy_failure", "The frozen test plan re-derived from the reproduced baseline tree does not carry the plan fingerprint and environment fingerprint the run recorded, so evidence collected now would not be evidence for that run. The measured producers are an upgraded or reinstalled runtime, an edited test command in the committed project config, and a changed reporter asset. It is the proof-side twin of resume_environment_mismatch, and its coarse value is policy_failure because the refusal is this server keeping two readings from being spliced together.", { since: "0.4.0" }),
+  entry("proof_in_progress", "proof", "blocked", "Another proof of this run holds the create-once lock beside its proof records, so this call did not start a second one. One proof at a time per run is what makes the ordinal a durable identity: two concurrent proofs would take the same next ordinal, and the second create-once write would lose its record. The lock carries its own expiry - the wait ceiling plus ten minutes of slack, which is longer than any proof this server will let run - and a call that finds an expired or unparseable lock reclaims it once and proceeds, so a process killed mid-proof does not wedge every later proof of that run.", { since: "0.4.0" }),
+  entry("proof_not_required", "proof", "unverified", "This task needs no regression proof, so no cell was run and a not_applicable record was written instead. It is a SUCCESS envelope, not a refusal: the record exists so the apply gate has a canonical answer to read rather than reading a missing file as a skipped proof. Its coarse value is unverified for the same reason evidence_unavailable is - nothing was proven, and nothing failed.", { since: "0.4.0" }),
+  entry("proof_project_unknown", "proof", "blocked", "The durable records of this run do not name the repository it was started in, so there is no repository to reproduce the baseline from. It mirrors apply_project_unknown exactly: a proof is bound to the repository whose state its baseline captured, and reproducing it wherever the server happens to be running is the foot-gun that binding exists to prevent.", { since: "0.4.0" }),
+  entry("proof_project_unusable", "proof", "blocked", "The repository this run was started in is named in the run records but cannot be used now: the path is gone, it is not a git repository, or it has no commit to reproduce against. Distinct from not knowing which repository it was, because the next thing to do differs - restoring or renaming a directory rather than reading the run records.", { since: "0.4.0" }),
+  entry("proof_record_unreadable", "proof", "infrastructure_failed", "Something is at the proof record path but it is not a readable proof record: the file is not JSON, is over the record byte cap, did not normalize against the exact key set, or names a different run. Bytes are never rewritten to make a record readable, so this names an unreadable record rather than a missing one - a run that has simply not been proven yet reads as absent, and the apply gate answers that case with apply_proof_missing instead.", { since: "0.4.0" }),
+  entry("proof_run_not_found", "proof", "blocked", "No run of that name is on this state root, so there is nothing to prove. It mirrors apply_run_not_found and status_run_not_found - the caller named something that is not there - so the coarse value is blocked and nothing was attempted. A run id that is not even shaped like one this server makes lands here too, before any path is built from it.", { since: "0.4.0" }),
+  entry("proof_run_unreadable", "proof", "infrastructure_failed", "The run exists on this state root but its manifest could not be read or did not normalize, so the baseline, the frozen plan fingerprints and the selected candidate the proof must reproduce are all unavailable. Bytes are never rewritten to make a run readable, so this names an unreadable record rather than a missing one.", { since: "0.4.0" }),
   entry("provider_below_security_floor", "provider", "blocked", "The vendor CLI chosen to write is below the security floor this server requires of a write role.", { since: "0.3.0" }),
   entry("provider_cli_not_found", "provider", "provider_failed", "resolveBinary could not find the vendor CLI on PATH."),
   entry("provider_cli_shim_only", "provider", "provider_failed", "Only a .CMD/.BAT shell shim was found; this repo only spawns with shell:false."),
@@ -16458,6 +16479,14 @@ var REASON_TEXT = deepFreeze({
     "Something is at {path} but it is not a readable patch file",
     "Look at what occupies that path, then start a new run rather than applying whatever is there"
   ),
+  apply_proof_failed: text(
+    "The regression proof for run {runId} did not pass, so nothing was applied; allow_unproven does not override a proof that ran and disagreed",
+    "Read the proof record for the failing cell, fix the candidate and start a new run; a failed proof is a fact about the patch, not about this call"
+  ),
+  apply_proof_missing: text(
+    "Run {runId} needs a regression proof and this state root has none that matches the patch about to be applied, so nothing was applied",
+    "Call orch_prove with this run_id and apply once it reports proved, or pass allow_unproven true to apply without a proof"
+  ),
   apply_run_not_found: text("No run named {runId} is on this state root, so there is nothing to apply", RECOVERY_STATUS_LIST),
   apply_project_unknown: text(
     "The records of run {runId} do not name the repository it was started in, so there is no repository to apply its patch to",
@@ -16754,6 +16783,54 @@ var REASON_TEXT = deepFreeze({
   preflight_gateway_env_unsupported: text("This host selects a vendor gateway deployment ({names}), which this server does not support", "Unset {names} in the shell that starts this server, or start it from a shell without them, then retry the run"),
   preflight_no_provider_available: text("No vendor CLI answered the preflight, so no role could be filled", RECOVERY_INSTALL),
   preflight_provider_unavailable: text("The {role} role was pinned to {vendor}, which the preflight reported unavailable", "Install that vendor CLI and check that PATH reaches it, then retry the run"),
+  // proof — `orch_prove` 가 재현에 실패한 자리들. 회복 문구가 「다시 실행하라」로 모이는 것은 이
+  // 도구의 실패가 재시도로 낫는 종류가 아니기 때문이다: 어긋난 것은 이 호출이 아니라 실행이 남긴
+  // 기록과 오늘의 저장소 사이의 사실이고, 같은 저장소에서 다시 불러도 같은 답이 온다.
+  proof_baseline_unavailable: text(
+    "The baseline commit this run was written against is gone from {path}, so the b0 cells have no tree to run on",
+    "Start a new run against the repository as it is now; a pruned baseline cannot be rebuilt from the run records"
+  ),
+  proof_candidate_mismatch: text(
+    "Applying this run's patch to the reproduced baseline does not rebuild the tree the run recorded for its selected candidate, so the proof would vouch for a different tree",
+    "Start a new run against the repository as it is now rather than proving a tree nobody selected"
+  ),
+  proof_candidate_unavailable: text(
+    "Run {runId} has no single selected candidate to prove: it ended in a tie or with no candidate, or its representative patch is no longer on this state root",
+    "Call orch_status with this run_id to see how the selection ended"
+  ),
+  proof_delta_mismatch: text(
+    "The test-only delta recomputed for this candidate does not match the digest the run recorded, so the br cells would measure a different set of test files",
+    "Start a new run against the repository as it is now; a proof cannot be spliced onto a delta the run never measured"
+  ),
+  proof_environment_drift: text(
+    "The frozen test plan re-derived from this run's baseline no longer carries the plan and environment fingerprints the run recorded, so evidence collected now would not be evidence for that run",
+    "Restore the toolchain and test command this run used, or start a new run in the environment as it is now"
+  ),
+  proof_in_progress: text(
+    "Another proof of run {runId} is already running on this state root, so this call did not start a second one",
+    "Wait for that proof to finish and read its record; a lock left by a killed process expires on its own and the next call reclaims it"
+  ),
+  proof_not_required: text(
+    "This task needs no regression proof, so no test cell was run and a not_applicable record was written for the apply gate to read",
+    "Call orch_apply with this run_id; the apply gate passes a run whose proof was never required"
+  ),
+  proof_project_unknown: text(
+    "The records of run {runId} do not name the repository it was started in, so there is no repository to reproduce its baseline from",
+    "Locate that repository from your own records and apply the retained patch there by hand; orch_prove cannot infer the target"
+  ),
+  proof_project_unusable: text(
+    "The repository this run was started in, {path}, is missing, is not a git repository, or has no commit to reproduce against",
+    "Restore that repository, then call orch_prove again"
+  ),
+  proof_record_unreadable: text(
+    "Something is at {path} but it is not a readable proof record",
+    "Look at what occupies that path and move it aside, then call orch_prove again"
+  ),
+  proof_run_not_found: text("No run named {runId} is on this state root, so there is nothing to prove", RECOVERY_STATUS_LIST),
+  proof_run_unreadable: text(
+    "The records of that run could not be read, so the baseline, the frozen plan and the selected candidate a proof must reproduce are all unavailable",
+    RECOVERY_STATUS_LIST
+  ),
   provider_below_security_floor: text("The {vendor} CLI at version {version} is below the security floor a write role requires", "Update the {vendor} CLI to {floor} or newer, or pin a different vendor as the writer"),
   provider_cli_not_found: text("The {vendor} CLI was not found on PATH", RECOVERY_INSTALL_VENDOR),
   provider_cli_shim_only: text("Only a shell shim was found for the {vendor} CLI, and this server spawns without a shell", "Install the native {vendor} executable, then retry"),
@@ -17164,6 +17241,8 @@ var SAMPLE_PARAMS = deepFreeze({
   apply_patch_empty: { path: "<project>" },
   apply_patch_missing: { runId: "run-0000000000000-aaaaaaaa" },
   apply_patch_unreadable: { path: "<stateRoot>/patches/run-0000000000000-aaaaaaaa.patch" },
+  apply_proof_failed: { runId: "run-0000000000000-aaaaaaaa" },
+  apply_proof_missing: { runId: "run-0000000000000-aaaaaaaa" },
   apply_project_unknown: { runId: "run-0000000000000-aaaaaaaa" },
   apply_project_unusable: { path: "<project>" },
   apply_run_not_found: { runId: "run-0000000000000-aaaaaaaa" },
@@ -17224,10 +17303,10 @@ var SAMPLE_PARAMS = deepFreeze({
   //   실재로 만들었다 — 골든이 "… is not a tool this server serves" 라고 적은 채 그 도구를
   //   서빙하게 된다(리서치 메모 §C.1 이 미리 적어 둔 함정이다).
   //   그래서 이번에는 **예약 목록에서 고르지 않는다** — 예약된 이름은 언젠가 실재가 되고, 그때
-  //   같은 자기모순이 세 번째로 돌아온다. `orch_cancel` 은 WS0 계약이 여덟으로 못박은 도구
-  //   집합 **밖**이고(취소는 `orch_status` 가 서빙한다), 그래서 호출자가 실제로 틀리는 이름
-  //   이면서 실재가 될 자리가 없다. `test/tool-contract.test.mjs` 가 두 사실을 잰다.
-  config_tool_unknown: { name: "orch_cancel", tools: "orch_models, orch_run, orch_config, orch_stats, orch_status, orch_apply, orch_reward, orch_reset" },
+  //   같은 자기모순이 세 번째로 돌아온다. `orch_cancel` 은 지금 아홉으로 못박힌 도구 집합
+  //   **밖**이고(취소는 `orch_status` 가 서빙한다), 그래서 호출자가 실제로 틀리는 이름이면서
+  //   실재가 될 자리가 없다. `test/tool-contract.test.mjs` 가 두 사실을 잰다.
+  config_tool_unknown: { name: "orch_cancel", tools: "orch_models, orch_run, orch_config, orch_stats, orch_status, orch_prove, orch_apply, orch_reward, orch_reset" },
   config_uncommitted: { file: ".bom-orch.json" },
   config_unreadable: { file: ".bom-orch.json", detail: "the repository could not say whether it exists (exit 128: fatal: not a git repository)" },
   config_wait_ms_invalid: { waitMs: -1 },
@@ -17269,6 +17348,13 @@ var SAMPLE_PARAMS = deepFreeze({
   learning_write_boundary_failed: { name: "after-pending", detail: "EPERM: operation not permitted" },
   preflight_gateway_env_unsupported: { names: "CLAUDE_CODE_USE_BEDROCK" },
   preflight_provider_unavailable: { role: "verifier", vendor: "codex" },
+  proof_baseline_unavailable: { path: "<project>" },
+  proof_candidate_unavailable: { runId: "run-0000000000000-aaaaaaaa" },
+  proof_in_progress: { runId: "run-0000000000000-aaaaaaaa" },
+  proof_project_unknown: { runId: "run-0000000000000-aaaaaaaa" },
+  proof_project_unusable: { path: "<project>" },
+  proof_record_unreadable: { path: "<stateRoot>/proofs/run-0000000000000-aaaaaaaa/proof.json" },
+  proof_run_not_found: { runId: "run-0000000000000-aaaaaaaa" },
   provider_below_security_floor: { vendor: "claude", version: "1.0.0", floor: "2.0.0" },
   provider_cli_not_found: { vendor: "codex" },
   provider_cli_shim_only: { vendor: "claude" },
@@ -17290,9 +17376,9 @@ var SAMPLE_PARAMS = deepFreeze({
   resume_environment_mismatch: { runId: "run-0000000000000-aaaaaaaa" },
   resume_manifest_unreadable: { runId: "run-0000000000000-aaaaaaaa" },
   resume_run_not_found: { runId: "run-0000000000000-aaaaaaaa" },
-  // ★ 엔진의 `MAX_WAIT_MS` 와 같은 수다(WS3 §0-W1 이 3,600,000 → 3,300,000 으로 내렸다).
-  //   여기서 engine 을 import 하면 순환이 생기므로(engine 이 이 파일을 부른다) 값을 적고,
-  //   `test/guards/wait-budget-inequality.test.mjs` 가 두 수가 갈리는 순간 붉어진다.
+  // ★ `src/deadline.mjs` 의 `MAX_WAIT_MS` 와 같은 수다(WS3 §0-W1 이 3,600,000 → 3,300,000 으로 내렸다).
+  //   WS9 태스크 4 뒤에는 순환이 아니지만 여전히 **안 수입한다**: 이 파일을 무는 모든 실패 경로의
+  //   폐포에 `deadline` 이 얹히고, 그 값보다 `wait-budget-inequality` 가드가 싸다.
   run_deadline_exceeded: { waitMs: 33e5 },
   run_nested_invocation: { runId: "run-0000000000000-aaaaaaaa" },
   run_tool_failed: { detail: "Cannot read properties of undefined" },
@@ -17423,7 +17509,7 @@ function compactPath(rawPath, options = {}) {
   const raw = typeof rawPath === "string" ? rawPath : "";
   const platform = options.platform ?? process.platform;
   const windows = platform === "win32";
-  const { delimiter: delimiter2, isAbsolute: isAbsolute39 } = pathGrammarFor(platform);
+  const { delimiter: delimiter2, isAbsolute: isAbsolute41 } = pathGrammarFor(platform);
   const limit = options.limit ?? CMD_ENV_VALUE_LIMIT;
   const prepend = Array.isArray(options.prepend) ? options.prepend.filter((d) => typeof d === "string" && d !== "") : [];
   const rawEntries = raw === "" ? [] : raw.split(delimiter2);
@@ -17450,7 +17536,7 @@ function compactPath(rawPath, options = {}) {
   let missingDropped = 0;
   for (const entry2 of entries) {
     const dir = normalizePathEntry(entry2);
-    if (dir === "" || !isAbsolute39(dir)) {
+    if (dir === "" || !isAbsolute41(dir)) {
       missingDropped += 1;
       continue;
     }
@@ -17775,7 +17861,9 @@ async function runCli({
   runId,
   authNames = [],
   collect: collect2,
-  sendStdin = true
+  sendStdin = true,
+  // 자체 못의 값 — 테스트가 줄이기 위해서만 받는다. 제품 호출자는 주지 않는다.
+  hangGuardMs = DEFAULT_TIMEOUT_MS
 } = {}) {
   const fail3 = (extra) => ({
     ...collect2(""),
@@ -17849,8 +17937,10 @@ async function runCli({
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => stderrChunks.push(chunk));
     signal?.addEventListener("abort", onAbort, { once: true });
-    const cap = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
-    timer = setTimeout(() => stop("timedOut"), cap);
+    const hasSignal = typeof signal?.addEventListener === "function";
+    const guard = Number.isFinite(hangGuardMs) && hangGuardMs > 0 ? hangGuardMs : DEFAULT_TIMEOUT_MS;
+    const cap = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : hasSignal ? null : guard;
+    if (cap !== null) timer = setTimeout(() => stop("timedOut"), cap);
     child.stdin.on("error", () => {
     });
     if (sendStdin) {
@@ -18277,8 +18367,6 @@ var EVIDENCE_UNREACHABLE = "unreachable";
 var AUTH_UNKNOWN = "auth_unknown";
 var AUTH_NOT_LOGGED_IN = "auth_not_logged_in";
 var PROOF_MULTIPLIER_BASELINE = 2;
-var PROOF_MULTIPLIER_PROVEN = 6;
-var SHARED_BASELINE_RUNS = 2;
 var CODEX_COMMAND_LINE_MAX_CHARS = 32767;
 var CODEX_ARGV_RESERVE_CHARS = 1024;
 var CODEX_PROMPT_BUDGET_CHARS = CODEX_COMMAND_LINE_MAX_CHARS - CODEX_ARGV_RESERVE_CHARS;
@@ -18292,7 +18380,7 @@ function codexArgvChars(text2) {
   return value.length + escapes;
 }
 var CODEX_WORKER_PROMPT_OVERHEAD_CHARS = 3099;
-var CODEX_VERIFIER_PROMPT_OVERHEAD_CHARS = 5892;
+var CODEX_VERIFIER_PROMPT_OVERHEAD_CHARS = 5618;
 var CODEX_PROMPT_OVERHEAD_CHARS = Math.max(CODEX_WORKER_PROMPT_OVERHEAD_CHARS, CODEX_VERIFIER_PROMPT_OVERHEAD_CHARS);
 var nonNegativeInt = (value, fallback = 0) => Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
 var positiveInt = (value, fallback) => Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
@@ -18327,13 +18415,11 @@ function evidenceReachable(input = {}) {
     ...shape
   });
 }
-function proofMultiplier(input = {}) {
-  return input?.proofRequirement?.required === true && witnessAccepted(input?.plan, input?.witnessAdapters) ? PROOF_MULTIPLIER_PROVEN : PROOF_MULTIPLIER_BASELINE;
+function proofMultiplier() {
+  return PROOF_MULTIPLIER_BASELINE;
 }
 function serialSuiteRuns(input = {}) {
-  const cells = proofMultiplier(input);
-  const passes = positiveInt(input?.candidateCount, 1) * positiveInt(input?.budget, 1);
-  return cells === PROOF_MULTIPLIER_PROVEN ? SHARED_BASELINE_RUNS + (cells - SHARED_BASELINE_RUNS) * passes : cells * passes;
+  return PROOF_MULTIPLIER_BASELINE * positiveInt(input?.candidateCount, 1) * positiveInt(input?.budget, 1);
 }
 function argvBudget(input = {}) {
   const budgetChars = positiveInt(input?.budgetChars, CODEX_PROMPT_BUDGET_CHARS);
@@ -18531,6 +18617,8 @@ async function run({
     evalTokens: runResult.usage?.outputTokens ?? null,
     truncated,
     doneReason,
+    hung: runResult.hung === true,
+    // 끊은 뒤에도 파이프가 안 닫혔다(run-cli) — settle 로그 줄이 싣는 한 비트.
     // notice 는 답변이 아니라 실행에 대한 진술이다 — content 에 이어붙이지 않는다.
     notice: sandboxNotice(role, platform),
     // 실패가 아니면 null 이다. 키 자체는 항상 있다(위 unstarted 의 이유와 같다).
@@ -19030,6 +19118,8 @@ async function run2({
     evalTokens: runResult.usage?.outputTokens ?? null,
     truncated,
     doneReason,
+    hung: runResult.hung === true,
+    // 끊은 뒤에도 파이프가 안 닫혔다(run-cli) — settle 로그 줄이 싣는 한 비트.
     // codex 는 OS 샌드박스가 있어 샌드박스 격차는 알릴 것이 없다. 다만 호출부가 도구
     // 집합 제한을 요청했는데 이 CLI 에는 그 채널이 없으면 그 사실은 알려야 한다 —
     // 조용히 무시하면 호출부는 워커에게 Bash 가 없다고 믿는다.
@@ -19622,7 +19712,7 @@ function validateArgs(args, spec) {
 }
 
 // src/engine.mjs
-import { isAbsolute as isAbsolute35, join as join33, relative as relative9, resolve as resolve14 } from "node:path";
+import { isAbsolute as isAbsolute36, join as join34, relative as relative9, resolve as resolve14 } from "node:path";
 
 // src/artifact-settlement.mjs
 import { isAbsolute as isAbsolute3 } from "node:path";
@@ -19939,8 +20029,13 @@ function confidenceOfReward({ readBackMatches = false } = {}) {
 function confidenceOfReset({ counted = false, readable = false, cleared = 0, snapshotWritten = false } = {}) {
   return yes(counted) && yes(readable) && (cleared === 0 || yes(snapshotWritten)) ? "verified" : "unverified";
 }
-function confidenceOfApply({ applied = false, verified = false } = {}) {
+function confidenceOfApply({ applied = false, verified = false, overridden = false } = {}) {
+  if (yes(overridden)) return "unverified";
   return yes(applied) && yes(verified) ? "verified" : "unverified";
+}
+function confidenceOfProve({ status = "unavailable", refused = false } = {}) {
+  if (yes(refused)) return "disputed";
+  return status === "proved" ? "verified" : "unverified";
 }
 function confidenceOfScope({ flagged = false }) {
   return yes(flagged) ? "disputed" : "verified";
@@ -19948,6 +20043,7 @@ function confidenceOfScope({ flagged = false }) {
 
 // src/deadline.mjs
 var MAX_TIMEOUT_MS = 2147483647;
+var MAX_WAIT_MS = 33e5;
 function timeoutSignal(timeoutMs) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return void 0;
   return AbortSignal.timeout(Math.max(1, Math.floor(Math.min(timeoutMs, MAX_TIMEOUT_MS))));
@@ -23199,6 +23295,7 @@ function buildRecovery(omitted) {
 
 // src/manifest-vocabulary.mjs
 var LANES = Object.freeze(["lane-a", "lane-b"]);
+var PROOF_STATUSES = Object.freeze(["proved", "deferred", "not_applicable", "not_proven", "unavailable", "flaky"]);
 function validLane(value) {
   return LANES.includes(value);
 }
@@ -23215,7 +23312,7 @@ var RUN_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 var WINDOWS_DEVICE_PATTERN = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
 var SELECTED_OUTCOMES = /* @__PURE__ */ new Set(["winner", "single_survivor", "equivalent"]);
 var ALL_OUTCOMES = /* @__PURE__ */ new Set([...SELECTED_OUTCOMES, "tie", "none"]);
-var PROOF_STATUSES = /* @__PURE__ */ new Set(["proved", "not_applicable", "not_proven", "unavailable", "flaky"]);
+var PROOF_STATUSES2 = new Set(PROOF_STATUSES);
 var SCOPE_REASON_LIMIT = 10;
 var SCOPE_REASON_CHARS = 200;
 var SCOPE_RULE_SET = new Set(SCOPE_RULES);
@@ -23270,7 +23367,7 @@ function normalizedCandidates(values, candidateCount, paths) {
   const seen = /* @__PURE__ */ new Set();
   for (const value of array2) {
     const object3 = exactObject(value, ["candidateId", "patchPresent", "proofStatus"]).value ?? null;
-    if (object3 === null || !validLane(object3.candidateId) || seen.has(object3.candidateId) || typeof object3.patchPresent !== "boolean" || !PROOF_STATUSES.has(object3.proofStatus)) return null;
+    if (object3 === null || !validLane(object3.candidateId) || seen.has(object3.candidateId) || typeof object3.patchPresent !== "boolean" || !PROOF_STATUSES2.has(object3.proofStatus)) return null;
     if (candidateCount === 1 && object3.candidateId !== "lane-a" || paths.candidatePaths[object3.candidateId] === void 0) return null;
     seen.add(object3.candidateId);
     out.push({ candidateId: object3.candidateId, patchPresent: object3.patchPresent, proofStatus: object3.proofStatus });
@@ -23460,7 +23557,7 @@ var TUPLE_TERMINALS = /* @__PURE__ */ new Set(["verified", "usable_unverified"])
 var TUPLE_TESTS = /* @__PURE__ */ new Set(["stable_repeated_full_pass", "stable_one_pass", "unknown_or_not_run", "flaky"]);
 var DECISIVE_FIELDS = /* @__PURE__ */ new Set(["terminalClass", "proof", "tests", "openIssues", "scope"]);
 var TERMINAL_RANK = Object.freeze({ verified: 1, usable_unverified: 0 });
-var PROOF_RANK = Object.freeze({ proved: 4, not_applicable: 3, not_proven: 2, unavailable: 1, flaky: 0 });
+var PROOF_RANK = Object.freeze({ proved: 4, not_applicable: 3, deferred: 3, not_proven: 2, unavailable: 1, flaky: 0 });
 var TEST_RANK = Object.freeze({ stable_repeated_full_pass: 3, stable_one_pass: 2, unknown_or_not_run: 1, flaky: 0 });
 var SHA256_PATTERN = /^[0-9a-f]{64}$/;
 function closedReasonValue(value, allowed) {
@@ -23805,7 +23902,7 @@ function projectCandidates(value, { fileLimit = null, summarize = false } = {}) 
     const proofStatus = data(candidate, "proofStatus");
     const ids = boundedStrings(data(candidate, "openIssueIds"), { maximum: 100, chars: 128 });
     const openIssueCount = safeInteger(data(candidate, "openIssueCount"), { maximum: 100 });
-    if (!PROOF_STATUSES.has(proofStatus) || ids === null || openIssueCount !== ids.length) {
+    if (!PROOF_STATUSES2.has(proofStatus) || ids === null || openIssueCount !== ids.length) {
       throw new TypeError("Invalid candidate status projection.");
     }
     const terminalClass = data(candidate, "terminalClass");
@@ -23906,14 +24003,16 @@ function projectEvidence(value, limit = null, authority = null) {
   const kept = limit === null ? entries : entries.slice(0, limit);
   return { entries: kept, omitted: malformed + entries.length - kept.length };
 }
+var proofNext = (status) => status === "deferred" ? "orch_prove" : null;
 function projectRegressionProof(value, evidenceLimit = null, authority = null) {
   const projected = projectEvidence(data(value, "evidenceRefs"), evidenceLimit, authority);
   const status = data(value, "status");
   const selectedCandidateId = data(value, "selectedCandidateId");
   const priorOmitted = safeInteger(data(value, "omittedEvidenceCount"));
-  if (!PROOF_STATUSES.has(status) || !(selectedCandidateId === null || laneId(selectedCandidateId) !== null) || priorOmitted === null) throw new TypeError("Invalid regression proof projection.");
+  if (!PROOF_STATUSES2.has(status) || !(selectedCandidateId === null || laneId(selectedCandidateId) !== null) || priorOmitted === null) throw new TypeError("Invalid regression proof projection.");
   return {
     status,
+    next: proofNext(status),
     selectedCandidateId,
     evidenceRefs: projected.entries,
     omittedEvidenceCount: checkedAdd(priorOmitted, projected.omitted)
@@ -23925,7 +24024,7 @@ function projectObjective(value) {
   const decisiveField = data(value, "decisiveField");
   const tupleA = list(data(value, "tupleA"));
   const tupleB = list(data(value, "tupleB"));
-  const validTuple = (tuple) => tuple.length === 5 && TUPLE_TERMINALS.has(tuple[0]) && PROOF_STATUSES.has(tuple[1]) && TUPLE_TESTS.has(tuple[2]) && safeInteger(tuple[3]) !== null && Array.isArray(tuple[4]) && tuple[4].length === 2 && [0, 1].includes(tuple[4][0]) && safeInteger(tuple[4][1]) !== null;
+  const validTuple = (tuple) => tuple.length === 5 && TUPLE_TERMINALS.has(tuple[0]) && PROOF_STATUSES2.has(tuple[1]) && TUPLE_TESTS.has(tuple[2]) && safeInteger(tuple[3]) !== null && Array.isArray(tuple[4]) && tuple[4].length === 2 && [0, 1].includes(tuple[4][0]) && safeInteger(tuple[4][1]) !== null;
   if (!["a", "b", "tie", "equivalent"].includes(result2) || !(decisiveField === null || DECISIVE_FIELDS.has(decisiveField)) || !validTuple(tupleA) || !validTuple(tupleB)) return null;
   const compare = () => {
     const fields = ["terminalClass", "proof", "tests", "openIssues"];
@@ -24317,8 +24416,10 @@ function buildFixedContentProjection(summary) {
     }));
     const legacyPatch = data(summary, "aliasDurable") === true && Object.hasOwn(floor2, "patch") ? floor2.patch : null;
     const selectedFloorCandidate = floor2.selection.selectedCandidateId === null ? null : floor2.candidates.find((candidate) => candidate.candidateId === floor2.selection.selectedCandidateId);
+    const floorProofStatus = selectedFloorCandidate?.proofStatus ?? (rawProof?.selectedCandidateId === floor2.selection.selectedCandidateId ? rawProof.status : "unavailable");
     const proof = {
-      status: selectedFloorCandidate?.proofStatus ?? (rawProof?.selectedCandidateId === floor2.selection.selectedCandidateId ? rawProof.status : "unavailable"),
+      status: floorProofStatus,
+      next: proofNext(floorProofStatus),
       selectedCandidateId: floor2.selection.selectedCandidateId,
       evidenceRefs: [],
       omittedEvidenceCount: floor2.omittedCounts.evidence
@@ -24344,6 +24445,7 @@ function buildFixedContentProjection(summary) {
       attempts: [],
       regressionProof: {
         status: proof.status,
+        next: proof.next,
         selectedCandidateId: proof.selectedCandidateId,
         evidenceRefs: [],
         omittedEvidenceCount: proof.omittedEvidenceCount
@@ -24950,7 +25052,7 @@ async function endsWithNewline(file) {
 }
 
 // src/reaper.mjs
-import { isAbsolute as isAbsolute25 } from "node:path";
+import { isAbsolute as isAbsolute26 } from "node:path";
 
 // src/reaper-ledger.mjs
 import { mkdir as mkdir4 } from "node:fs/promises";
@@ -25353,8 +25455,8 @@ async function treeKill(pid, deps = {}) {
 // src/run-retention.mjs
 import { createHash as createHash4, randomBytes as randomBytes2 } from "node:crypto";
 import { constants as fsConstants3 } from "node:fs";
-import { lstat as lstat3, mkdir as mkdir5, open as open7, opendir as opendir2, readdir as readdir2, rename as rename3, rm as rm5, stat as stat6 } from "node:fs/promises";
-import { basename as basename6, dirname as dirname10, isAbsolute as isAbsolute16, join as join17, relative as relative3, resolve as resolve7 } from "node:path";
+import { lstat as lstat3, mkdir as mkdir6, open as open8, opendir as opendir2, readFile as readFile10, readdir as readdir3, rename as rename3, rm as rm6, stat as stat7 } from "node:fs/promises";
+import { basename as basename6, dirname as dirname10, isAbsolute as isAbsolute17, join as join18, relative as relative3, resolve as resolve7 } from "node:path";
 
 // src/run-manifest.mjs
 import { basename as basename5, dirname as dirname9, isAbsolute as isAbsolute14, join as join15, relative as relative2, resolve as resolve5, sep } from "node:path";
@@ -25364,7 +25466,7 @@ import { isAbsolute as isAbsolute13 } from "node:path";
 
 // src/verdict.mjs
 import { createHash as createHash2 } from "node:crypto";
-var MAX_PROVIDER_CONTENT_LENGTH = 2e3;
+var MAX_PROVIDER_CONTENT_LENGTH = 1e6;
 var MAX_BLOCKING_ISSUES = 100;
 var MAX_NOTES = 50;
 var MAX_FIELD_LENGTH = 2e3;
@@ -25423,12 +25525,16 @@ function validateExpected(expected, phase2) {
 }
 function unfenceProviderJson(text2) {
   const trimmed = typeof text2 === "string" ? text2.trim() : "";
-  if (!trimmed.startsWith("```") || !trimmed.endsWith("```") || trimmed.length < 7) return trimmed;
-  const newline = trimmed.indexOf("\n");
-  if (newline === -1) return trimmed;
-  const opener = trimmed.slice(3, newline).trim();
-  if (opener !== "" && !/^[A-Za-z0-9+-]{1,20}$/.test(opener)) return trimmed;
-  return trimmed.slice(newline + 1, -3).trim();
+  const lines = trimmed.split("\n");
+  const fences = lines.flatMap((line, index) => /^```/.test(line.trim()) ? [index] : []);
+  if (fences.length !== 2) return trimmed;
+  const [open11, close] = fences;
+  const [, run3, opener] = lines[open11].trim().match(/^(`{3,})(.*)$/);
+  if (opener.trim() !== "" && !/^[A-Za-z0-9+-]{1,20}$/.test(opener.trim())) return trimmed;
+  if (lines[close].trim() !== run3) return trimmed;
+  const outside = [...lines.slice(0, open11), ...lines.slice(close + 1)].join("\n");
+  if (/[{}[\]`]/.test(outside)) return trimmed;
+  return lines.slice(open11 + 1, close).join("\n").trim();
 }
 function parseVerifierVerdict(raw, expected) {
   if (!raw || raw.truncated !== false || typeof raw.content !== "string") return invalid("invalid_raw");
@@ -25599,6 +25705,8 @@ function applyMachineIssues(ledger, input) {
   const machineEntries = next.entries.filter((entry2) => entry2.namespace === "machine");
   const byFingerprint = new Map(machineEntries.map((entry2) => [entry2.fingerprint, entry2]));
   const incoming = new Set(fingerprints);
+  const labels = input.labels !== null && typeof input.labels === "object" && !Array.isArray(input.labels) ? input.labels : {};
+  const labelFor = (fingerprint) => Object.hasOwn(labels, fingerprint) && typeof labels[fingerprint] === "string" && labels[fingerprint] !== "" ? labels[fingerprint] : null;
   for (const entry2 of machineEntries) {
     if (entry2.status === "open" && !incoming.has(entry2.fingerprint)) entry2.status = "resolved";
   }
@@ -25606,6 +25714,7 @@ function applyMachineIssues(ledger, input) {
     const existing = byFingerprint.get(fingerprint);
     if (existing) {
       existing.status = "open";
+      if (labelFor(fingerprint) !== null) existing.label = labelFor(fingerprint);
       continue;
     }
     if (sortOpenIds(next.entries).length >= MAX_BLOCKING_ISSUES) return issueLimitExceeded();
@@ -25614,6 +25723,7 @@ function applyMachineIssues(ledger, input) {
       namespace: "machine",
       status: "open",
       fingerprint,
+      label: labelFor(fingerprint),
       observations: []
     };
     next.entries.push(entry2);
@@ -25748,7 +25858,7 @@ function unapprovedScope2(scope) {
 }
 function candidateEligibilityUnsafe(candidate) {
   if (candidate === null || typeof candidate !== "object" || !validLane(candidate.candidateId) || !validBinding(candidate.binding) || !TERMINAL_CLASSES2.has(candidate.terminalClass) || candidate.recovery !== null || unapprovedScope2(candidate.scope) || candidate.crossVerificationCompleted !== true || !Array.isArray(candidate.issues?.openIds) || candidate.issues.openIds.length !== 0 || candidate.issues?.count !== 0 || candidate.issues?.limitExceeded !== false) return false;
-  if (candidate.terminalClass === "verified" && (candidate.tests?.execution !== "completed" || candidate.tests?.outcome !== "pass" || candidate.tests?.stability !== "stable" || candidate.tests?.trusted !== true || candidate.tests?.complete !== true || candidate.regressionProof?.required === true && candidate.regressionProof.status !== "proved")) return false;
+  if (candidate.terminalClass === "verified" && (candidate.tests?.execution !== "completed" || candidate.tests?.outcome !== "pass" || candidate.tests?.stability !== "stable" || candidate.tests?.trusted !== true || candidate.tests?.complete !== true || candidate.regressionProof?.required === true && !["proved", "deferred"].includes(candidate.regressionProof.status))) return false;
   if (candidate.terminalClass === "usable_unverified" && candidate.stopReason !== REASON.evidence_unavailable) return false;
   const patch = candidate.patch;
   const ref = patch?.ref;
@@ -25776,7 +25886,7 @@ function selectSingleCandidate(candidate) {
   });
 }
 var TERMINAL_RANK2 = Object.freeze({ verified: 1, usable_unverified: 0 });
-var PROOF_RANK2 = Object.freeze({ proved: 4, not_applicable: 3, not_proven: 2, unavailable: 1, flaky: 0 });
+var PROOF_RANK2 = Object.freeze({ proved: 4, not_applicable: 3, deferred: 3, not_proven: 2, unavailable: 1, flaky: 0 });
 var TEST_RANK2 = Object.freeze({ stable_repeated_full_pass: 3, stable_one_pass: 2, unknown_or_not_run: 1, flaky: 0 });
 var JUDGE_CATEGORIES2 = /* @__PURE__ */ new Set(["correctness", "security", "requirements", "scope", "tests"]);
 var MAX_JUDGE_DIFF_BYTES = 12e3;
@@ -25784,6 +25894,7 @@ var MAX_JUDGE_FILES = 32;
 var MAX_JUDGE_ISSUE_FACTS = 20;
 var MAX_JUDGE_EVIDENCE_FACTS = 20;
 var MAX_JUDGE_CLAIM_CHARS = 400;
+var MAX_LEDGER_PROSE_CHARS = 2e3;
 var JUDGE_PROMPT_ENVELOPE_CHARS = 316;
 var LOCAL_ID_CHARS_PER_VIEW = 2 * (MAX_JUDGE_ISSUE_FACTS + MAX_JUDGE_EVIDENCE_FACTS);
 var MAX_JUDGE_VIEW_ARGV_CHARS = Math.floor(
@@ -25929,7 +26040,9 @@ function readEntries(value) {
   return entries === MISSING ? null : exactDenseArray(entries, 100);
 }
 function normalizeMachineLedgerEntry(entry2) {
-  const machine = exactObject(entry2, ["id", "namespace", "status", "fingerprint", "observations"]).value ?? null;
+  const { label = null, ...rest } = entry2 !== null && typeof entry2 === "object" && !Array.isArray(entry2) ? entry2 : {};
+  if (label !== null && typeof label !== "string") return null;
+  const machine = exactObject(rest, ["id", "namespace", "status", "fingerprint", "observations"]).value ?? null;
   const observations = exactDenseArray(machine?.observations, 100);
   return machine !== null && machine.namespace === "machine" && MACHINE_LEDGER_ID.test(machine.id) && LEDGER_STATUSES.has(machine.status) && SHA256.test(machine.fingerprint) && observations !== null ? machine : null;
 }
@@ -25982,11 +26095,11 @@ function normalizeIssueFact(entry2, index, nonce) {
   const category = ownData(issue2, "category");
   const claim = ownData(issue2, "claim");
   const evidence = ownData(issue2, "evidence");
-  if (category === MISSING || claim === MISSING || evidence === MISSING || !JUDGE_CATEGORIES2.has(category) || boundedCleanText(claim, MAX_JUDGE_CLAIM_CHARS, { allowDiffWhitespace: true }) === null || boundedCleanText(evidence, MAX_JUDGE_CLAIM_CHARS, { allowDiffWhitespace: true }) === null) return null;
+  if (category === MISSING || claim === MISSING || evidence === MISSING || !JUDGE_CATEGORIES2.has(category) || boundedCleanText(claim, MAX_LEDGER_PROSE_CHARS, { allowDiffWhitespace: true }) === null || boundedCleanText(evidence, MAX_LEDGER_PROSE_CHARS, { allowDiffWhitespace: true }) === null) return null;
   return {
     anonymousId: `I${String(index + 1).padStart(2, "0")}`,
     category,
-    claim,
+    claim: clipWhole(claim, MAX_JUDGE_CLAIM_CHARS - 1),
     evidenceDigest: sha256(`${nonce}\0verifier\0${evidence}`)
   };
 }
@@ -26319,7 +26432,7 @@ function selectCandidates(input) {
 // src/manifest-selection.mjs
 function normalizeComparisonTuple(value) {
   const array2 = exactDenseArray(value, 5);
-  if (array2 === null || array2.length !== 5 || !["verified", "usable_unverified"].includes(array2[0]) || !["proved", "not_applicable", "not_proven", "unavailable", "flaky"].includes(array2[1]) || !["stable_repeated_full_pass", "stable_one_pass", "unknown_or_not_run", "flaky"].includes(array2[2]) || !isSafeCount(array2[3])) return null;
+  if (array2 === null || array2.length !== 5 || !["verified", "usable_unverified"].includes(array2[0]) || !PROOF_STATUSES.includes(array2[1]) || !["stable_repeated_full_pass", "stable_one_pass", "unknown_or_not_run", "flaky"].includes(array2[2]) || !isSafeCount(array2[3])) return null;
   const scope = exactDenseArray(array2[4], 2);
   if (scope === null || scope.length !== 2 || ![0, 1].includes(scope[0]) || !isSafeCount(scope[1])) return null;
   return [array2[0], array2[1], array2[2], array2[3], [scope[0], scope[1]]];
@@ -26552,7 +26665,14 @@ function normalizeInitialManifest(value, runId) {
   const proof = exactObject(object3.proofRequirement, ["required", "reason"]).value ?? null;
   const planner = normalizeRoleBinding(object3.plannerBinding, "planner");
   const laneEntries = exactDenseArray(object3.laneBindings, 2);
-  const reasons = ["explicit_bug_fix", "explicit_non_bug", "default_code_change", "non_code_task"];
+  const reasons = [
+    "default_required",
+    "explicit_opt_out",
+    "explicit_bug_fix",
+    "explicit_non_bug",
+    "default_code_change",
+    "non_code_task"
+  ];
   if (baseline === null || !OBJECT_ID_PATTERN2.test(baseline.commit) || !OBJECT_ID_PATTERN2.test(baseline.tree) || plan === null || !SHA256_PATTERN2.test(plan.planFingerprint) || !SHA256_PATTERN2.test(plan.environmentFingerprint) || proof === null || typeof proof.required !== "boolean" || !reasons.includes(proof.reason) || planner === null || laneEntries === null || laneEntries.length !== object3.candidateCount || !(object3.deadlineAt === null || isSafeCount(object3.deadlineAt))) return null;
   const lanes = [];
   for (let index = 0; index < laneEntries.length; index += 1) {
@@ -26776,7 +26896,7 @@ function normalizeCandidateRef(value) {
   const patchRef = object3?.patchRef === null ? null : normalizeArtifactRef(object3?.patchRef);
   const tests = normalizeTests(object3?.tests);
   const scope = normalizeScope(object3?.scope);
-  if (object3 === null || !validLane(object3.candidateId) || !(object3.sourceAttemptId === null || boundedString3(object3.sourceAttemptId, 256)) || !["verified", "usable_unverified", "rejected", "blocked"].includes(object3.terminalClass) || !(object3.treeHash === null || OBJECT_ID_PATTERN2.test(object3.treeHash)) || patchRef === null && object3.patchRef !== null || patchRef !== null && (patchRef.kind !== "candidate" || patchRef.candidateId !== object3.candidateId) || !["proved", "not_applicable", "not_proven", "unavailable", "flaky"].includes(object3.proofStatus) || tests === null || scope === null) return null;
+  if (object3 === null || !validLane(object3.candidateId) || !(object3.sourceAttemptId === null || boundedString3(object3.sourceAttemptId, 256)) || !["verified", "usable_unverified", "rejected", "blocked"].includes(object3.terminalClass) || !(object3.treeHash === null || OBJECT_ID_PATTERN2.test(object3.treeHash)) || patchRef === null && object3.patchRef !== null || patchRef !== null && (patchRef.kind !== "candidate" || patchRef.candidateId !== object3.candidateId) || !PROOF_STATUSES.includes(object3.proofStatus) || tests === null || scope === null) return null;
   if (object3.terminalClass === "blocked" && object3.sourceAttemptId === null && (object3.treeHash !== null || patchRef !== null)) return null;
   return {
     candidateId: object3.candidateId,
@@ -27290,6 +27410,269 @@ function validateRunManifestTransitionV1(currentValue, nextValue) {
   return next;
 }
 
+// src/proof-record.mjs
+import { mkdir as mkdir5, open as open7, readFile as readFile9, readdir as readdir2, rm as rm5, stat as stat6 } from "node:fs/promises";
+import { isAbsolute as isAbsolute15, join as join16 } from "node:path";
+var PROOF_RECORD_KEYS = Object.freeze([
+  "schemaVersion",
+  "runId",
+  "candidateId",
+  "attemptId",
+  "ordinal",
+  "treeHash",
+  "patchSha256",
+  "planFingerprint",
+  "environmentFingerprint",
+  "testDeltaSha256",
+  "status",
+  "repairable",
+  "reasonCodes",
+  "evidenceIds",
+  "witnessIds",
+  "startedAt",
+  "finishedAt",
+  "expiresAt",
+  "cost"
+]);
+var PROOF_SCHEMA_VERSION = 1;
+var MAX_PROOF_ORDINAL = 999;
+var MAX_PROOF_JSON_BYTES = 2 * 1024 * 1024;
+var MAX_ID_CHARS = 256;
+var MAX_WITNESS_IDS = 2e4;
+var PROOF_LOCK_STALE_MS = 33e5 + 6e5;
+var RUN_ID_PATTERN2 = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+var OBJECT_ID_PATTERN3 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+var SHA256_PATTERN3 = /^[0-9a-f]{64}$/;
+var ATTEMPT_FILE_PATTERN = /^proof-(\d{3})\.json$/;
+var EVIDENCE_KINDS2 = Object.freeze(["b0", "br", "c"]);
+var IDENTITY_REQUIRED = "a proof path needs an absolute state root and a valid run id";
+var ORDINAL_REQUIRED = "a proof path needs an ordinal from 1 to 999";
+var CELL_REQUIRED = "a proof evidence path needs kind b0, br or c and repetition 1 or 2";
+function requireIdentity(stateRoot, runId) {
+  if (typeof stateRoot !== "string" || stateRoot === "" || !isAbsolute15(stateRoot) || typeof runId !== "string" || !RUN_ID_PATTERN2.test(runId)) throw new TypeError(IDENTITY_REQUIRED);
+}
+function ordinalText(ordinal2) {
+  if (!Number.isSafeInteger(ordinal2) || ordinal2 < 1 || ordinal2 > MAX_PROOF_ORDINAL) throw new TypeError(ORDINAL_REQUIRED);
+  return String(ordinal2).padStart(3, "0");
+}
+function proofDir(stateRoot, runId) {
+  requireIdentity(stateRoot, runId);
+  return join16(stateRoot, "proofs", runId);
+}
+function proofRecordPath(stateRoot, runId) {
+  return join16(proofDir(stateRoot, runId), "proof.json");
+}
+function proofAttemptPath(stateRoot, runId, ordinal2) {
+  return join16(proofDir(stateRoot, runId), `proof-${ordinalText(ordinal2)}.json`);
+}
+function proofEvidencePath(stateRoot, runId, ordinal2, kind, repetition) {
+  if (!EVIDENCE_KINDS2.includes(kind) || ![1, 2].includes(repetition)) throw new TypeError(CELL_REQUIRED);
+  return join16(proofDir(stateRoot, runId), "evidence", `${ordinalText(ordinal2)}-${kind}-${repetition}.json`);
+}
+function proofLockPath(stateRoot, runId) {
+  return join16(proofDir(stateRoot, runId), ".lock");
+}
+function proofAttemptId(runId, ordinal2) {
+  if (typeof runId !== "string" || !RUN_ID_PATTERN2.test(runId)) throw new TypeError(IDENTITY_REQUIRED);
+  return `${runId}/prove/${ordinalText(ordinal2)}`;
+}
+function boundedIdList(value, max = 64) {
+  return Array.isArray(value) && value.length <= max && value.every((entry2) => typeof entry2 === "string" && entry2.length > 0 && entry2.length <= MAX_ID_CHARS);
+}
+function normalizeCost(value) {
+  const cost = exactObject(value, ["testRuns"]).value ?? null;
+  const runs = exactObject(cost?.testRuns, ["count", "totalMs"]).value ?? null;
+  if (runs === null || !Number.isSafeInteger(runs.count) || runs.count < 0 || !Number.isSafeInteger(runs.totalMs) || runs.totalMs < 0) return null;
+  return { testRuns: { count: runs.count, totalMs: runs.totalMs } };
+}
+function normalizeProofRecord(value) {
+  const object3 = exactObject(value, PROOF_RECORD_KEYS).value ?? null;
+  if (object3 === null || object3.schemaVersion !== PROOF_SCHEMA_VERSION || typeof object3.runId !== "string" || !RUN_ID_PATTERN2.test(object3.runId) || !(object3.candidateId === null || validLane(object3.candidateId)) || !Number.isSafeInteger(object3.ordinal) || object3.ordinal < 1 || object3.ordinal > MAX_PROOF_ORDINAL || object3.attemptId !== `${object3.runId}/prove/${String(object3.ordinal).padStart(3, "0")}` || !(object3.treeHash === null || OBJECT_ID_PATTERN3.test(object3.treeHash)) || !(object3.patchSha256 === null || SHA256_PATTERN3.test(object3.patchSha256)) || !SHA256_PATTERN3.test(object3.planFingerprint ?? "") || !SHA256_PATTERN3.test(object3.environmentFingerprint ?? "") || !(object3.testDeltaSha256 === null || SHA256_PATTERN3.test(object3.testDeltaSha256)) || !PROOF_STATUSES.includes(object3.status) || typeof object3.repairable !== "boolean" || !boundedIdList(object3.reasonCodes) || !boundedIdList(object3.evidenceIds) || !boundedIdList(object3.witnessIds, MAX_WITNESS_IDS) || !Number.isSafeInteger(object3.startedAt) || object3.startedAt <= 0 || !Number.isSafeInteger(object3.finishedAt) || object3.finishedAt < object3.startedAt || !Number.isSafeInteger(object3.expiresAt) || object3.expiresAt <= 0) return null;
+  const cost = normalizeCost(object3.cost);
+  if (cost === null) return null;
+  return {
+    schemaVersion: PROOF_SCHEMA_VERSION,
+    runId: object3.runId,
+    candidateId: object3.candidateId,
+    attemptId: object3.attemptId,
+    ordinal: object3.ordinal,
+    treeHash: object3.treeHash,
+    patchSha256: object3.patchSha256,
+    planFingerprint: object3.planFingerprint,
+    environmentFingerprint: object3.environmentFingerprint,
+    testDeltaSha256: object3.testDeltaSha256,
+    status: object3.status,
+    repairable: object3.repairable,
+    reasonCodes: [...object3.reasonCodes],
+    evidenceIds: [...object3.evidenceIds],
+    witnessIds: [...object3.witnessIds],
+    startedAt: object3.startedAt,
+    finishedAt: object3.finishedAt,
+    expiresAt: object3.expiresAt,
+    cost
+  };
+}
+function jsonBytes2(value, limit) {
+  try {
+    const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}
+`, "utf8");
+    return bytes.length > limit ? null : bytes;
+  } catch {
+    return null;
+  }
+}
+async function readProofRecord({ stateRoot, runId } = {}) {
+  let path;
+  try {
+    path = proofRecordPath(stateRoot, runId);
+  } catch {
+    return { ok: false, reasonCode: REASON.proof_record_unreadable };
+  }
+  let bytes;
+  try {
+    bytes = await readFile9(path);
+  } catch (error2) {
+    if (error2?.code === "ENOENT") return { ok: true, record: null };
+    return { ok: false, reasonCode: REASON.proof_record_unreadable };
+  }
+  let parsed = null;
+  try {
+    if (bytes.length <= MAX_PROOF_JSON_BYTES) parsed = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    return { ok: false, reasonCode: REASON.proof_record_unreadable };
+  }
+  const record2 = normalizeProofRecord(parsed);
+  return record2 === null || record2.runId !== runId ? { ok: false, reasonCode: REASON.proof_record_unreadable } : { ok: true, record: record2 };
+}
+async function nextProofOrdinal({ stateRoot, runId } = {}) {
+  let dir;
+  try {
+    dir = proofDir(stateRoot, runId);
+  } catch {
+    return null;
+  }
+  let names;
+  try {
+    names = await readdir2(dir);
+  } catch (error2) {
+    return error2?.code === "ENOENT" ? 1 : null;
+  }
+  let highest = 0;
+  for (const name of names) {
+    const found = ATTEMPT_FILE_PATTERN.exec(name);
+    if (found !== null) highest = Math.max(highest, Number.parseInt(found[1], 10));
+  }
+  return highest >= MAX_PROOF_ORDINAL ? null : highest + 1;
+}
+async function ensureProofDirectories(stateRoot, runId) {
+  try {
+    await mkdir5(join16(proofDir(stateRoot, runId), "evidence"), { recursive: true, mode: 448 });
+    return { ok: true };
+  } catch (error2) {
+    return { ok: false, stage: "directory", reason: `${error2?.code ?? "unknown"}` };
+  }
+}
+async function createOnce(path, bytes, stage) {
+  let handle;
+  try {
+    handle = await open7(path, "wx", 384);
+    await handle.writeFile(bytes);
+    await handle.sync();
+    return { ok: true };
+  } catch (error2) {
+    return { ok: false, stage, reason: `${error2?.code ?? "unknown"}`, exists: error2?.code === "EEXIST" };
+  } finally {
+    await handle?.close().catch(() => {
+    });
+  }
+}
+async function writeProofRecord({ stateRoot, runId, record: record2 } = {}) {
+  const normalized = normalizeProofRecord(record2);
+  if (normalized === null || normalized.runId !== runId) return { ok: false, stage: "record", reason: "invalid" };
+  const bytes = jsonBytes2(normalized, MAX_PROOF_JSON_BYTES);
+  if (bytes === null) return { ok: false, stage: "record", reason: "unserializable" };
+  const directories = await ensureProofDirectories(stateRoot, runId);
+  if (!directories.ok) return directories;
+  const attemptPath2 = proofAttemptPath(stateRoot, runId, normalized.ordinal);
+  const written = await createOnce(attemptPath2, bytes, "attempt");
+  if (!written.ok) return written;
+  const digest2 = sha256(bytes);
+  const recordPath2 = proofRecordPath(stateRoot, runId);
+  const published = await writeFileAtomic(recordPath2, bytes, {
+    tempPath: `${recordPath2}.tmp-${ordinalText(normalized.ordinal)}-${digest2.slice(0, 12)}`,
+    fsync: true,
+    syncDir: true
+  });
+  return published.ok ? { ok: true, path: recordPath2, attemptPath: attemptPath2, sha256: digest2, bytes: bytes.length } : { ok: false, stage: "publish", reason: published.reason ?? published.stage };
+}
+async function writeProofEvidence({ stateRoot, runId, ordinal: ordinal2, kind, repetition, record: record2, expiresAt } = {}) {
+  if (record2 === null || typeof record2 !== "object" || typeof record2.evidenceId !== "string" || !Number.isSafeInteger(expiresAt) || expiresAt <= 0) return { ok: false, stage: "record", reason: "invalid" };
+  const bytes = jsonBytes2(record2, MAX_PROOF_JSON_BYTES);
+  if (bytes === null) return { ok: false, stage: "record", reason: "unserializable" };
+  const directories = await ensureProofDirectories(stateRoot, runId);
+  if (!directories.ok) return directories;
+  const path = proofEvidencePath(stateRoot, runId, ordinal2, kind, repetition);
+  const written = await createOnce(path, bytes, "evidence");
+  if (!written.ok) return written;
+  return { ok: true, ref: { kind: "evidence", path, sha256: sha256(bytes), bytes: bytes.length, expiresAt } };
+}
+async function acquireProofLock({ stateRoot, runId, pid, nowMs } = {}) {
+  if (!Number.isSafeInteger(pid) || pid < 0 || !Number.isSafeInteger(nowMs) || nowMs <= 0) {
+    return { ok: false, stage: "lock", reason: "invalid" };
+  }
+  const directories = await ensureProofDirectories(stateRoot, runId);
+  if (!directories.ok) return directories;
+  const path = proofLockPath(stateRoot, runId);
+  const body = jsonBytes2(
+    { schemaVersion: PROOF_SCHEMA_VERSION, kind: "proof-lock", runId, pid, nowMs, expiresAt: nowMs + PROOF_LOCK_STALE_MS },
+    MAX_PROOF_JSON_BYTES
+  );
+  if (body === null) return { ok: false, stage: "lock", reason: "unserializable" };
+  const written = await createOnce(path, body, "lock");
+  if (written.ok) return { ok: true, release: async () => {
+    await rm5(path, { force: true }).catch(() => {
+    });
+  } };
+  if (written.exists !== true) return written;
+  if (!await staleProofLock(path, nowMs)) return { ok: false, reasonCode: REASON.proof_in_progress };
+  try {
+    await rm5(path, { force: true });
+  } catch {
+    return { ok: false, reasonCode: REASON.proof_in_progress };
+  }
+  const retried = await createOnce(path, body, "lock");
+  if (!retried.ok) return retried.exists === true ? { ok: false, reasonCode: REASON.proof_in_progress } : retried;
+  return { ok: true, release: async () => {
+    await rm5(path, { force: true }).catch(() => {
+    });
+  } };
+}
+async function proofLockLive(path, nowMs, { readFile: readOne = readFile9, stat: statOne = stat6 } = {}) {
+  let raw;
+  try {
+    raw = await readOne(path, "utf8");
+  } catch (error2) {
+    if (error2?.code === "ENOENT") return false;
+    raw = void 0;
+  }
+  if (raw !== void 0) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Number.isSafeInteger(parsed?.expiresAt)) return parsed.expiresAt > nowMs;
+    } catch {
+    }
+  }
+  try {
+    const info = await statOne(path);
+    return Number(info.mtimeMs) + PROOF_LOCK_STALE_MS > nowMs;
+  } catch {
+    return false;
+  }
+}
+async function staleProofLock(path, nowMs) {
+  return !await proofLockLive(path, nowMs);
+}
+
 // src/run-store-fs.mjs
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -27305,7 +27688,7 @@ import {
   rename as fsRename2,
   unlink as fsUnlink
 } from "node:fs/promises";
-import { isAbsolute as isAbsolute15, join as join16, resolve as resolve6, win32 as pathWin322 } from "node:path";
+import { isAbsolute as isAbsolute16, join as join17, resolve as resolve6, win32 as pathWin322 } from "node:path";
 var DEP_KEYS = /* @__PURE__ */ new Set([
   "canonicalPath",
   "lstat",
@@ -27332,12 +27715,12 @@ var OWNER_VERIFY_DEP_KEYS = /* @__PURE__ */ new Set([
   "runCommand"
 ]);
 function ownerPathIsAbsolute(path, platform) {
-  return platform === "win32" ? pathWin322.isAbsolute(path) : isAbsolute15(path);
+  return platform === "win32" ? pathWin322.isAbsolute(path) : isAbsolute16(path);
 }
 function ownerPathResolve(path, platform) {
   return platform === "win32" ? pathWin322.resolve(path) : resolve6(path);
 }
-function jsonBytes2(value) {
+function jsonBytes3(value) {
   try {
     return Buffer.from(`${JSON.stringify(value, null, 2)}
 `, "utf8");
@@ -27371,8 +27754,8 @@ function parseWhoamiIdentity(text2) {
 }
 async function defaultWindowsBinary(name) {
   const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
-  if (!boundedString3(systemRoot, 4096) || !isAbsolute15(systemRoot)) throw new Error("missing system root");
-  const path = join16(systemRoot, "System32", name);
+  if (!boundedString3(systemRoot, 4096) || !isAbsolute16(systemRoot)) throw new Error("missing system root");
+  const path = join17(systemRoot, "System32", name);
   const info = await fsLstat(path);
   if (!info.isFile() || info.isSymbolicLink()) throw new Error("invalid system binary");
   return path;
@@ -27683,13 +28066,13 @@ var SCRATCH_NAMES = Object.freeze([
 var PATCH_NAMES = Object.freeze([/^[a-z0-9][a-z0-9_-]{0,63}\.patch$/]);
 var PLAN_SCRATCH_NAMES = Object.freeze([/^[a-z0-9][a-z0-9_-]{0,63}-planner-[A-Za-z0-9]{6}$/]);
 var LOG_NAMES = Object.freeze([/^[a-z0-9][a-z0-9_-]{0,63}\.jsonl$/]);
-var RUN_ID_PATTERN2 = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+var RUN_ID_PATTERN3 = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 var WINDOWS_DEVICE_PATTERN2 = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
 var INIT_LOCK_PATTERN = /^\.init-lock-([a-z0-9][a-z0-9_-]{0,63})\.json$/;
 var GENERATION_PATTERN2 = /^[0-9a-f]{12}$/;
 var CHECKPOINT_TEMP_PATTERN = /^\.tmp-manifest\.json-(0|[1-9]\d*)-([0-9a-f]{12})$/;
 function validRunId2(value) {
-  return typeof value === "string" && RUN_ID_PATTERN2.test(value) && !WINDOWS_DEVICE_PATTERN2.test(value);
+  return typeof value === "string" && RUN_ID_PATTERN3.test(value) && !WINDOWS_DEVICE_PATTERN2.test(value);
 }
 var exactLstat = (path) => lstat3(path, { bigint: true });
 function frozenRunResult({ removed = [], checked = 0, skipped = [] } = {}) {
@@ -28031,14 +28414,14 @@ async function validatePartialFinal(runDir2, lock, context) {
   for (const name of prefix) {
     const entry2 = entries.find((candidate) => candidate.name === name);
     if (direntKind(entry2) !== "directory") return { ok: false, code: "unsafe_type" };
-    const path = join17(runDir2, name);
+    const path = join18(runDir2, name);
     const checked = await safeExisting(path, "directory", context);
     if (!checked.ok) return checked;
     const nested = await listDirectory(path, context);
     if (nested === null || nested.length !== 0) return { ok: false, code: "unexpected_entry" };
   }
   if (tempNames.length === 1) {
-    const path = join17(runDir2, tempNames[0]);
+    const path = join18(runDir2, tempNames[0]);
     const temp = await safeReadFile(path, context, { max: MAX_RUN_MANIFEST_BYTES, code: "invalid_manifest" });
     if (!temp.ok) return temp;
     if (temp.bytes.length > 0) {
@@ -28221,7 +28604,7 @@ async function validateCheckpointTemp(path, current, currentBytes, context) {
   return validatedBytes !== null && validatedBytes.equals(temp.bytes) ? { ok: true } : { ok: false, code: "checkpoint_temp_invalid" };
 }
 async function patchesView(manifest, context) {
-  const patchesDir = join17(context.root, "patches");
+  const patchesDir = join18(context.root, "patches");
   const status = await lstatStatus(patchesDir, context.deps.lstat);
   if (status.exists === false) {
     context.snapshot.absent.add(patchesDir);
@@ -28244,7 +28627,7 @@ async function validateWinnerInventory(manifest, winner, context, targets) {
   const tempPrefix = `.tmp-${aliasName}-`;
   const relevant = view.entries.filter((entry2) => entry2.name === aliasName || entry2.name.startsWith(tempPrefix));
   if (winner === null) return relevant.length === 0 ? { ok: true } : { ok: false, code: "alias_mismatch" };
-  const finalPath = join17(view.path, aliasName);
+  const finalPath = join18(view.path, aliasName);
   const expectedRelative = artifactIdentityPath(manifest, winner);
   if (winner.relativePath !== expectedRelative || absoluteRelativePath(context.root, winner.relativePath) !== finalPath) {
     return { ok: false, code: "invalid_inventory" };
@@ -28304,7 +28687,7 @@ async function validateCompleteFinal(runDir2, manifestRecord, context) {
   for (const name of ["candidates", "attempts", "evidence"]) {
     const entry2 = rootEntries.find((candidate) => candidate.name === name);
     if (entry2 === void 0 || direntKind(entry2) !== "directory") return { ok: false, code: "unsafe_type" };
-    const path = join17(runDir2, name);
+    const path = join18(runDir2, name);
     const checked = await safeExisting(path, "directory", context);
     if (!checked.ok) return checked;
     const entries = await listDirectory(path, context);
@@ -28313,7 +28696,7 @@ async function validateCompleteFinal(runDir2, manifestRecord, context) {
   }
   if (checkpointEntries.length === 1) {
     if (direntKind(checkpointEntries[0]) !== "file") return { ok: false, code: "unsafe_type" };
-    const checkpoint = await validateCheckpointTemp(join17(runDir2, checkpointEntries[0].name), manifest, manifestBytes, context);
+    const checkpoint = await validateCheckpointTemp(join18(runDir2, checkpointEntries[0].name), manifest, manifestBytes, context);
     if (!checkpoint.ok) return checkpoint;
   }
   const targets = [runDir2];
@@ -28362,8 +28745,8 @@ async function validateRunUnit({ root, runsDir, runId, finalEntry, lockEntry, no
   if (currentRuns === null) return { ok: false, code: "unsafe_type" };
   finalEntry = currentRuns.find((entry2) => entry2.name === runId) ?? null;
   lockEntry = currentRuns.find((entry2) => entry2.name === `.init-lock-${runId}.json`) ?? null;
-  const finalPath = join17(runsDir, runId);
-  const lockPath = join17(runsDir, `.init-lock-${runId}.json`);
+  const finalPath = join18(runsDir, runId);
+  const lockPath = join18(runsDir, `.init-lock-${runId}.json`);
   let lock = null;
   if (lockEntry !== null) {
     if (direntKind(lockEntry) !== "file") return { ok: false, code: "unsafe_type" };
@@ -28402,7 +28785,7 @@ async function validateRunUnit({ root, runsDir, runId, finalEntry, lockEntry, no
     };
   }
   if (direntKind(manifestEntry) !== "file") return { ok: false, code: "unsafe_type" };
-  const manifest = await readManifest(join17(finalPath, "manifest.json"), runId, context);
+  const manifest = await readManifest(join18(finalPath, "manifest.json"), runId, context);
   if (!manifest.ok) return manifest;
   if (lock !== null && (manifest.manifest.generation !== lock.value.generation || manifest.manifest.createdAt !== lock.value.createdAt || manifest.manifest.expiresAt !== lock.value.expiresAt)) {
     return { ok: false, code: "generation_mismatch" };
@@ -28441,13 +28824,13 @@ async function revalidateSnapshot(snapshot, deps) {
   return true;
 }
 async function createQuarantineParent(snapshot, deps, expired) {
-  const runsDir = join17(snapshot.root, "runs");
+  const runsDir = join18(snapshot.root, "runs");
   for (let attempt = 0; attempt < 4; attempt += 1) {
     if (expired()) return null;
     let path;
     try {
-      path = join17(runsDir, `.reap-${randomBytes2(16).toString("hex")}`);
-      await mkdir5(path, { mode: 448 });
+      path = join18(runsDir, `.reap-${randomBytes2(16).toString("hex")}`);
+      await mkdir6(path, { mode: 448 });
     } catch (error2) {
       if (error2?.code === "EEXIST") continue;
       return null;
@@ -28556,7 +28939,7 @@ async function classifyRenameFailure(path, movedPath, expected, movedTargets, de
   return { completed: false, code: "validation_changed" };
 }
 function patchRemovalTarget(path, root) {
-  if (!samePath(dirname10(path), join17(root, "patches"))) return false;
+  if (!samePath(dirname10(path), join18(root, "patches"))) return false;
   const name = basename6(path);
   if (name.endsWith(".patch") && !name.startsWith(".tmp-")) {
     return validRunId2(name.slice(0, -".patch".length));
@@ -28565,13 +28948,13 @@ function patchRemovalTarget(path, root) {
   return match !== null && validRunId2(match[1]) && validArtifactTempSuffix(match[2]);
 }
 function prepareRemovalTargets(targets, snapshot) {
-  const runsDir = join17(snapshot.root, "runs");
+  const runsDir = join18(snapshot.root, "runs");
   const quarantineDevice = snapshot.paths.get(runsDir)?.deviceIdentity ?? null;
   if (quarantineDevice === null) return null;
   const unique = [...new Set(targets)];
   const prepared = [];
   for (const path of unique) {
-    if (typeof path !== "string" || !isAbsolute16(path) || !samePath(resolve7(path), path) || !contained(snapshot.root, path)) return null;
+    if (typeof path !== "string" || !isAbsolute17(path) || !samePath(resolve7(path), path) || !contained(snapshot.root, path)) return null;
     const expected = snapshot.paths.get(path);
     if (expected === void 0 || expected.deviceIdentity !== quarantineDevice) return null;
     const lockMatch = INIT_LOCK_PATTERN.exec(basename6(path));
@@ -28609,7 +28992,7 @@ async function removeOwnedTargets(targets, snapshot, deps, expired) {
     if (expired()) return "removal_failed";
     const status = await lstatStatus(path, deps.lstat);
     if (status.exists !== true || kindOf(status.info) !== expected.kind || !expectedSourceUnchanged(status.info, expected, movedTargets)) return "validation_changed";
-    const movedPath = join17(quarantine.path, `unit-${String(index).padStart(3, "0")}`);
+    const movedPath = join18(quarantine.path, `unit-${String(index).padStart(3, "0")}`);
     if ((await lstatStatus(movedPath, deps.lstat)).exists !== false) return "validation_changed";
     if (expired()) return "removal_failed";
     let moved;
@@ -28680,7 +29063,7 @@ async function sweepRuns(stateRoot, nowMs, options) {
     "deadlineAt",
     "nowMs"
   ]));
-  if (parsed === null || typeof stateRoot !== "string" || stateRoot === "" || !isAbsolute16(stateRoot) || !samePath(resolve7(stateRoot), stateRoot) || !Number.isSafeInteger(nowMs) || nowMs < 0) {
+  if (parsed === null || typeof stateRoot !== "string" || stateRoot === "" || !isAbsolute17(stateRoot) || !samePath(resolve7(stateRoot), stateRoot) || !Number.isSafeInteger(nowMs) || nowMs < 0) {
     return emptyUnsafe("unsafe_root");
   }
   if (Object.hasOwn(parsed, "excludeRunId") && !validRunId2(parsed.excludeRunId)) return emptyUnsafe("invalid_exclusion");
@@ -28689,9 +29072,9 @@ async function sweepRuns(stateRoot, nowMs, options) {
   const deps = {
     canonicalPath: parsed.canonicalPath ?? canonical,
     lstat: parsed.lstat ?? exactLstat,
-    open: parsed.open ?? open7,
-    readdir: parsed.readdir ?? readdir2,
-    rm: parsed.rm ?? rm5,
+    open: parsed.open ?? open8,
+    readdir: parsed.readdir ?? readdir3,
+    rm: parsed.rm ?? rm6,
     verifyOwnerOnly: parsed.verifyOwnerOnly ?? verifyArtifactOwnerOnly,
     validateTransition: parsed.validateTransition ?? validateRunManifestTransitionV1,
     barrier: parsed.barrier ?? (async () => {
@@ -28703,7 +29086,7 @@ async function sweepRuns(stateRoot, nowMs, options) {
     if (expired()) return frozenRunResult();
     const root = await canonicalValue(deps.canonicalPath, stateRoot);
     if (root === null || !samePath(root, resolve7(stateRoot))) return emptyUnsafe("unsafe_root");
-    const runsDir = join17(root, "runs");
+    const runsDir = join18(root, "runs");
     if (expired()) return frozenRunResult();
     const runsStatus = await lstatStatus(runsDir, deps.lstat);
     if (runsStatus.exists === false) return frozenRunResult();
@@ -28795,7 +29178,7 @@ async function sweepAged({
   const realRoot = await canonical(stateRoot);
   if (realRoot === null) return empty;
   if (expired()) return empty;
-  const dir = await canonical(join17(realRoot, name));
+  const dir = await canonical(join18(realRoot, name));
   if (dir === null || !contained(realRoot, dir)) return empty;
   let directory;
   try {
@@ -28815,13 +29198,13 @@ async function sweepAged({
       if (!(kind === "directory" ? entry2.isDirectory() : entry2.isFile()) || !shapes.some((shape) => shape.test(entry2.name)) || acceptName !== null && !acceptName(entry2.name)) continue;
       checked += 1;
       if (expired()) break;
-      const full = await canonical(join17(dir, entry2.name));
+      const full = await canonical(join18(dir, entry2.name));
       if (full === null || !contained(dir, full)) continue;
       if (expired()) break;
-      const info = await stat6(full).catch(() => null);
+      const info = await stat7(full).catch(() => null);
       if (info === null || nowMs - info.mtimeMs < maxAgeMs) continue;
       if (expired()) break;
-      if (await rm5(full, { force: true, recursive: kind === "directory" }).then(() => true, () => false)) removed += 1;
+      if (await rm6(full, { force: true, recursive: kind === "directory" }).then(() => true, () => false)) removed += 1;
     }
   } catch {
   } finally {
@@ -28870,6 +29253,64 @@ function sweepPatches(stateRoot, nowMs, options) {
     clock: parsed.nowMs
   });
 }
+async function expiredProofUnit(dir, nowMs, readOne, statOne) {
+  if (await proofLockLive(join18(dir, ".lock"), nowMs, { readFile: readOne, stat: statOne })) return false;
+  const path = join18(dir, "proof.json");
+  const info = await statOne(path).catch(() => null);
+  if (info !== null && info.isFile() && info.size <= MAX_JSON_ARTIFACT_BYTES) {
+    let parsed = null;
+    try {
+      parsed = normalizeProofRecord(JSON.parse(await readOne(path, "utf8")));
+    } catch {
+      parsed = null;
+    }
+    if (parsed !== null) return Number.isSafeInteger(parsed.expiresAt) && parsed.expiresAt <= nowMs;
+  }
+  const own2 = await statOne(dir).catch(() => null);
+  return own2 !== null && nowMs - Number(own2.mtimeMs) >= RUN_ARTIFACT_RETENTION_MS;
+}
+async function sweepProofs(stateRoot, nowMs, options) {
+  const empty = { removed: 0, checked: 0 };
+  const parsed = exactFunctionOptions(
+    options,
+    /* @__PURE__ */ new Set(["excludeRunId", "readdir", "readFile", "rm", "lstat", "deadlineAt", "nowMs"])
+  );
+  if (parsed === null || typeof stateRoot !== "string" || stateRoot === "" || !isAbsolute17(stateRoot) || !Number.isSafeInteger(nowMs) || nowMs < 0 || Object.hasOwn(parsed, "excludeRunId") && !validRunId2(parsed.excludeRunId)) return empty;
+  const expired = agedDeadline(parsed.deadlineAt, parsed.nowMs);
+  if (expired === null) return empty;
+  if (expired()) return empty;
+  const listEntries = parsed.readdir ?? readdir3;
+  const readOne = parsed.readFile ?? readFile10;
+  const statOne = parsed.lstat ?? exactLstat;
+  const remove = parsed.rm ?? rm6;
+  const realRoot = await canonical(stateRoot);
+  if (realRoot === null) return empty;
+  const dir = await canonical(join18(realRoot, "proofs"));
+  if (dir === null || !contained(realRoot, dir)) return empty;
+  let entries;
+  try {
+    entries = await listEntries(dir, { withFileTypes: true });
+  } catch {
+    return empty;
+  }
+  let removed = 0;
+  let checked = 0;
+  let scanned = 0;
+  try {
+    for (const entry2 of Array.isArray(entries) ? entries : []) {
+      if (scanned >= AGED_SWEEP_ENTRY_CAP || expired()) break;
+      scanned += 1;
+      if (direntKind(entry2) !== "directory" || !validRunId2(entry2.name) || entry2.name === parsed.excludeRunId) continue;
+      checked += 1;
+      const full = await canonical(join18(dir, entry2.name));
+      if (full === null || !contained(dir, full)) continue;
+      if (!await expiredProofUnit(full, nowMs, readOne, statOne)) continue;
+      if (await remove(full, { force: true, recursive: true }).then(() => true, () => false)) removed += 1;
+    }
+  } catch {
+  }
+  return { removed, checked };
+}
 function sweepLogs({
   stateRoot,
   now = Date.now(),
@@ -28893,8 +29334,8 @@ function sweepLogs({
 // src/scratch-rooms.mjs
 import { randomBytes as cryptoRandomBytes2 } from "node:crypto";
 import { constants as fsConstants4 } from "node:fs";
-import { lstat as lstat4, mkdir as mkdir6, open as open8, readFile as readFile9, readdir as readdir3, rename as rename4, rm as rm6, stat as stat7 } from "node:fs/promises";
-import { basename as basename7, dirname as dirname11, isAbsolute as isAbsolute17, join as join18 } from "node:path";
+import { lstat as lstat4, mkdir as mkdir7, open as open9, readFile as readFile11, readdir as readdir4, rename as rename4, rm as rm7, stat as stat8 } from "node:fs/promises";
+import { basename as basename7, dirname as dirname11, isAbsolute as isAbsolute18, join as join19 } from "node:path";
 var SCRATCH_ROOM_RETENTION_MS = 6 * 60 * 60 * 1e3;
 var SCRATCH_ROOM_SWEEP_BUDGET_MS = 6e4;
 var SCRATCH_ROOM_SCHEMA_VERSION = 1;
@@ -28911,7 +29352,7 @@ var DISPOSITIONS = /* @__PURE__ */ new Set(["disposable", "recovery_armed", "ret
 var STATUSES2 = /* @__PURE__ */ new Set(["reserved", "active"]);
 var tempCounter4 = 0;
 var emptySweep = () => ({ checked: 0, removed: 0, preserved: 0, newer: 0 });
-var jsonBytes3 = (value) => Buffer.from(`${JSON.stringify(value, null, 2)}
+var jsonBytes4 = (value) => Buffer.from(`${JSON.stringify(value, null, 2)}
 `, "utf8");
 var identityOf2 = (entry2) => ({
   dev: String(entry2.dev),
@@ -28949,7 +29390,7 @@ function randomHex2(bytes, deps) {
   return value.toString("hex");
 }
 async function writeExclusive2(path, bytes) {
-  const handle = await open8(path, "wx", 384);
+  const handle = await open9(path, "wx", 384);
   try {
     await handle.writeFile(bytes);
     await handle.sync().catch(() => {
@@ -28963,7 +29404,7 @@ async function writeExclusive2(path, bytes) {
 }
 async function writeRecord(path, record2) {
   const tempPath = `${path}.${process.pid}.${tempCounter4++}.${cryptoRandomBytes2(8).toString("hex")}.tmp`;
-  return writeFileAtomic(path, jsonBytes3(record2), {
+  return writeFileAtomic(path, jsonBytes4(record2), {
     tempPath,
     mode: 384,
     exclusive: true,
@@ -28979,7 +29420,7 @@ async function readBoundedJson(path) {
       return { status: "invalid" };
     }
     const flags = fsConstants4.O_RDONLY | (fsConstants4.O_NOFOLLOW ?? 0) | (fsConstants4.O_NONBLOCK ?? 0);
-    handle = await open8(path, flags);
+    handle = await open9(path, flags);
     const opened = await handle.stat({ bigint: true });
     if (!opened.isFile() || !sameIdentity2(identityOf2(before), opened) || opened.size > BigInt(MAX_RECORD_BYTES)) {
       return { status: "invalid" };
@@ -29019,7 +29460,7 @@ async function ensurePlainDirectory(path) {
     if (error2?.code !== "ENOENT") return false;
   }
   try {
-    await mkdir6(path, { mode: 448 });
+    await mkdir7(path, { mode: 448 });
   } catch (error2) {
     if (error2?.code !== "EEXIST") return false;
   }
@@ -29031,11 +29472,11 @@ async function ensurePlainDirectory(path) {
   }
 }
 async function rootsFor2(stateRoot) {
-  if (typeof stateRoot !== "string" || stateRoot === "" || !isAbsolute17(stateRoot)) return null;
-  await mkdir6(stateRoot, { recursive: true, mode: 448 });
+  if (typeof stateRoot !== "string" || stateRoot === "" || !isAbsolute18(stateRoot)) return null;
+  await mkdir7(stateRoot, { recursive: true, mode: 448 });
   const realRoot = await canonical(stateRoot);
   if (realRoot === null) return null;
-  const scratch = join18(realRoot, "scratch");
+  const scratch = join19(realRoot, "scratch");
   let scratchEntry;
   try {
     scratchEntry = await lstat4(scratch);
@@ -29046,9 +29487,9 @@ async function rootsFor2(stateRoot) {
   if (scratchEntry === null || !scratchEntry.isDirectory() && !scratchEntry.isSymbolicLink()) return null;
   const realScratch = await canonical(scratch);
   if (realScratch === null || !contained(realRoot, realScratch)) return null;
-  const scratchTarget = await stat7(realScratch).catch(() => null);
+  const scratchTarget = await stat8(realScratch).catch(() => null);
   if (scratchTarget === null || !scratchTarget.isDirectory() || !scratchEntry.isSymbolicLink() && !samePath(realScratch, scratch)) return null;
-  const registry2 = join18(realScratch, REGISTRY2);
+  const registry2 = join19(realScratch, REGISTRY2);
   if (!await ensurePlainDirectory(registry2)) return null;
   const realRegistry = await canonical(registry2);
   if (realRoot === null || realScratch === null || realRegistry === null || !contained(realScratch, realRegistry) || !samePath(realRegistry, registry2)) return null;
@@ -29060,9 +29501,9 @@ function publicHandle2(roots, record2) {
     token: record2.token,
     kind: record2.kind,
     name: record2.name,
-    path: join18(roots.scratch, record2.name),
-    recordPath: join18(roots.registry, `${record2.roomId}.json`),
-    lockPath: join18(roots.registry, `${record2.roomId}.lock`)
+    path: join19(roots.scratch, record2.name),
+    recordPath: join19(roots.registry, `${record2.roomId}.json`),
+    lockPath: join19(roots.registry, `${record2.roomId}.lock`)
   });
 }
 async function createScratchRoom(spec, deps = {}) {
@@ -29092,16 +29533,16 @@ async function createScratchRoom(spec, deps = {}) {
       ownerPid,
       ownerStartTime: typeof ownerStartTime === "string" && ownerStartTime !== "" ? ownerStartTime : null,
       runId: typeof spec?.runId === "string" && spec.runId !== "" ? spec.runId : null,
-      projectPath: typeof spec?.projectPath === "string" && isAbsolute17(spec.projectPath) ? spec.projectPath : null,
+      projectPath: typeof spec?.projectPath === "string" && isAbsolute18(spec.projectPath) ? spec.projectPath : null,
       token,
       identity: null
     };
     const handle = publicHandle2(roots, record2);
-    await writeExclusive2(handle.recordPath, jsonBytes3(record2));
+    await writeExclusive2(handle.recordPath, jsonBytes4(record2));
     await callPhase(deps, "after-reservation");
-    await mkdir6(handle.path, { mode: 448 });
+    await mkdir7(handle.path, { mode: 448 });
     await callPhase(deps, "after-directory");
-    await writeExclusive2(join18(handle.path, OWNER_FILE), jsonBytes3({
+    await writeExclusive2(join19(handle.path, OWNER_FILE), jsonBytes4({
       schemaVersion: SCRATCH_ROOM_SCHEMA_VERSION,
       roomId,
       token
@@ -29151,12 +29592,12 @@ function retainScratchRoom(handle, { nowMs = Date.now() } = {}) {
   return transition(handle, "retained_manual", nowMs);
 }
 async function ownerMarkerMatches(path, record2, allowMissing) {
-  const loaded = await readBoundedJson(join18(path, OWNER_FILE));
+  const loaded = await readBoundedJson(join19(path, OWNER_FILE));
   if (loaded.status !== "parsed") return allowMissing && loaded.status === "missing";
   const raw = loaded.value;
   return raw !== null && typeof raw === "object" && !Array.isArray(raw) && raw.schemaVersion === SCRATCH_ROOM_SCHEMA_VERSION && raw.roomId === record2.roomId && raw.token === record2.token;
 }
-var roomQuarantinePath = (scratch, record2) => join18(scratch, `.reap-${record2.roomId}-${record2.token}`);
+var roomQuarantinePath = (scratch, record2) => join19(scratch, `.reap-${record2.roomId}-${record2.token}`);
 function authorityExpired(authority) {
   if (typeof authority?.expired !== "function") return false;
   try {
@@ -29190,11 +29631,11 @@ async function inspectOwnedRoom(path, scratch, record2, { allowMissing, expected
   return { ok: true, missing: false, entry: entry2, identity: identityOf2(entry2) };
 }
 async function removeOwnedRoom(scratch, record2, authority = {}) {
-  const roomPath = join18(scratch, record2.name);
+  const roomPath = join19(scratch, record2.name);
   const quarantinePath = roomQuarantinePath(scratch, record2);
   const deps = authority?.deps ?? {};
   const move = typeof deps.rename === "function" ? deps.rename : rename4;
-  const remove = typeof deps.rm === "function" ? deps.rm : rm6;
+  const remove = typeof deps.rm === "function" ? deps.rm : rm7;
   let owned = await inspectOwnedRoom(roomPath, scratch, record2, {
     allowMissing: record2.status === "reserved"
   });
@@ -29234,7 +29675,7 @@ async function removeOwnedRoom(scratch, record2, authority = {}) {
   return remains ? { ok: false } : { ok: true, removed: true };
 }
 async function closeRecord({ roots, recordPath: recordPath2, roomId, token, allowRetained, authority = {} }) {
-  const lockPath = join18(roots.registry, `${roomId}.lock`);
+  const lockPath = join19(roots.registry, `${roomId}.lock`);
   if (authorityExpired(authority)) return { ok: false };
   const remainingMs = authorityRemainingMs(authority);
   if (remainingMs === 0) return { ok: false };
@@ -29247,7 +29688,7 @@ async function closeRecord({ roots, recordPath: recordPath2, roomId, token, allo
     const removed = await removeOwnedRoom(roots.scratch, loaded.record, authority);
     if (!removed.ok) return { ok: false };
     if (authorityExpired(authority)) return { ok: false };
-    await rm6(recordPath2, { force: true }).catch(() => {
+    await rm7(recordPath2, { force: true }).catch(() => {
     });
     const recordRemains = await lstat4(recordPath2).then(() => true, (error2) => error2?.code !== "ENOENT");
     return recordRemains ? { ok: false } : { ok: true, removed: removed.removed || true };
@@ -29262,8 +29703,8 @@ async function closeScratchRoom(handle) {
     return { ok: false };
   }
   const scratch = dirname11(handle.path);
-  const registry2 = join18(scratch, REGISTRY2);
-  if (handle.name !== basename7(handle.path) || !samePath(handle.recordPath, join18(registry2, `${handle.roomId}.json`)) || !samePath(handle.lockPath, join18(registry2, `${handle.roomId}.lock`))) return { ok: false };
+  const registry2 = join19(scratch, REGISTRY2);
+  if (handle.name !== basename7(handle.path) || !samePath(handle.recordPath, join19(registry2, `${handle.roomId}.json`)) || !samePath(handle.lockPath, join19(registry2, `${handle.roomId}.lock`))) return { ok: false };
   return closeRecord({
     roots: { scratch, registry: registry2 },
     recordPath: handle.recordPath,
@@ -29325,7 +29766,7 @@ async function sweepScratchRooms(spec = {}, deps = {}) {
   if (budgetExpired()) return result2;
   let entries;
   try {
-    entries = await readdir3(roots.registry, { withFileTypes: true });
+    entries = await readdir4(roots.registry, { withFileTypes: true });
   } catch {
     return result2;
   }
@@ -29335,7 +29776,7 @@ async function sweepScratchRooms(spec = {}, deps = {}) {
     if (matched === null) continue;
     result2.checked += 1;
     const roomId = matched[1];
-    const recordPath2 = join18(roots.registry, entry2.name);
+    const recordPath2 = join19(roots.registry, entry2.name);
     if (budgetExpired()) {
       result2.preserved += 1;
       break;
@@ -29379,18 +29820,18 @@ async function sweepScratchRooms(spec = {}, deps = {}) {
 
 // src/worktree-scope-claim.mjs
 import { randomBytes as cryptoRandomBytes3 } from "node:crypto";
-import { isAbsolute as isAbsolute19 } from "node:path";
+import { isAbsolute as isAbsolute20 } from "node:path";
 
 // src/worktree-paths.mjs
-import { isAbsolute as isAbsolute18, resolve as resolve8 } from "node:path";
+import { isAbsolute as isAbsolute19, resolve as resolve8 } from "node:path";
 function isSafeWorktree(stateRoot, worktree) {
   if (typeof stateRoot !== "string" || stateRoot === "") return false;
   if (typeof worktree !== "string" || worktree === "") return false;
-  if (!isAbsolute18(worktree)) return false;
+  if (!isAbsolute19(worktree)) return false;
   return contained(resolve8(stateRoot, "worktrees"), resolve8(worktree));
 }
 async function resolveSafeWorktree(stateRoot, worktree) {
-  if (typeof worktree !== "string" || worktree === "" || !isAbsolute18(worktree)) return null;
+  if (typeof worktree !== "string" || worktree === "" || !isAbsolute19(worktree)) return null;
   const [realRoot, realWorktree] = await Promise.all([canonical(stateRoot), canonical(worktree)]);
   if (realRoot === null || realWorktree === null) return null;
   return isSafeWorktree(realRoot, realWorktree) ? realWorktree : null;
@@ -29416,7 +29857,7 @@ var mutationFailure = (updated) => ({
   ...updated?.releaseReason === void 0 ? {} : { releaseReason: updated.releaseReason }
 });
 function validClaim(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value) && typeof value.stateRoot === "string" && value.stateRoot !== "" && isAbsolute19(value.stateRoot) && typeof value.worktree === "string" && value.worktree !== "" && isAbsolute19(value.worktree) && typeof value.projectPath === "string" && value.projectPath !== "" && isAbsolute19(value.projectPath) && typeof value.runId === "string" && value.runId !== "" && TOKEN.test(value.claimToken ?? "") && (value.claimKind === "create" || value.claimKind === "cleanup");
+  return value !== null && typeof value === "object" && !Array.isArray(value) && typeof value.stateRoot === "string" && value.stateRoot !== "" && isAbsolute20(value.stateRoot) && typeof value.worktree === "string" && value.worktree !== "" && isAbsolute20(value.worktree) && typeof value.projectPath === "string" && value.projectPath !== "" && isAbsolute20(value.projectPath) && typeof value.runId === "string" && value.runId !== "" && TOKEN.test(value.claimToken ?? "") && (value.claimKind === "create" || value.claimKind === "cleanup");
 }
 var exactClaim = (record2, claim) => isWorktreeScopeClaimRecord(record2) && record2.claimToken === claim.claimToken && record2.claimKind === claim.claimKind && record2.authorityToken === claim.authorityToken && record2.runId === claim.runId && record2.worktree === claim.worktree && record2.projectPath === claim.projectPath && record2.pid === claim.pid && record2.startTime === claim.startTime && record2.ownerPid === claim.pid && record2.ownerStartTime === claim.startTime;
 var claimFromRecord = (stateRoot, record2) => Object.freeze({
@@ -29458,7 +29899,7 @@ async function acquireWorktreeScopeClaim({
   expectedScopeRecords = null,
   deps = {}
 } = {}) {
-  if (typeof stateRoot !== "string" || !isAbsolute19(stateRoot) || typeof runId !== "string" || runId === "" || typeof worktree !== "string" || !isAbsolute19(worktree) || typeof projectPath !== "string" || !isAbsolute19(projectPath) || !["create", "cleanup"].includes(claimKind) || authorityToken !== null && !TOKEN.test(authorityToken) || claimKind === "create" && authorityToken === null || claimKind === "cleanup" && !Array.isArray(expectedScopeRecords)) return { ok: false, status: "invalid" };
+  if (typeof stateRoot !== "string" || !isAbsolute20(stateRoot) || typeof runId !== "string" || runId === "" || typeof worktree !== "string" || !isAbsolute20(worktree) || typeof projectPath !== "string" || !isAbsolute20(projectPath) || !["create", "cleanup"].includes(claimKind) || authorityToken !== null && !TOKEN.test(authorityToken) || claimKind === "create" && authorityToken === null || claimKind === "cleanup" && !Array.isArray(expectedScopeRecords)) return { ok: false, status: "invalid" };
   const [canonicalStateRoot, canonicalWorktree, canonicalProjectPath] = await Promise.all([
     canonical(stateRoot),
     resolveSafeWorktree(stateRoot, worktree),
@@ -29765,16 +30206,16 @@ async function completeWorktreeScopeClaim(claim, deps = {}) {
 
 // src/worktree.mjs
 import { createHash as createHash7 } from "node:crypto";
-import { lstat as lstat6, mkdir as mkdir7, readFile as readFile12, readdir as readdir4, rm as rm8, stat as stat9, writeFile as writeFile2 } from "node:fs/promises";
-import { basename as basename8, dirname as dirname13, isAbsolute as isAbsolute23, join as join21, relative as relative4, resolve as resolve9 } from "node:path";
+import { lstat as lstat6, mkdir as mkdir8, readFile as readFile14, readdir as readdir5, rm as rm9, stat as stat10, writeFile as writeFile2 } from "node:fs/promises";
+import { basename as basename8, dirname as dirname13, isAbsolute as isAbsolute24, join as join22, relative as relative4, resolve as resolve9 } from "node:path";
 
 // src/worktree-authority.mjs
 import { randomBytes as cryptoRandomBytes4 } from "node:crypto";
-import { isAbsolute as isAbsolute21 } from "node:path";
+import { isAbsolute as isAbsolute22 } from "node:path";
 
 // src/worktree-git-effect.mjs
 import { fork } from "node:child_process";
-import { isAbsolute as isAbsolute20 } from "node:path";
+import { isAbsolute as isAbsolute21 } from "node:path";
 import { fileURLToPath } from "node:url";
 var HELPER_ARG = "--worktree-effect-helper";
 var READY_TIMEOUT_MS = 1e4;
@@ -29828,7 +30269,7 @@ function effectTimeoutMs(budget) {
   return remaining;
 }
 function optionsFor(claim, operation, timeoutMs = DEFAULT_EFFECT_TIMEOUT_MS) {
-  if (claim === null || typeof claim !== "object" || !isAbsolute20(claim.worktree ?? "") || !isAbsolute20(claim.projectPath ?? "") || operation === null || typeof operation !== "object" || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > DEFAULT_EFFECT_TIMEOUT_MS) return null;
+  if (claim === null || typeof claim !== "object" || !isAbsolute21(claim.worktree ?? "") || !isAbsolute21(claim.projectPath ?? "") || operation === null || typeof operation !== "object" || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > DEFAULT_EFFECT_TIMEOUT_MS) return null;
   if (operation.kind === "remove" && Object.keys(operation).length === 1) {
     return { args: ["worktree", "remove", "--force", claim.worktree], cwd: claim.projectPath, timeoutMs };
   }
@@ -30156,7 +30597,7 @@ function worktreeAuthorityFailure(result2) {
   return fail(REASON.state_recovery_intent_unavailable);
 }
 function validAuthority(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value) && typeof value.stateRoot === "string" && value.stateRoot !== "" && isAbsolute21(value.stateRoot) && typeof value.projectPath === "string" && value.projectPath !== "" && isAbsolute21(value.projectPath) && typeof value.worktree === "string" && value.worktree !== "" && isAbsolute21(value.worktree) && typeof value.runId === "string" && value.runId !== "" && (value.purpose === null || typeof value.purpose === "string" && value.purpose !== "") && Number.isInteger(value.pid) && value.pid > 0 && typeof value.startTime === "string" && value.startTime !== "" && TOKEN2.test(value.token ?? "");
+  return value !== null && typeof value === "object" && !Array.isArray(value) && typeof value.stateRoot === "string" && value.stateRoot !== "" && isAbsolute22(value.stateRoot) && typeof value.projectPath === "string" && value.projectPath !== "" && isAbsolute22(value.projectPath) && typeof value.worktree === "string" && value.worktree !== "" && isAbsolute22(value.worktree) && typeof value.runId === "string" && value.runId !== "" && (value.purpose === null || typeof value.purpose === "string" && value.purpose !== "") && Number.isInteger(value.pid) && value.pid > 0 && typeof value.startTime === "string" && value.startTime !== "" && TOKEN2.test(value.token ?? "");
 }
 var exactAuthorityRecord = (record2, authority) => isWorktreeCreationAuthorityRecord(record2) && record2.worktreeAuthorityToken === authority.token && record2.pid === authority.pid && record2.startTime === authority.startTime && record2.ownerPid === authority.pid && record2.ownerStartTime === authority.startTime && record2.runId === authority.runId && record2.worktree === authority.worktree && record2.projectPath === authority.projectPath;
 async function redurableAuthority(authority, deps) {
@@ -30182,7 +30623,7 @@ async function armWorktreeCreationAuthority({
   deps = {}
 } = {}) {
   const target = await resolveSafeWorktree(stateRoot, worktree);
-  if (target === null || typeof runId !== "string" || runId === "" || typeof projectPath !== "string" || projectPath === "" || !isAbsolute21(projectPath) || purpose !== null && (typeof purpose !== "string" || purpose === "")) {
+  if (target === null || typeof runId !== "string" || runId === "" || typeof projectPath !== "string" || projectPath === "" || !isAbsolute22(projectPath) || purpose !== null && (typeof purpose !== "string" || purpose === "")) {
     return { ok: false, status: "invalid" };
   }
   const selfPid = Number.isInteger(deps.selfPid) && deps.selfPid > 0 ? deps.selfPid : process.pid;
@@ -30350,7 +30791,7 @@ async function settleFailedWorktreeCreation(state) {
 }
 
 // src/worktree-cleanup.mjs
-import { lstat as lstat5, rm as rm7 } from "node:fs/promises";
+import { lstat as lstat5, rm as rm8 } from "node:fs/promises";
 var sameRows = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 var exactClaimRow = (record2, claim) => isWorktreeScopeClaimRecord(record2) && record2.claimToken === claim.claimToken && record2.claimKind === claim.claimKind && record2.authorityToken === claim.authorityToken && record2.runId === claim.runId && record2.worktree === claim.worktree && record2.projectPath === claim.projectPath && record2.pid === claim.pid && record2.startTime === claim.startTime && record2.ownerPid === claim.pid && record2.ownerStartTime === claim.startTime;
 var nonClaimRows = (records) => records.filter((record2) => !isWorktreeScopeClaimRecord(record2));
@@ -30438,7 +30879,7 @@ async function cleanupClaimedWorktree({
   if (await latestIdleClaim({ claim, expectedScopeRecords, deps }) === null) {
     return { removed: null, unregistered: null, status: "effect_unknown", effect };
   }
-  const removePath = deps.removePath ?? rm7;
+  const removePath = deps.removePath ?? rm8;
   await removePath(claim.worktree, { recursive: true, force: true }).catch(() => {
   });
   let listed = await listRegistered();
@@ -30546,16 +30987,16 @@ function boundWorktreeAuthority(handle) {
 }
 
 // src/worktree-diff.mjs
-import { readFile as readFile11, stat as stat8 } from "node:fs/promises";
-import { join as join20 } from "node:path";
+import { readFile as readFile13, stat as stat9 } from "node:fs/promises";
+import { join as join21 } from "node:path";
 
 // src/worktree-patch.mjs
 import { createHash as createHash5 } from "node:crypto";
-import { readFile as readFile10, writeFile } from "node:fs/promises";
-import { dirname as dirname12, join as join19 } from "node:path";
+import { readFile as readFile12, writeFile } from "node:fs/promises";
+import { dirname as dirname12, join as join20 } from "node:path";
 var WORKTREE_TIMEOUT_MS = 3e5;
 var FULL_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-var SHA256_PATTERN3 = /^[0-9a-f]{64}$/;
+var SHA256_PATTERN4 = /^[0-9a-f]{64}$/;
 var isFullObjectId = (value) => typeof value === "string" && FULL_OBJECT_ID_PATTERN.test(value);
 function createWorktreePatchOperations({
   absenceProven: absenceProven2,
@@ -30584,7 +31025,7 @@ function createWorktreePatchOperations({
       canonical(indexResult.stdout.trim())
     ]);
     if (gitDir === null || indexPath === null || !samePath3(dirname12(indexPath), gitDir)) return null;
-    const bytes = await readFile10(indexPath).catch(() => null);
+    const bytes = await readFile12(indexPath).catch(() => null);
     return bytes === null ? null : { gitDir, indexPath, bytes };
   }
   async function restoreAppliedWorktree({ run: run3, cwd, original, savedIndex }) {
@@ -30625,9 +31066,13 @@ function createWorktreePatchOperations({
     if (!Buffer.isBuffer(patch)) {
       return fail(REASON.worktree_patch_bytes_invalid);
     }
-    if (typeof expectedSha !== "string" || !SHA256_PATTERN3.test(expectedSha)) {
+    if (typeof expectedSha !== "string" || !SHA256_PATTERN4.test(expectedSha)) {
       return fail(REASON.worktree_patch_digest_invalid);
     }
+    if (options.allowIgnored !== void 0 && typeof options.allowIgnored !== "boolean") {
+      return fail(REASON.worktree_patch_bytes_invalid);
+    }
+    const allowIgnored = options.allowIgnored === true;
     const actualSha = createHash5("sha256").update(patch).digest("hex");
     if (actualSha !== expectedSha) {
       return fail(REASON.worktree_patch_digest_mismatch);
@@ -30637,8 +31082,9 @@ function createWorktreePatchOperations({
     const run3 = deps?.run ?? runGit;
     const original = await resolveRevisionIdentity2({ run: run3, cwd: paths.path, revision: "HEAD", requireExact: false });
     if (original.blocked) return original;
+    const pristineArgs = allowIgnored ? ["status", "--porcelain", "-z"] : ["status", "--porcelain", "-z", "--ignored=matching"];
     const pristine = await run3({
-      args: ["status", "--porcelain", "-z", "--ignored=matching"],
+      args: pristineArgs,
       cwd: paths.path,
       timeoutMs: WORKTREE_TIMEOUT_MS
     }).catch(() => null);
@@ -30661,8 +31107,8 @@ function createWorktreePatchOperations({
       if (!opened.ok) return fail(REASON.worktree_scratch_unusable);
       scratchRoom = opened.handle;
       operationPath = opened.handle.path;
-      patchPath = join19(operationPath, "patch");
-      indexPath = join19(operationPath, "index");
+      patchPath = join20(operationPath, "patch");
+      indexPath = join20(operationPath, "index");
       await writeFile(patchPath, patch, { flag: "wx" });
       const tempEnv = { GIT_INDEX_FILE: indexPath };
       const readTree = await run3({
@@ -30740,7 +31186,7 @@ function createWorktreePatchOperations({
         return identity;
       }
       const clean = await run3({
-        args: ["status", "--porcelain", "-z", "--ignored=matching"],
+        args: pristineArgs,
         cwd: paths.path,
         timeoutMs: WORKTREE_TIMEOUT_MS
       }).catch(() => null);
@@ -30854,7 +31300,7 @@ async function diffToFile({ run: run3, args, cwd, env, patchPath }) {
     timeoutMs: WORKTREE_TIMEOUT_MS
   });
   if (!got.ok) return { failure: got };
-  const size = await stat8(patchPath).then((entry2) => entry2.size, () => null);
+  const size = await stat9(patchPath).then((entry2) => entry2.size, () => null);
   if (size === null) {
     return {
       failure: {
@@ -30878,11 +31324,11 @@ async function diffToBytes({ run: run3, args, cwd, env, stateRoot }) {
     const opened = await createScratchRoom({ stateRoot, kind: "diff" });
     if (!opened.ok) throw new Error(renderReason(REASON.worktree_scratch_unusable).error);
     scratchRoom = opened.handle;
-    const patchPath = join20(opened.handle.path, "patch");
+    const patchPath = join21(opened.handle.path, "patch");
     const wrote = await diffToFile({ run: run3, args, cwd, env, patchPath });
     if (wrote.failure) outcome = wrote;
     else if (wrote.size === 0) outcome = { bytes: Buffer.alloc(0) };
-    else outcome = { bytes: await readFile11(patchPath) };
+    else outcome = { bytes: await readFile13(patchPath) };
   } catch (error2) {
     outcome = { crashed: new Error(renderReason(REASON.worktree_scratch_failed, { detail: errorText(error2) }).error) };
   }
@@ -30895,7 +31341,7 @@ async function diffToBytes({ run: run3, args, cwd, env, stateRoot }) {
 
 // src/worktree-revision.mjs
 import { createHash as createHash6 } from "node:crypto";
-import { isAbsolute as isAbsolute22 } from "node:path";
+import { isAbsolute as isAbsolute23 } from "node:path";
 var MAX_ALLOWLIST_PATHS = 4e3;
 var UNNAMED_STEP = "(unnamed step)";
 var REGULAR_FILE_MODES = /* @__PURE__ */ new Set(["100644", "100755"]);
@@ -30915,7 +31361,7 @@ function validateEvidencePaths(paths, { enforceInputLimit = true } = {}) {
       return { ok: false, reasonCode: REASON.worktree_path_undecodable, params: {} };
     }
     const segments = path.split("/");
-    if (isAbsolute22(path) || path.startsWith("/") || /^[A-Za-z]:/.test(path) || path.includes("\\") || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    if (isAbsolute23(path) || path.startsWith("/") || /^[A-Za-z]:/.test(path) || path.includes("\\") || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
       return { ok: false, reasonCode: REASON.worktree_path_unsafe, params: { path: JSON.stringify(path) } };
     }
     if (seen.has(path)) {
@@ -31156,10 +31602,10 @@ var COMMIT_IDENTITY = Object.freeze({
   GIT_COMMITTER_NAME: "bom-orch",
   GIT_COMMITTER_EMAIL: "bom-orch@localhost"
 });
-var RUN_ID_PATTERN3 = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-var PURPOSE_PATTERN = /^(?:lane-[ab]|lane-[ab]-\d{3}-(?:b0|br|c)-[12])$/;
+var RUN_ID_PATTERN4 = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+var PURPOSE_PATTERN = /^(?:lane-[ab]|prove-\d{3}|lane-[ab]-\d{3}-(?:b0|br|c)-[12]|prove-\d{3}-(?:b0|br|c)-[12])$/;
 function makeWorktreeId({ runId, purpose } = {}) {
-  if (typeof runId !== "string" || !RUN_ID_PATTERN3.test(runId)) {
+  if (typeof runId !== "string" || !RUN_ID_PATTERN4.test(runId)) {
     throw new TypeError(renderReason(REASON.worktree_run_id_invalid).error);
   }
   if (typeof purpose !== "string" || !PURPOSE_PATTERN.test(purpose)) {
@@ -31169,7 +31615,7 @@ function makeWorktreeId({ runId, purpose } = {}) {
   const suffix = `-${purpose}-${digest2}`;
   const prefix = runId.slice(0, 64 - suffix.length);
   const id = `${prefix}${suffix}`;
-  if (!RUN_ID_PATTERN3.test(id) || id.length > 64) {
+  if (!RUN_ID_PATTERN4.test(id) || id.length > 64) {
     throw new RangeError(renderReason(REASON.worktree_id_underivable).error);
   }
   return id;
@@ -31199,7 +31645,7 @@ var {
 });
 async function absenceProven(path) {
   try {
-    await stat9(path);
+    await stat10(path);
     return false;
   } catch (error2) {
     return error2?.code === "ENOENT";
@@ -31263,8 +31709,8 @@ async function createWorktree(spec) {
     const run3 = deps.run ?? runGit;
     if (typeof projectPath !== "string" || projectPath === "") return fail(REASON.worktree_project_path_missing);
     if (typeof stateRoot !== "string" || stateRoot === "") return fail(REASON.worktree_state_root_missing);
-    if (typeof runId !== "string" || !RUN_ID_PATTERN3.test(runId)) return fail(REASON.worktree_run_id_invalid);
-    if (typeof worktreeId !== "string" || !RUN_ID_PATTERN3.test(worktreeId)) return fail(REASON.worktree_id_invalid);
+    if (typeof runId !== "string" || !RUN_ID_PATTERN4.test(runId)) return fail(REASON.worktree_run_id_invalid);
+    if (typeof worktreeId !== "string" || !RUN_ID_PATTERN4.test(worktreeId)) return fail(REASON.worktree_id_invalid);
     if (purpose !== null && (typeof purpose !== "string" || !PURPOSE_PATTERN.test(purpose))) {
       return fail(REASON.worktree_purpose_invalid);
     }
@@ -31275,9 +31721,9 @@ async function createWorktree(spec) {
     }
     const rel = relative4(realProject, realStateRoot);
     const firstSegment = rel.split(/[\\/]/)[0];
-    const isOutside = rel !== "" && (isAbsolute23(rel) || firstSegment === "..");
+    const isOutside = rel !== "" && (isAbsolute24(rel) || firstSegment === "..");
     if (!isOutside) return fail(REASON.worktree_state_root_inside_project, { path: realStateRoot });
-    const worktreePath = join21(realStateRoot, "worktrees", worktreeId);
+    const worktreePath = join22(realStateRoot, "worktrees", worktreeId);
     if (!isSafeWorktree(realStateRoot, worktreePath)) {
       return fail(REASON.worktree_path_outside_state_root, { path: worktreePath });
     }
@@ -31324,7 +31770,7 @@ async function createRevisionWorktree(spec, deps = {}) {
     const sourceGuard = checkHandle(sourceWorktree);
     if (sourceGuard) return sourceGuard;
     if (typeof stateRoot !== "string" || stateRoot === "") return fail(REASON.worktree_state_root_missing);
-    if (typeof runId !== "string" || !RUN_ID_PATTERN3.test(runId)) return fail(REASON.worktree_run_id_invalid);
+    if (typeof runId !== "string" || !RUN_ID_PATTERN4.test(runId)) return fail(REASON.worktree_run_id_invalid);
     if (typeof purpose !== "string" || !PURPOSE_PATTERN.test(purpose)) return fail(REASON.worktree_purpose_invalid);
     if (!isFullObjectId(revision)) return fail(REASON.worktree_revision_invalid);
     let worktreeId;
@@ -31351,7 +31797,7 @@ async function createRevisionWorktree(spec, deps = {}) {
     }
     const rel = relative4(realProject, realStateRoot);
     const firstSegment = rel.split(/[\\/]/)[0];
-    const isOutside = rel !== "" && (isAbsolute23(rel) || firstSegment === "..");
+    const isOutside = rel !== "" && (isAbsolute24(rel) || firstSegment === "..");
     if (!isOutside) return fail(REASON.worktree_state_root_inside_project, { path: realStateRoot });
     const identity = await resolveRevisionIdentity({ run: run3, cwd: realProject, revision, requireExact: true });
     if (identity.blocked) return identity;
@@ -31370,7 +31816,7 @@ async function createRevisionWorktree(spec, deps = {}) {
     if (declaredBaseline !== null && (declaredBaseline.commit !== resolvedBaseline.commit || declaredBaseline.tree !== resolvedBaseline.tree)) {
       return fail(REASON.worktree_source_baseline_mismatch);
     }
-    const requested = join21(realStateRoot, "worktrees", worktreeId);
+    const requested = join22(realStateRoot, "worktrees", worktreeId);
     if (!isSafeWorktree(realStateRoot, requested)) {
       return fail(REASON.worktree_path_outside_state_root, { path: requested });
     }
@@ -31448,9 +31894,9 @@ async function createBody({
   if (claimed?.claim !== null && typeof claimed?.claim === "object") state.claim = claimed.claim;
   if (claimed?.commitUnknown === true) state.durabilityUnknown = true;
   if (claimed?.ok !== true || state.claim === null) return worktreeAuthorityFailure(claimed);
-  const scratch = join21(stateRoot, "scratch");
-  await mkdir7(join21(stateRoot, "worktrees"), { recursive: true });
-  await mkdir7(scratch, { recursive: true });
+  const scratch = join22(stateRoot, "scratch");
+  await mkdir8(join22(stateRoot, "worktrees"), { recursive: true });
+  await mkdir8(scratch, { recursive: true });
   const worktreePath = await canonical(requested);
   if (worktreePath === null || !isSafeWorktree(stateRoot, worktreePath)) {
     return fail(REASON.worktree_path_outside_state_root, { path: requested });
@@ -31465,7 +31911,7 @@ async function createBody({
     const pathState = await lstat6(worktreePath).then(() => "present", (error2) => error2?.code === "ENOENT" ? "absent" : "unknown");
     if (pathState === "unknown") return fail(REASON.worktree_path_in_use, { path: worktreePath });
     if (pathState === "present") {
-      const marker = await lstat6(join21(worktreePath, ".git")).then(() => "present", (error2) => error2?.code === "ENOENT" ? "absent" : "unknown");
+      const marker = await lstat6(join22(worktreePath, ".git")).then(() => "present", (error2) => error2?.code === "ENOENT" ? "absent" : "unknown");
       if (marker !== "absent") return fail(REASON.worktree_path_in_use, { path: worktreePath });
     }
   }
@@ -31580,7 +32026,7 @@ async function collectSharedRules({ run: run3, cwd }) {
   if (commonDir === "") return null;
   const found = [];
   for (const name of ["info/exclude", "info/attributes"]) {
-    const text2 = await readFile12(join21(commonDir, ...name.split("/")), "utf8").catch(() => null);
+    const text2 = await readFile14(join22(commonDir, ...name.split("/")), "utf8").catch(() => null);
     if (text2 === null) continue;
     const meaningful = text2.split("\n").some((line) => {
       const trimmed = line.trim();
@@ -31591,9 +32037,9 @@ async function collectSharedRules({ run: run3, cwd }) {
   return found;
 }
 async function transplant({ run: run3, projectPath, worktreePath, scratch, runId }) {
-  const indexPath = join21(scratch, `index-${runId}-${process.pid}`);
-  const patchPath = join21(scratch, `state-${runId}-${process.pid}.patch`);
-  await rm8(indexPath, { force: true });
+  const indexPath = join22(scratch, `index-${runId}-${process.pid}`);
+  const patchPath = join22(scratch, `state-${runId}-${process.pid}.patch`);
+  await rm9(indexPath, { force: true });
   try {
     const env = { GIT_INDEX_FILE: indexPath };
     const readTree = await run3({
@@ -31640,9 +32086,9 @@ async function transplant({ run: run3, projectPath, worktreePath, scratch, runId
     }
     return { applied: true, files };
   } finally {
-    await rm8(indexPath, { force: true }).catch(() => {
+    await rm9(indexPath, { force: true }).catch(() => {
     });
-    await rm8(patchPath, { force: true }).catch(() => {
+    await rm9(patchPath, { force: true }).catch(() => {
     });
   }
 }
@@ -31692,7 +32138,7 @@ async function discard({
   deps = {},
   authority = null,
   statPath = lstat6,
-  removePath = rm8
+  removePath = rm9
 }) {
   const coordinated = await coordinateWorktreeCleanup({
     stateRoot,
@@ -31731,18 +32177,18 @@ async function unregisterOnlyOurs({ run: run3, projectPath, worktreePath }) {
   if (!got?.ok || typeof got.stdout !== "string") return false;
   const commonDir = got.stdout.trim();
   if (commonDir === "") return false;
-  const adminRoot = join21(commonDir, "worktrees");
-  const ids = await readdir4(adminRoot).catch(() => null);
+  const adminRoot = join22(commonDir, "worktrees");
+  const ids = await readdir5(adminRoot).catch(() => null);
   if (ids === null) return false;
   const ours = [];
   for (const id of ids) {
-    const text2 = await readFile12(join21(adminRoot, id, "gitdir"), "utf8").catch(() => null);
+    const text2 = await readFile14(join22(adminRoot, id, "gitdir"), "utf8").catch(() => null);
     if (text2 === null) continue;
     const gitdir = text2.trim();
     if (gitdir !== "" && samePath2(dirname13(gitdir), worktreePath)) ours.push(id);
   }
   if (ours.length !== 1) return false;
-  return rm8(join21(adminRoot, ours[0]), { recursive: true, force: true }).then(() => true, () => false);
+  return rm9(join22(adminRoot, ours[0]), { recursive: true, force: true }).then(() => true, () => false);
 }
 async function canonicalHandle(wt) {
   const guard = checkHandle(wt);
@@ -31816,7 +32262,7 @@ async function removeWorktree(wt, deps = {}) {
     deps,
     authority,
     statPath: deps.statPath ?? deps.lstatPath ?? lstat6,
-    removePath: deps.removePath ?? rm8
+    removePath: deps.removePath ?? rm9
   });
   if (result2.settled === true) {
     const settleAuthority = deps.settleWorktreeCreationAuthority ?? settleWorktreeCreationAuthority;
@@ -31834,7 +32280,7 @@ function checkHandle(wt) {
 
 // src/reaper-tracking.mjs
 import { randomBytes as cryptoRandomBytes5 } from "node:crypto";
-import { isAbsolute as isAbsolute24 } from "node:path";
+import { isAbsolute as isAbsolute25 } from "node:path";
 var publicMutationResult = (updated) => updated?.ok === true ? true : updated?.stateSchema === void 0 ? false : { ok: false, stateSchema: updated.stateSchema };
 var publicDetailedMutationResult = (updated) => updated?.ok === true ? { ok: true } : {
   ok: false,
@@ -31891,7 +32337,7 @@ async function armEffectUnknownIntent({
   const { selfPid = process.pid, getStartTime = defaultGetStartTime } = deps;
   const randomBytes5 = typeof deps.randomBytes === "function" ? deps.randomBytes : cryptoRandomBytes5;
   const target = await resolveSafeWorktree(stateRoot, worktree);
-  if (target === null || typeof runId !== "string" || runId === "" || typeof projectPath !== "string" || projectPath === "" || !isAbsolute24(projectPath) || !Number.isSafeInteger(retainUntil) || retainUntil < 0) return { ok: false, status: "invalid" };
+  if (target === null || typeof runId !== "string" || runId === "" || typeof projectPath !== "string" || projectPath === "" || !isAbsolute25(projectPath) || !Number.isSafeInteger(retainUntil) || retainUntil < 0) return { ok: false, status: "invalid" };
   let tokenBytes;
   try {
     tokenBytes = randomBytes5(32);
@@ -31950,7 +32396,7 @@ async function trackWorktree({
     ownerStartTime: ownerStartTime ?? null,
     spawnfile: null,
     worktree: target,
-    projectPath: typeof projectPath === "string" && projectPath !== "" && isAbsolute24(projectPath) ? projectPath : null,
+    projectPath: typeof projectPath === "string" && projectPath !== "" && isAbsolute25(projectPath) ? projectPath : null,
     purpose,
     retainUntil
   }, ledgerOptionsOf(deps));
@@ -32010,6 +32456,12 @@ async function sweepOrphans({
     // ★ 로그도 여기서 치운다(WS2 §5). scratch·patches 와 **같은 함수**를 지나므로 소유권 판정과
     //   반환 모양이 한 글자도 다르지 않다 — 엔진의 실행별 스윕 표에도 같은 행이 있다.
     logs: { removed: 0, checked: 0 },
+    // ★★ follow-up ③ (2026-09-01): 증명(`<stateRoot>/proofs/<runId>/`)도 여기서 치운다. 그
+    //   디렉터리는 끝난 실행의 `runs/<runId>/` **밖**에 산다(불변식, 스펙 §2) — 아무도 안 치우면
+    //   지난 실행의 만료된 증명은 다음 `orch_run` 을 기다리는데, 그 실행이 다시 안 돌 수도 있다.
+    //   판정은 여전히 기록 자신의 `expiresAt` 이지 이 부팅의 시계가 아니다(「자기 시계로 치우지
+    //   않는다」) — `sweepProofs` 가 그 규율을 쥔다, 여기는 부르기만 한다.
+    proofs: { removed: 0, checked: 0 },
     runs: { removed: [], checked: 0, skipped: [] }
   };
   try {
@@ -32021,6 +32473,7 @@ async function sweepOrphans({
       scratchRoomSweep = sweepScratchRooms,
       patchSweep = sweepPatches,
       logSweep = sweepLogs,
+      proofSweep = sweepProofs,
       planSweep = sweepPlans,
       runSweep = sweepRuns,
       npmCacheSweep = sweepNpmCache,
@@ -32058,6 +32511,8 @@ async function sweepOrphans({
     result2.plans = await planSweep(stateRoot, nowMs, { deadlineAt, nowMs: getNowMs });
     if (budgetExpired()) return result2;
     result2.logs = await logSweep({ stateRoot, now: nowMs, deadlineAt, clock: getNowMs });
+    if (budgetExpired()) return result2;
+    result2.proofs = await proofSweep(stateRoot, nowMs, { deadlineAt, nowMs: getNowMs });
     if (budgetExpired()) return result2;
     const hasExclusion = excludeRunId !== void 0;
     const artifactFlagsValid = typeof shouldSweepPatches === "boolean" && typeof shouldSweepRuns === "boolean";
@@ -32177,7 +32632,7 @@ async function sweepOrphans({
     };
     const acquireClaimForScope = async ({ record: record2, target, expectedScopeRecords }) => {
       const projectPaths = [...new Set(expectedScopeRecords.map((candidate) => candidate?.projectPath).filter((value) => typeof value === "string" && value !== ""))];
-      if (projectPaths.length !== 1 || !isAbsolute25(projectPaths[0])) {
+      if (projectPaths.length !== 1 || !isAbsolute26(projectPaths[0])) {
         return { ok: false, status: "scope_mismatch" };
       }
       const projectPath = projectPaths[0];
@@ -32421,7 +32876,7 @@ async function reclaimTrackedWorktree({
   effectBudget
 }) {
   const projectPath = record2?.projectPath;
-  if (typeof projectPath !== "string" || projectPath === "" || !isAbsolute25(projectPath)) {
+  if (typeof projectPath !== "string" || projectPath === "" || !isAbsolute26(projectPath)) {
     return false;
   }
   const result2 = await reclaimWorktree(
@@ -32469,14 +32924,14 @@ function stateSchemaNotice(stateSchema) {
 }
 
 // src/test-runner.mjs
-import { lstat as lstat8, stat as stat11 } from "node:fs/promises";
-import { basename as basename9, dirname as dirname14, isAbsolute as isAbsolute27, join as join23, relative as relative6, resolve as resolve10 } from "node:path";
+import { lstat as lstat8, stat as stat12 } from "node:fs/promises";
+import { basename as basename9, dirname as dirname14, isAbsolute as isAbsolute28, join as join24, relative as relative6, resolve as resolve10 } from "node:path";
 import { fileURLToPath as fileURLToPath3 } from "node:url";
 
 // src/test-evidence.mjs
 import { randomBytes as randomBytes3 } from "node:crypto";
-import { lstat as lstat7, open as open9, readFile as readFile13, readdir as readdir5, rm as rm9, stat as stat10 } from "node:fs/promises";
-import { isAbsolute as isAbsolute26, join as join22, relative as relative5 } from "node:path";
+import { lstat as lstat7, open as open10, readFile as readFile15, readdir as readdir6, rm as rm10, stat as stat11 } from "node:fs/promises";
+import { isAbsolute as isAbsolute27, join as join23, relative as relative5 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/xml-subset.mjs
@@ -32636,7 +33091,7 @@ function tokenizeJunitXml(text2, { onOpen, onText, onClose, maxAttributeChars })
 // src/test-evidence.mjs
 var ADAPTER_EVIDENCE_POLICY = /* @__PURE__ */ new WeakMap();
 var TEST_RECORD_WITNESS_AUTHORITY = /* @__PURE__ */ new WeakMap();
-var SHA256_PATTERN4 = /^[0-9a-f]{64}$/;
+var SHA256_PATTERN5 = /^[0-9a-f]{64}$/;
 var MAX_ADAPTER_BYTES = 8 * 1024 * 1024;
 var MAX_ADAPTER_EVENTS = 2e4;
 var MAX_ADAPTER_LINE_CHARS = 16384;
@@ -32681,10 +33136,10 @@ function safeRelativeSourcePath(value, worktreePath = null) {
       return null;
     }
   }
-  if (isAbsolute26(path)) {
+  if (isAbsolute27(path)) {
     if (worktreePath === null) return null;
     const rel = relative5(worktreePath, path);
-    if (rel === "" || isAbsolute26(rel) || rel.split(/[\\/]/).includes("..")) return null;
+    if (rel === "" || isAbsolute27(rel) || rel.split(/[\\/]/).includes("..")) return null;
     path = rel.replaceAll("\\", "/");
   }
   if (process.platform === "win32") path = path.replaceAll("\\", "/");
@@ -32742,20 +33197,22 @@ function pathAllowedByPolicy(adapterId, path, policy) {
   }
   return false;
 }
-function sameNodeRecord(entry2, event, path, name) {
-  return entry2.path === path && entry2.name === name && entry2.kind === event.kind && entry2.line === event.line && entry2.column === event.column && entry2.nesting === event.nesting;
-}
 function parseNodeEvidence(bytes, worktreePath = null, witnessPolicy = DEFAULT_NODE_WITNESS_POLICY) {
   const events = parseJsonLines(bytes);
   if (events === null) return invalidEvidence();
-  const stack = [];
-  const witnesses = [];
+  const open11 = /* @__PURE__ */ new Map();
+  const openByPath = /* @__PURE__ */ new Map();
+  const witnesses = /* @__PURE__ */ new Set();
+  const seenNames = /* @__PURE__ */ new Map();
   const failureFingerprints2 = [];
   const witnessAuthority = [];
   let failureKind = "unknown";
   let terminal = null;
   let completedCount = 0;
   let failedCount = 0;
+  const markDescendantFailed = (node) => {
+    for (let parent = node.parent; parent !== null; parent = parent.parent) parent.descendantFailed = true;
+  };
   for (let index = 0; index < events.length; index += 1) {
     const event = events[index];
     if (event?.type === "terminal") {
@@ -32764,73 +33221,90 @@ function parseNodeEvidence(bytes, worktreePath = null, witnessPolicy = DEFAULT_N
       continue;
     }
     const keys = ["type", "kind", "name", "file", "line", "column", "nesting", "failureType"];
-    if (!hasExactKeys(event, keys) || !["enqueue", "pass", "fail"].includes(event.type) || !["test", "suite"].includes(event.kind) || typeof event.name !== "string" || event.name === "" || event.name.length > 1024 || event.name.includes(" > ") || !Number.isInteger(event.line) || event.line < 1 || !Number.isInteger(event.column) || event.column < 0 || !Number.isInteger(event.nesting) || event.nesting < 0 || event.nesting > 64 || event.failureType !== null && typeof event.failureType !== "string") return invalidEvidence();
+    if (!hasExactKeys(event, keys) || !["enqueue", "pass", "fail"].includes(event.type) || !["test", "suite"].includes(event.kind) || typeof event.name !== "string" || event.name === "" || event.name.length > 1024 || !Number.isInteger(event.line) || event.line < 1 || !Number.isInteger(event.column) || event.column < 0 || !Number.isInteger(event.nesting) || event.nesting < 0 || event.nesting > 64 || event.failureType !== null && typeof event.failureType !== "string") return invalidEvidence();
     const path = safeRelativeSourcePath(event.file, worktreePath);
     const name = normalizeFullTestName(event.name);
     if (path === null || name === null) return invalidEvidence();
+    const key = JSON.stringify([path, event.kind, name, event.line, event.column, event.nesting]);
     if (event.type === "enqueue") {
-      if (event.failureType !== null || event.nesting !== stack.length || stack.length > 0 && (stack.at(-1).path !== path || stack.at(-1).kind !== "suite")) return invalidEvidence();
-      for (const parent of stack) parent.hasChild = true;
-      const fullName = [...stack.map((entry2) => entry2.name), name].join(" > ");
+      if (event.failureType !== null || open11.has(key)) return invalidEvidence();
+      const byNesting2 = openByPath.get(path) ?? /* @__PURE__ */ new Map();
+      const parent = event.nesting === 0 ? null : byNesting2.get(event.nesting - 1) ?? null;
+      if (event.nesting > 0 && parent === null) return invalidEvidence();
+      const fullName = parent === null ? name : `${parent.fullName} > ${name}`;
       if (normalizeFullTestName(fullName) === null) return invalidEvidence();
-      stack.push({
-        path,
-        kind: event.kind,
-        name,
-        fullName,
-        line: event.line,
-        column: event.column,
-        nesting: event.nesting,
-        hasChild: false,
-        descendantFailed: false
-      });
+      const node = { path, kind: event.kind, fullName, parent, openChildren: 0, hasChild: false, descendantFailed: false };
+      if (parent !== null) {
+        parent.openChildren += 1;
+        parent.hasChild = true;
+      }
+      open11.set(key, node);
+      byNesting2.set(event.nesting, node);
+      openByPath.set(path, byNesting2);
       continue;
     }
-    const current = stack.at(-1);
-    if (!current || event.nesting !== stack.length - 1 || !sameNodeRecord(current, event, path, name)) return invalidEvidence();
-    stack.pop();
+    const current = open11.get(key);
+    if (!current || current.openChildren !== 0) return invalidEvidence();
+    open11.delete(key);
+    const byNesting = openByPath.get(path);
+    if (byNesting?.get(event.nesting) === current) byNesting.delete(event.nesting);
+    if (current.parent !== null) current.parent.openChildren -= 1;
     completedCount += 1;
+    const failed = event.type === "fail";
+    let ownFailure = false;
     if (current.kind === "suite") {
       if (current.descendantFailed) {
-        if (event.type !== "fail" || event.failureType !== "subtestsFailed") return invalidEvidence("infrastructure");
-        for (const parent of stack) parent.descendantFailed = true;
-      } else if (event.type === "fail") {
-        failureKind = "infrastructure";
-        failedCount += 1;
-        for (const parent of stack) parent.descendantFailed = true;
-      } else if (event.failureType !== null) {
+        if (!failed || event.failureType !== "subtestsFailed") return invalidEvidence("infrastructure");
+        markDescendantFailed(current);
+      } else if (failed) {
         return invalidEvidence("infrastructure");
       }
       continue;
     }
-    if (current.hasChild) return invalidEvidence("infrastructure");
-    if (event.type === "fail") {
-      if (event.failureType !== "testCodeFailure") return invalidEvidence("infrastructure");
+    if (current.hasChild) {
+      if (current.descendantFailed) {
+        if (!failed || event.failureType !== "subtestsFailed") return invalidEvidence("infrastructure");
+        markDescendantFailed(current);
+      } else if (failed) {
+        if (event.failureType !== "testCodeFailure") return invalidEvidence("infrastructure");
+        ownFailure = true;
+      }
+    } else {
+      if (failed) {
+        if (event.failureType !== "testCodeFailure") return invalidEvidence("infrastructure");
+        ownFailure = true;
+      } else if (event.failureType !== null) {
+        if (event.failureType !== "skip" && event.failureType !== "todo") return invalidEvidence();
+        continue;
+      }
+    }
+    if (ownFailure) {
       failureKind = "assertion";
       failedCount += 1;
-      for (const parent of stack) parent.descendantFailed = true;
-    } else if (event.failureType !== null) {
-      if (event.failureType !== "skip" && event.failureType !== "todo") return invalidEvidence();
-      continue;
+      markDescendantFailed(current);
     }
     if (!pathAllowedByPolicy("node-events-v1", path, witnessPolicy)) continue;
-    const id = witnessId("node-events-v1", path, current.fullName);
-    if (witnesses.includes(id)) return invalidEvidence();
-    witnesses.push(id);
+    const nameKey = `${path}\0${current.fullName}`;
+    const occurrence = (seenNames.get(nameKey) ?? 0) + 1;
+    seenNames.set(nameKey, occurrence);
+    const witnessName = occurrence === 1 ? current.fullName : `${current.fullName} #${occurrence}`;
+    const id = witnessId("node-events-v1", path, witnessName);
+    if (witnesses.has(id)) return invalidEvidence();
+    witnesses.add(id);
     witnessAuthority.push({
       adapterId: "node-events-v1",
       path,
-      fullName: current.fullName,
-      outcome: event.type === "fail" ? "fail" : "pass",
+      fullName: witnessName,
+      outcome: ownFailure ? "fail" : "pass",
       witnessId: id
     });
-    if (event.type === "fail") failureFingerprints2.push(sha256(Buffer.from(`assertion\0${id}`, "utf8")));
+    if (ownFailure) failureFingerprints2.push(sha256(Buffer.from(`assertion\0${id}`, "utf8")));
   }
-  if (terminal === null || stack.length !== 0 || terminal.count !== completedCount) return invalidEvidence();
+  if (terminal === null || open11.size !== 0 || terminal.count !== completedCount) return invalidEvidence();
   return {
     trusted: true,
     complete: true,
-    witnessIds: witnesses.sort(),
+    witnessIds: [...witnesses].sort(),
     failureFingerprints: failureFingerprints2.sort(),
     failureKind,
     observedOutcome: failedCount > 0 ? "fail" : "pass",
@@ -33155,7 +33629,7 @@ function sameStringList(a, b) {
   return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((value, index) => value === b[index]);
 }
 function sortedShaList(values) {
-  if (!Array.isArray(values) || values.some((value) => typeof value !== "string" || !SHA256_PATTERN4.test(value))) {
+  if (!Array.isArray(values) || values.some((value) => typeof value !== "string" || !SHA256_PATTERN5.test(value))) {
     return null;
   }
   const sorted = [...new Set(values)].sort();
@@ -33186,6 +33660,15 @@ function selectTestDeltaWitnesses(record2, deltaPaths) {
 function boundedDiagnostics(values) {
   return [...new Set(values)].filter((value) => typeof value === "string" && value !== "").slice(0, MAX_DIAGNOSTICS).map((value) => value.slice(0, MAX_DIAGNOSTIC_CHARS));
 }
+var FAILING_LABEL_CHARS = 160;
+function failingTestLabels(record2) {
+  const authority = TEST_RECORD_WITNESS_AUTHORITY.get(record2);
+  if (authority === void 0) return deepFreeze([]);
+  return deepFreeze(authority.filter((entry2) => entry2.outcome === "fail").map((entry2) => ({
+    fingerprint: sha256(Buffer.from(`assertion\0${entry2.witnessId}`, "utf8")),
+    label: `${entry2.path} \u203A ${entry2.fullName}`.slice(0, FAILING_LABEL_CHARS)
+  })).sort((left, right) => left.label < right.label ? -1 : left.label > right.label ? 1 : 0));
+}
 function persistableRecord(plan, raw, evidence, diagnostics = []) {
   const classified = classifyWithRequiredAdapter(raw, evidence, plan?.adapterId ?? null);
   const record2 = {
@@ -33198,8 +33681,8 @@ function persistableRecord(plan, raw, evidence, diagnostics = []) {
     // ★ `execution` 으로는 이걸 못 잰다. 스폰 전 중단과 스폰 후 중단이 둘 다 `'aborted'` 라서,
     //   그 값으로 판단하면 한 줄도 안 돌린 실행을 "돌았다"고 신고하게 된다.
     ranWithUserPrivilege: raw?.ran === true,
-    planFingerprint: plan?.planFingerprint && SHA256_PATTERN4.test(plan.planFingerprint) ? plan.planFingerprint : sha256("invalid-plan"),
-    environmentFingerprint: plan?.environmentFingerprint && SHA256_PATTERN4.test(plan.environmentFingerprint) ? plan.environmentFingerprint : sha256("invalid-environment"),
+    planFingerprint: plan?.planFingerprint && SHA256_PATTERN5.test(plan.planFingerprint) ? plan.planFingerprint : sha256("invalid-plan"),
+    environmentFingerprint: plan?.environmentFingerprint && SHA256_PATTERN5.test(plan.environmentFingerprint) ? plan.environmentFingerprint : sha256("invalid-environment"),
     truncated: raw?.truncated === true,
     diagnostics: boundedDiagnostics(diagnostics)
   };
@@ -33209,8 +33692,8 @@ function persistableRecord(plan, raw, evidence, diagnostics = []) {
 async function createOwnedEventFile(worktreePath, deps = {}) {
   const suffix = typeof deps.randomSuffix === "function" ? deps.randomSuffix() : randomBytes3(12).toString("hex");
   if (!/^[0-9a-f]{24}$/.test(suffix)) throw new Error("invalid event suffix");
-  const path = join22(worktreePath, `.bom-orch-test-${suffix}.jsonl`);
-  const handle = await (deps.openEventFile ?? open9)(path, "wx", 384);
+  const path = join23(worktreePath, `.bom-orch-test-${suffix}.jsonl`);
+  const handle = await (deps.openEventFile ?? open10)(path, "wx", 384);
   try {
     await handle.close();
     const info = await (deps.lstatCreatedEventFile ?? lstat7)(path);
@@ -33235,9 +33718,9 @@ async function eventFileUnchanged(file, deps = {}) {
 }
 async function readOwnedEvidence(file, deps = {}) {
   if (!await eventFileUnchanged(file, deps)) return null;
-  const info = await (deps.statEventFile ?? stat10)(file.path);
+  const info = await (deps.statEventFile ?? stat11)(file.path);
   if (!info.isFile() || info.size <= 0 || info.size > MAX_ADAPTER_BYTES) return null;
-  const bytes = await (deps.readEventFile ?? readFile13)(file.path, "utf8");
+  const bytes = await (deps.readEventFile ?? readFile15)(file.path, "utf8");
   return bytes.length <= MAX_ADAPTER_BYTES ? bytes : null;
 }
 async function insideCanonicalWorktree(worktreePath, path, canonicalize) {
@@ -33245,12 +33728,12 @@ async function insideCanonicalWorktree(worktreePath, path, canonicalize) {
   const real = await canonicalize(path);
   if (typeof root !== "string" || typeof real !== "string") return false;
   const rel = relative5(root, real);
-  return rel !== "" && !isAbsolute26(rel) && !rel.split(/[\\/]/).includes("..");
+  return rel !== "" && !isAbsolute27(rel) && !rel.split(/[\\/]/).includes("..");
 }
 async function prepareDeclaredResults(worktreePath, declared, deps = {}) {
   const relativePath = safeRelativeSourcePath(declared);
-  if (relativePath === null || typeof worktreePath !== "string" || !isAbsolute26(worktreePath)) return null;
-  const path = join22(worktreePath, relativePath);
+  if (relativePath === null || typeof worktreePath !== "string" || !isAbsolute27(worktreePath)) return null;
+  const path = join23(worktreePath, relativePath);
   if (!await insideCanonicalWorktree(worktreePath, path, deps.canonicalResults ?? canonical)) return null;
   const target = { path, identity: null, worktreePath };
   try {
@@ -33260,7 +33743,7 @@ async function prepareDeclaredResults(worktreePath, declared, deps = {}) {
   }
   if (!/\.xml$/i.test(relativePath)) return target;
   try {
-    const handle = await (deps.openEventFile ?? open9)(path, "wx", 384);
+    const handle = await (deps.openEventFile ?? open10)(path, "wx", 384);
     await handle.close();
     const created = await (deps.lstatCreatedEventFile ?? lstat7)(path);
     const real = await (deps.canonicalCreatedEventFile ?? canonical)(path);
@@ -33286,13 +33769,13 @@ async function readDeclaredResults(target, deps = {}) {
   }
   if (!info.isFile() || info.size <= 0 || info.size > MAX_ADAPTER_BYTES) return null;
   const owned = target.identity !== null && await eventFileUnchanged(target, deps);
-  const bytes = await (deps.readEventFile ?? readFile13)(target.path, "utf8");
+  const bytes = await (deps.readEventFile ?? readFile15)(target.path, "utf8");
   return bytes.length > MAX_ADAPTER_BYTES ? null : { documents: [bytes], owned };
 }
 async function readResultsDirectory(path, deps = {}) {
   let entries;
   try {
-    entries = await (deps.readdirResults ?? readdir5)(path, { withFileTypes: true });
+    entries = await (deps.readdirResults ?? readdir6)(path, { withFileTypes: true });
   } catch {
     return null;
   }
@@ -33301,13 +33784,13 @@ async function readResultsDirectory(path, deps = {}) {
   const documents = [];
   let total = 0;
   for (const name of names) {
-    const full = join22(path, name);
+    const full = join23(path, name);
     try {
       const info = await (deps.lstatEventFile ?? lstat7)(full);
       if (!info.isFile() || info.isSymbolicLink() || info.size <= 0) return null;
       total += info.size;
       if (total > MAX_ADAPTER_BYTES) return null;
-      documents.push(await (deps.readEventFile ?? readFile13)(full, "utf8"));
+      documents.push(await (deps.readEventFile ?? readFile15)(full, "utf8"));
     } catch {
       return null;
     }
@@ -33317,7 +33800,7 @@ async function readResultsDirectory(path, deps = {}) {
 async function cleanupOwnedEvidence(file, deps = {}) {
   if (!await eventFileUnchanged(file, deps)) return false;
   try {
-    await (deps.removeEventFile ?? rm9)(file.path);
+    await (deps.removeEventFile ?? rm10)(file.path);
     try {
       await (deps.lstatEventFile ?? lstat7)(file.path);
       return false;
@@ -33539,7 +34022,7 @@ async function spawnAndCollect({ command, args, cwd, env, signal, timeoutMs, onS
 // src/test-runner.mjs
 async function isDirectory(path) {
   try {
-    return (await stat11(path)).isDirectory();
+    return (await stat12(path)).isDirectory();
   } catch {
     return false;
   }
@@ -33547,11 +34030,11 @@ async function isDirectory(path) {
 function insideWorktree(worktree, path) {
   if (path === worktree) return true;
   const rel = relative6(worktree, path);
-  return rel !== "" && !isAbsolute27(rel) && !rel.split(/[\\/]/).includes("..");
+  return rel !== "" && !isAbsolute28(rel) && !rel.split(/[\\/]/).includes("..");
 }
 async function resolveDeclaredCwd(worktreePath, declared, deps = {}) {
   if (declared === void 0 || declared === null || declared === "" || declared === ".") return worktreePath;
-  if (typeof declared !== "string" || declared.includes("\\") || isAbsolute27(declared)) return null;
+  if (typeof declared !== "string" || declared.includes("\\") || isAbsolute28(declared)) return null;
   const path = resolve10(worktreePath, declared);
   if (path === resolve10(worktreePath)) return worktreePath;
   if (!insideWorktree(worktreePath, path) || !await isDirectory(path)) return null;
@@ -33626,17 +34109,17 @@ async function cwdLookupWarning(worktree, definition) {
   const exts = ["", ...(process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";")].map((e) => e.trim().toLowerCase());
   const inRoot = [];
   for (const ext of exts) {
-    if (await isFile2(join23(worktree, token + ext))) inRoot.push(token + ext);
+    if (await isFile2(join24(worktree, token + ext))) inRoot.push(token + ext);
   }
   if (inRoot.length === 0) return null;
   for (const ext of exts) {
-    if (await isFile2(join23(worktree, "node_modules", ".bin", token + ext))) return null;
+    if (await isFile2(join24(worktree, "node_modules", ".bin", token + ext))) return null;
   }
   return renderNotice("test_command_bare_name_unresolved", { path: inRoot.join(" / "), token });
 }
 async function isFile2(path) {
   try {
-    return (await stat11(path)).isFile();
+    return (await stat12(path)).isFile();
   } catch {
     return false;
   }
@@ -33646,11 +34129,11 @@ async function runTests(spec) {
     const options = spec && typeof spec === "object" ? spec : {};
     const { worktree, command, definition, source = null, runId, signal } = options;
     const args = options.args ?? [];
-    if (typeof worktree !== "string" || worktree === "" || !isAbsolute27(worktree)) {
+    if (typeof worktree !== "string" || worktree === "" || !isAbsolute28(worktree)) {
       return fail(REASON.evidence_worktree_invalid);
     }
     if (!await isDirectory(worktree)) return fail(REASON.evidence_worktree_invalid);
-    if (typeof command !== "string" || command === "" || !isAbsolute27(command)) {
+    if (typeof command !== "string" || command === "" || !isAbsolute28(command)) {
       const unresolvedTool = options.unresolvedTool;
       if (typeof unresolvedTool === "string" && unresolvedTool !== "") {
         return fail(REASON.test_command_unavailable, {}, { unresolvedTool });
@@ -33662,7 +34145,7 @@ async function runTests(spec) {
       return fail(REASON.test_abort_signal_invalid);
     }
     const spawnCwd = typeof options.cwd === "string" && options.cwd !== "" ? options.cwd : worktree;
-    if (!isAbsolute27(spawnCwd) || !insideWorktree(worktree, spawnCwd) || !await isDirectory(spawnCwd)) {
+    if (!isAbsolute28(spawnCwd) || !insideWorktree(worktree, spawnCwd) || !await isDirectory(spawnCwd)) {
       return fail(REASON.test_plan_invalid);
     }
     const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : DEFAULT_TIMEOUT_MS3;
@@ -33687,11 +34170,13 @@ async function runTests(spec) {
     notes.push(...extras.notes);
     const lookupWarning = await cwdLookupWarning(worktree, definition);
     if (lookupWarning !== null) notes.push(lookupWarning);
-    const childEnv = buildChildEnv(options.env ?? process.env, {
+    const parentEnv = options.env ?? process.env;
+    const insideEvidence = typeof parentEnv.BOM_ORCH_EVIDENCE_RUN_ID === "string" && parentEnv.BOM_ORCH_EVIDENCE_RUN_ID !== "";
+    const childEnv = buildChildEnv(parentEnv, {
       authNames: [],
-      runId,
+      runId: insideEvidence ? runId : void 0,
       pathPrepend: [dirname14(process.execPath)],
-      extra: options.childEnvExtra,
+      extra: { ...options.childEnvExtra ?? {}, BOM_ORCH_EVIDENCE_RUN_ID: runId },
       notes
     });
     const started = Date.now();
@@ -33716,7 +34201,7 @@ async function runTests(spec) {
     if (run3.hung) notes.push(renderNotice("test_output_pipe_unclosed", {}));
     if (passed === false && lookupWarning !== null) confidence = "unverified";
     if (passed === false && MISSING_DEP_SIGNS.some((sign) => run3.output.includes(sign))) {
-      const hasNodeModules = source === "package.json" ? await isDirectory(join23(worktree, "node_modules")) : true;
+      const hasNodeModules = source === "package.json" ? await isDirectory(join24(worktree, "node_modules")) : true;
       if (source !== "package.json" || !hasNodeModules) {
         confidence = "unverified";
         notes.push(renderNotice(
@@ -33803,7 +34288,7 @@ function publicDefinitionPins(definition) {
   const entries = [definition, ...Array.isArray(definition.extras) ? definition.extras : []];
   const grouped = /* @__PURE__ */ new Map();
   for (const entry2 of entries) {
-    const path = typeof entry2?.file === "string" && entry2.file !== "" && !isAbsolute27(entry2.file) ? entry2.file.replaceAll("\\", "/") : null;
+    const path = typeof entry2?.file === "string" && entry2.file !== "" && !isAbsolute28(entry2.file) ? entry2.file.replaceAll("\\", "/") : null;
     if (path === null || path.includes("\0") || path.split("/").some((part) => part === "..")) continue;
     const current = grouped.get(path) ?? [];
     current.push(normalizedDefinitionPin(entry2));
@@ -33812,21 +34297,41 @@ function publicDefinitionPins(definition) {
   return [...grouped.entries()].sort(([a], [b]) => compareUtf8(a, b)).map(([path, values]) => ({ path, sha256: hashJson(values) }));
 }
 function tokenizeLiteralNodeScript(script) {
-  if (typeof script !== "string" || script === "" || script.length > 8192 || /[\r\n\t'"\\$%!*?\[\]{}()~^;&|><`#]/.test(script)) return null;
+  if (typeof script !== "string" || script === "" || script.length > 8192 || /[\r\n\t'\\$%!()~;&|><`#]/.test(script) || script.includes('""')) return null;
   const trimmed = script.trim();
   if (trimmed === "") return null;
-  const tokens = trimmed.split(/ +/);
-  if (tokens.some((token) => token === "" || !/^[A-Za-z0-9._/@+=,:-]+$/.test(token))) return null;
+  const tokens = [];
+  let current = "";
+  let quoted = false;
+  let inQuote = false;
+  for (const char of trimmed) {
+    if (char === '"') {
+      inQuote = !inQuote;
+      quoted = true;
+      continue;
+    }
+    if (char === " " && !inQuote) {
+      if (current !== "" || quoted) tokens.push(current);
+      current = "";
+      quoted = false;
+      continue;
+    }
+    if (!(inQuote ? /[A-Za-z0-9._/@+=,:*?^\[\]{}-]/ : /[A-Za-z0-9._/@+=,:-]/).test(char)) return null;
+    current += char;
+  }
+  if (inQuote) return null;
+  if (current !== "" || quoted) tokens.push(current);
+  if (tokens.some((token) => token === "")) return null;
   if (tokens.length < 2 || !/^(?:node|node\.exe)$/i.test(tokens[0])) return null;
   const args = tokens.slice(1);
   if (args.filter((arg) => arg === "--test").length !== 1) return null;
   if (args.some(
-    (arg) => arg.startsWith("--test-reporter") || arg.startsWith("--test-reporter-destination") || isAbsolute27(arg) || /^[A-Za-z]:/.test(arg)
+    (arg) => arg.startsWith("--test-reporter") || arg.startsWith("--test-reporter-destination") || isAbsolute28(arg) || /^[A-Za-z]:/.test(arg)
   )) return null;
   return args;
 }
 function validWitnessRoot(value) {
-  if (typeof value !== "string" || value === "" || value.length > 512 || value.includes("\0") || value.includes("\\") || isAbsolute27(value) || /^[A-Za-z]:/.test(value) || /[*?\[\]{}]/.test(value)) return null;
+  if (typeof value !== "string" || value === "" || value.length > 512 || value.includes("\0") || value.includes("\\") || isAbsolute28(value) || /^[A-Za-z]:/.test(value) || /[*?\[\]{}]/.test(value)) return null;
   const normalized = value.replace(/^\.\//, "").replace(/\/$/, "").normalize("NFC");
   const parts = normalized.split("/");
   return parts.some((part) => part === "" || part === "." || part === "..") ? null : parts.join("/");
@@ -33872,7 +34377,7 @@ async function freezeControllerArgv(derived, deps = {}) {
   const launchers = [];
   for (let index = 0; index < derived.args.length; index += 1) {
     const arg = derived.args[index];
-    if (!isAbsolute27(arg)) {
+    if (!isAbsolute28(arg)) {
       argv.push(arg);
       continue;
     }
@@ -33978,10 +34483,10 @@ function resolveExecutableAgain(path, deps = {}) {
   return defaultResolveTool(name);
 }
 async function executableIdentity(path, deps = {}) {
-  if (typeof path !== "string" || !isAbsolute27(path)) return null;
+  if (typeof path !== "string" || !isAbsolute28(path)) return null;
   try {
     const inspectLink = deps.lstatExecutable ?? lstat8;
-    const inspectFile = deps.statExecutable ?? stat11;
+    const inspectFile = deps.statExecutable ?? stat12;
     const link = await inspectLink(path);
     if (link.isSymbolicLink() || !link.isFile()) return null;
     const info = await inspectFile(path);
@@ -34055,7 +34560,7 @@ async function deriveFrozenTestPlan(projectPath, deps = {}) {
   return plan;
 }
 function validFrozenPlan(plan) {
-  if (!hasExactKeys(plan, PLAN_KEYS) || !Object.isFrozen(plan) || plan.schemaVersion !== 1 || plan.cwdPolicy !== "evidence-worktree" || !SHA256_PATTERN4.test(plan.planFingerprint) || !SHA256_PATTERN4.test(plan.environmentFingerprint) || !Array.isArray(plan.argv) || plan.argv.some((arg) => typeof arg !== "string") || !Array.isArray(plan.pinnedDefinitions)) return false;
+  if (!hasExactKeys(plan, PLAN_KEYS) || !Object.isFrozen(plan) || plan.schemaVersion !== 1 || plan.cwdPolicy !== "evidence-worktree" || !SHA256_PATTERN5.test(plan.planFingerprint) || !SHA256_PATTERN5.test(plan.environmentFingerprint) || !Array.isArray(plan.argv) || plan.argv.some((arg) => typeof arg !== "string") || !Array.isArray(plan.pinnedDefinitions)) return false;
   const core = exactPlanWithoutFingerprint(plan);
   return hashJson(core) === plan.planFingerprint;
 }
@@ -34159,9 +34664,9 @@ async function verifyWorktreeHandle(worktree, runId, mode) {
   if (!worktree || worktree.ok !== true || typeof worktree.path !== "string" || typeof worktree.stateRoot !== "string" || typeof worktree.worktreeId !== "string" || worktree.runId !== runId || !TEST_MODES.has(mode) || typeof worktree.purpose !== "string" || !new RegExp(`-${mode}-[12]$`).test(worktree.purpose)) return null;
   const [realPath, realState] = await Promise.all([canonical(worktree.path), canonical(worktree.stateRoot)]);
   if (realPath === null || realState === null || basename9(realPath) !== worktree.worktreeId) return null;
-  const root = join23(realState, "worktrees");
+  const root = join24(realState, "worktrees");
   const rel = relative6(root, realPath);
-  if (rel === "" || isAbsolute27(rel) || rel.split(/[\\/]/).includes("..")) return null;
+  if (rel === "" || isAbsolute28(rel) || rel.split(/[\\/]/).includes("..")) return null;
   return { path: realPath, stateRoot: realState };
 }
 async function verifyDefinition(worktreePath, definition) {
@@ -34319,13 +34824,11 @@ async function runFrozenTests(input, deps = {}) {
 }
 
 // src/regression-proof.mjs
-var SHA256_PATTERN5 = /^[0-9a-f]{64}$/;
-var OBJECT_ID_PATTERN3 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+var SHA256_PATTERN6 = /^[0-9a-f]{64}$/;
+var OBJECT_ID_PATTERN4 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 var SAFE_MODE = /* @__PURE__ */ new Set(["100644", "100755"]);
-var BUG_FIX_PATTERN = /\b(?:bug|bugs|error|errors|failure|failures|regression|regressions|repair|repairs|fix|fixes|fixed|fixing)\b|버그|오류|실패|회귀|고쳐|(?:문제|결함|깨짐|고장)(?:을|를|이|가)?\s*(?:수정|고치|해결)/i;
-var NON_BUG_PATTERN = /\b(?:feature|features|refactor|refactors|refactoring|docs?|documentation)\b|기능|리팩터|문서/i;
-var CODE_CLASSES = /* @__PURE__ */ new Set(["code:test-bearing", "code:no-tests"]);
 var REGRESSION_WITNESS_ADAPTERS = Object.freeze(["node-events-v1", "pytest-events-v1"]);
+var EVIDENCE_STAGES = Object.freeze(["run", "prove"]);
 var EVIDENCE_KEYS = [
   "schemaVersion",
   "evidenceId",
@@ -34374,12 +34877,8 @@ function result(required2, status, repairable, evidenceIds = [], reasonCodes = [
   };
 }
 function classifyProofRequirement(input = {}) {
-  const task = typeof input?.task === "string" ? input.task : "";
-  const taskClass = typeof input?.taskClass === "string" ? input.taskClass : "";
-  if (BUG_FIX_PATTERN.test(task)) return Object.freeze({ required: true, reason: "explicit_bug_fix" });
-  if (NON_BUG_PATTERN.test(task)) return Object.freeze({ required: false, reason: "explicit_non_bug" });
-  if (CODE_CLASSES.has(taskClass)) return Object.freeze({ required: true, reason: "default_code_change" });
-  return Object.freeze({ required: false, reason: "non_code_task" });
+  if (input?.requireProof === false) return Object.freeze({ required: false, reason: "explicit_opt_out" });
+  return Object.freeze({ required: true, reason: "default_required" });
 }
 function invalidPath(path) {
   if (boundedText(path, 4096) === null || path.includes("\\") || path.startsWith("/") || /^[A-Za-z]:/.test(path)) return true;
@@ -34417,7 +34916,7 @@ function noDelta(status, reasonCode) {
 async function splitTestOnlyDelta(input = {}, deps = {}) {
   const entries = Array.isArray(input?.entries) ? input.entries : null;
   const plan = input?.testPlan;
-  if (entries === null || !OBJECT_ID_PATTERN3.test(input?.baselineRevision ?? "") || !OBJECT_ID_PATTERN3.test(input?.candidateRevision ?? "")) return noDelta("unsafe", REASON.test_delta_input_invalid);
+  if (entries === null || !OBJECT_ID_PATTERN4.test(input?.baselineRevision ?? "") || !OBJECT_ID_PATTERN4.test(input?.candidateRevision ?? "")) return noDelta("unsafe", REASON.test_delta_input_invalid);
   if (plan?.regressionWitnessTrusted !== true || !REGRESSION_WITNESS_ADAPTERS.includes(plan?.adapterId)) {
     return noDelta("ambiguous", REASON.test_plan_untrusted);
   }
@@ -34474,7 +34973,7 @@ async function splitTestOnlyDelta(input = {}, deps = {}) {
   if (collected?.blocked) return noDelta("ambiguous", REASON.test_delta_collection_failed);
   const patch = collected?.patch;
   const files = Array.isArray(collected?.files) ? collected.files : null;
-  if (collected?.ok !== true || !Buffer.isBuffer(patch) || patch.length === 0 || files === null || files.length !== paths.length || files.some((path, index) => path !== paths[index]) || !SHA256_PATTERN5.test(collected.sha256 ?? "") || collected.sha256 !== sha256(patch) || collected.empty === true) {
+  if (collected?.ok !== true || !Buffer.isBuffer(patch) || patch.length === 0 || files === null || files.length !== paths.length || files.some((path, index) => path !== paths[index]) || !SHA256_PATTERN6.test(collected.sha256 ?? "") || collected.sha256 !== sha256(patch) || collected.empty === true) {
     return noDelta("ambiguous", REASON.test_delta_collection_mismatch);
   }
   return { status: "separable", patch, sha256: collected.sha256, paths, reasonCodes: [] };
@@ -34482,7 +34981,7 @@ async function splitTestOnlyDelta(input = {}, deps = {}) {
 function validClassified(value, record2) {
   const witnesses = sortedStrings(value?.witnessIds);
   const failures = sortedStrings(value?.failureFingerprints);
-  if (!hasExactKeys(value, CLASSIFIED_KEYS) || value.planFingerprint !== record2.testPlanFingerprint || value.environmentFingerprint !== record2.environmentFingerprint || !["completed", "not_run", "spawn_error", "timeout", "aborted", "hung", "lingering"].includes(value.execution) || !["pass", "fail", "unknown"].includes(value.outcome) || !["assertion", "collection", "compile", "dependency", "infrastructure", "unknown"].includes(value.failureKind) || value.stability !== "unknown" || typeof value.reproduction !== "boolean" || witnesses === null || failures === null || witnesses.length > 2e4 || failures.length > 2e4 || witnesses.some((id) => !SHA256_PATTERN5.test(id)) || failures.some((id) => !SHA256_PATTERN5.test(id)) || !(value.outputSha256 === null || SHA256_PATTERN5.test(value.outputSha256)) || !Number.isSafeInteger(value.outputChars) || value.outputChars < 0 || typeof value.truncated !== "boolean" || !Array.isArray(value.diagnostics) || value.diagnostics.length > 8 || value.diagnostics.some((item) => typeof item !== "string" || !/^[a-z0-9_]{1,64}$/.test(item))) return false;
+  if (!hasExactKeys(value, CLASSIFIED_KEYS) || value.planFingerprint !== record2.testPlanFingerprint || value.environmentFingerprint !== record2.environmentFingerprint || !["completed", "not_run", "spawn_error", "timeout", "aborted", "hung", "lingering"].includes(value.execution) || !["pass", "fail", "unknown"].includes(value.outcome) || !["assertion", "collection", "compile", "dependency", "infrastructure", "unknown"].includes(value.failureKind) || value.stability !== "unknown" || typeof value.reproduction !== "boolean" || witnesses === null || failures === null || witnesses.length > 2e4 || failures.length > 2e4 || witnesses.some((id) => !SHA256_PATTERN6.test(id)) || failures.some((id) => !SHA256_PATTERN6.test(id)) || !(value.outputSha256 === null || SHA256_PATTERN6.test(value.outputSha256)) || !Number.isSafeInteger(value.outputChars) || value.outputChars < 0 || typeof value.truncated !== "boolean" || !Array.isArray(value.diagnostics) || value.diagnostics.length > 8 || value.diagnostics.some((item) => typeof item !== "string" || !/^[a-z0-9_]{1,64}$/.test(item))) return false;
   return true;
 }
 function validateEvidenceGroups(input, deltaSha) {
@@ -34498,7 +34997,7 @@ function validateEvidenceGroups(input, deltaSha) {
     if (!Array.isArray(records) || records.length !== 2) return null;
     for (let index = 0; index < records.length; index += 1) {
       const record2 = records[index];
-      if (!hasExactKeys(record2, EVIDENCE_KEYS) || record2.schemaVersion !== 1 || record2.kind !== kind || record2.repetition !== index + 1 || typeof record2.evidenceId !== "string" || record2.evidenceId === "" || typeof record2.attemptId !== "string" || record2.attemptId === "" || !OBJECT_ID_PATTERN3.test(record2.baselineRevision) || !OBJECT_ID_PATTERN3.test(record2.baselineTree) || !OBJECT_ID_PATTERN3.test(record2.candidateRevision) || !OBJECT_ID_PATTERN3.test(record2.candidateTree) || !SHA256_PATTERN5.test(record2.candidatePatchSha256) || !SHA256_PATTERN5.test(record2.testPlanFingerprint) || !SHA256_PATTERN5.test(record2.environmentFingerprint) || record2.testDeltaSha256 !== (kind === "b0" ? null : deltaSha) || !validClassified(record2.classified, record2) || ids.has(record2.evidenceId)) return null;
+      if (!hasExactKeys(record2, EVIDENCE_KEYS) || record2.schemaVersion !== 1 || record2.kind !== kind || record2.repetition !== index + 1 || typeof record2.evidenceId !== "string" || record2.evidenceId === "" || typeof record2.attemptId !== "string" || record2.attemptId === "" || !OBJECT_ID_PATTERN4.test(record2.baselineRevision) || !OBJECT_ID_PATTERN4.test(record2.baselineTree) || !OBJECT_ID_PATTERN4.test(record2.candidateRevision) || !OBJECT_ID_PATTERN4.test(record2.candidateTree) || !SHA256_PATTERN6.test(record2.candidatePatchSha256) || !SHA256_PATTERN6.test(record2.testPlanFingerprint) || !SHA256_PATTERN6.test(record2.environmentFingerprint) || record2.testDeltaSha256 !== (kind === "b0" ? null : deltaSha) || !validClassified(record2.classified, record2) || ids.has(record2.evidenceId)) return null;
       ids.add(record2.evidenceId);
       const current = [
         record2.attemptId,
@@ -34535,7 +35034,7 @@ function sameStrings2(a, b) {
 function validatedCompanion(value, record2) {
   const witnesses = sortedStrings(value?.witnessIds);
   const assertions = sortedStrings(value?.assertionWitnessIds);
-  if (!hasExactKeys(value, COMPANION_KEYS) || witnesses === null || assertions === null || witnesses.length !== value.witnessIds.length || assertions.length !== value.assertionWitnessIds.length || !sameStrings2(witnesses, value.witnessIds) || !sameStrings2(assertions, value.assertionWitnessIds) || witnesses.some((id) => !SHA256_PATTERN5.test(id)) || assertions.some((id) => !SHA256_PATTERN5.test(id))) return null;
+  if (!hasExactKeys(value, COMPANION_KEYS) || witnesses === null || assertions === null || witnesses.length !== value.witnessIds.length || assertions.length !== value.assertionWitnessIds.length || !sameStrings2(witnesses, value.witnessIds) || !sameStrings2(assertions, value.assertionWitnessIds) || witnesses.some((id) => !SHA256_PATTERN6.test(id)) || assertions.some((id) => !SHA256_PATTERN6.test(id))) return null;
   const publicWitnesses = new Set(record2.classified.witnessIds);
   const publicFailures = new Set(record2.classified.failureFingerprints);
   if (witnesses.some((id) => !publicWitnesses.has(id)) || assertions.some((id) => !witnesses.includes(id) || !publicFailures.has(sha256(Buffer.from(`assertion\0${id}`, "utf8")))) || record2.classified.outcome === "pass" && assertions.length > 0) return null;
@@ -34573,7 +35072,7 @@ function completeRegressionProof(input = {}) {
     const repairable = delta.status === "empty" || delta.status === "deletion_only";
     return result(true, repairable ? "not_proven" : "unavailable", repairable, [], reasons);
   }
-  if (!Buffer.isBuffer(delta.patch) || !SHA256_PATTERN5.test(delta.sha256 ?? "") || sha256(delta.patch) !== delta.sha256 || !Array.isArray(delta.paths) || delta.paths.length === 0 || !Array.isArray(delta.reasonCodes) || delta.reasonCodes.length !== 0) {
+  if (!Buffer.isBuffer(delta.patch) || !SHA256_PATTERN6.test(delta.sha256 ?? "") || sha256(delta.patch) !== delta.sha256 || !Array.isArray(delta.paths) || delta.paths.length === 0 || !Array.isArray(delta.reasonCodes) || delta.reasonCodes.length !== 0) {
     return result(true, "unavailable", false, [], [REASON.test_delta_authority_mismatch]);
   }
   const validated = validateEvidenceGroups(input, delta.sha256);
@@ -34719,7 +35218,7 @@ function cloneCacheCell(value, plan) {
   const classified = cloneClassified(value.classified, plan);
   const deltaWitnessIds = sortedStrings(value.deltaWitnessIds);
   const deltaAssertionWitnessIds = sortedStrings(value.deltaAssertionWitnessIds);
-  if (classified === null || deltaWitnessIds === null || deltaAssertionWitnessIds === null || deltaWitnessIds.length !== value.deltaWitnessIds.length || deltaAssertionWitnessIds.length !== value.deltaAssertionWitnessIds.length || !sameStrings2(deltaWitnessIds, value.deltaWitnessIds) || !sameStrings2(deltaAssertionWitnessIds, value.deltaAssertionWitnessIds) || deltaWitnessIds.some((id) => !SHA256_PATTERN5.test(id) || !classified.witnessIds.includes(id)) || deltaAssertionWitnessIds.some((id) => !deltaWitnessIds.includes(id) || !classified.failureFingerprints.includes(sha256(Buffer.from(`assertion\0${id}`, "utf8")))) || classified.outcome === "pass" && deltaAssertionWitnessIds.length > 0) return null;
+  if (classified === null || deltaWitnessIds === null || deltaAssertionWitnessIds === null || deltaWitnessIds.length !== value.deltaWitnessIds.length || deltaAssertionWitnessIds.length !== value.deltaAssertionWitnessIds.length || !sameStrings2(deltaWitnessIds, value.deltaWitnessIds) || !sameStrings2(deltaAssertionWitnessIds, value.deltaAssertionWitnessIds) || deltaWitnessIds.some((id) => !SHA256_PATTERN6.test(id) || !classified.witnessIds.includes(id)) || deltaAssertionWitnessIds.some((id) => !deltaWitnessIds.includes(id) || !classified.failureFingerprints.includes(sha256(Buffer.from(`assertion\0${id}`, "utf8")))) || classified.outcome === "pass" && deltaAssertionWitnessIds.length > 0) return null;
   return Object.freeze({
     classified,
     deltaWitnessIds: Object.freeze(deltaWitnessIds),
@@ -34751,7 +35250,7 @@ function attemptOrdinal(spec) {
   return /^\d{3}$/.test(ordinal2) ? ordinal2 : null;
 }
 function validEvidenceSpec(spec) {
-  return spec && typeof spec === "object" && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(spec.runId ?? "") && ["lane-a", "lane-b"].includes(spec.laneId) && attemptOrdinal(spec) !== null && OBJECT_ID_PATTERN3.test(spec.baseline?.commit ?? "") && OBJECT_ID_PATTERN3.test(spec.baseline?.tree ?? "") && OBJECT_ID_PATTERN3.test(spec.candidate?.commit ?? "") && OBJECT_ID_PATTERN3.test(spec.candidate?.treeHash ?? "") && SHA256_PATTERN5.test(spec.candidate?.patchSha256 ?? "") && spec.candidate?.testPlanFingerprint === spec.frozenTestPlan?.planFingerprint && SHA256_PATTERN5.test(spec.frozenTestPlan?.planFingerprint ?? "") && SHA256_PATTERN5.test(spec.frozenTestPlan?.environmentFingerprint ?? "") && spec.proofRequirement && typeof spec.proofRequirement.required === "boolean" && spec.testQueue && typeof spec.testQueue.enqueue === "function" && typeof spec.testQueue.poison === "function" && typeof spec.testQueue.isPoisoned === "function" && spec.cache instanceof Map && (spec.deadlineAt === null || Number.isFinite(spec.deadlineAt));
+  return spec && typeof spec === "object" && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(spec.runId ?? "") && EVIDENCE_STAGES.includes(spec.stage) && ["lane-a", "lane-b", "prove"].includes(spec.laneId) && attemptOrdinal(spec) !== null && OBJECT_ID_PATTERN4.test(spec.baseline?.commit ?? "") && OBJECT_ID_PATTERN4.test(spec.baseline?.tree ?? "") && OBJECT_ID_PATTERN4.test(spec.candidate?.commit ?? "") && OBJECT_ID_PATTERN4.test(spec.candidate?.treeHash ?? "") && SHA256_PATTERN6.test(spec.candidate?.patchSha256 ?? "") && spec.candidate?.testPlanFingerprint === spec.frozenTestPlan?.planFingerprint && SHA256_PATTERN6.test(spec.frozenTestPlan?.planFingerprint ?? "") && SHA256_PATTERN6.test(spec.frozenTestPlan?.environmentFingerprint ?? "") && spec.proofRequirement && typeof spec.proofRequirement.required === "boolean" && spec.testQueue && typeof spec.testQueue.enqueue === "function" && typeof spec.testQueue.poison === "function" && typeof spec.testQueue.isPoisoned === "function" && spec.cache instanceof Map && (spec.deadlineAt === null || Number.isFinite(spec.deadlineAt));
 }
 function evidenceId(spec, kind, repetition) {
   return `${spec.attemptId}/${kind.toUpperCase()}/${repetition}`;
@@ -34881,10 +35380,12 @@ function operationalFailure(code) {
   ]);
   return allowed.has(code) ? Object.freeze({ code }) : null;
 }
-function candidateEvidenceResult(tests, regressionProof, evidence, cleanup, reason = null) {
+function candidateEvidenceResult(tests, regressionProof, evidence, cleanup, reason = null, failureLabels = []) {
   return Object.freeze({
     tests,
     regressionProof,
+    // 후보 실행(c)의 실패 테스트 이름 — 기록에는 없고 이 결과에만 있다(`failingTestLabels` 의 WHY).
+    failureLabels: Object.freeze(failureLabels.map((entry2) => Object.freeze({ ...entry2 }))),
     evidence: Object.freeze([...evidence].sort((a, b) => a.evidenceOrdinal - b.evidenceOrdinal)),
     cleanup: Object.freeze([...cleanup]),
     operationalFailure: operationalFailure(reason)
@@ -34905,6 +35406,10 @@ function initialFailureProof(spec, candidateRecords, reasonCode) {
   if (!required2) return result(false, "not_applicable", false, candidateRecords.map((record2) => record2.evidenceId));
   return result(true, "not_proven", true, candidateRecords.map((record2) => record2.evidenceId), [reasonCode]);
 }
+function deferredProof(spec, candidateRecords) {
+  const evidenceIds = candidateRecords.map((record2) => record2.evidenceId);
+  return spec.proofRequirement.required === true ? result(true, "deferred", false, evidenceIds) : result(false, "not_applicable", false, evidenceIds);
+}
 async function runCandidateEvidence(spec, deps = {}) {
   if (!validEvidenceSpec(spec)) {
     return candidateEvidenceResult(
@@ -34923,6 +35428,9 @@ async function runCandidateEvidence(spec, deps = {}) {
   const killChildren = deps.killTrackedChildren ?? defaultKillTrackedChildren;
   const inspectEnvironment = deps.checkFrozenEnvironment ?? ((input) => checkFrozenTestPlanEnvironment(input.plan, deps.runnerDeps ?? {}));
   const selectWitnesses = deps.selectTestDeltaWitnesses ?? selectTestDeltaWitnesses;
+  const labelsOf = deps.failingTestLabels ?? failingTestLabels;
+  const candidateLabels = /* @__PURE__ */ new Map();
+  const labelsResult = () => [...candidateLabels].map(([fingerprint, label]) => ({ fingerprint, label }));
   const persist = typeof deps.persistEvidence === "function" ? deps.persistEvidence : async () => ({ blocked: true });
   const handoffCleanup = typeof deps.handoffEvidenceCleanup === "function" ? deps.handoffEvidenceCleanup : async () => false;
   const now = typeof deps.now === "function" ? deps.now : Date.now;
@@ -35029,7 +35537,7 @@ async function runCandidateEvidence(spec, deps = {}) {
         if (!Buffer.isBuffer(spec.testDelta.patch) || sha256(spec.testDelta.patch) !== spec.testDelta.sha256) {
           throw queueError(REASON.test_delta_authority_mismatch);
         }
-        const applied = await applyPatch(worktree, { patch: spec.testDelta.patch, sha256: spec.testDelta.sha256 });
+        const applied = await applyPatch(worktree, { patch: spec.testDelta.patch, sha256: spec.testDelta.sha256, allowIgnored: true });
         if (applied?.ok !== true) throw queueError(REASON.test_delta_apply_failed);
       }
       if (!await checkEnvironment("before_spawn", kind, repetition)) throw queueError(operationalReason);
@@ -35056,6 +35564,19 @@ async function runCandidateEvidence(spec, deps = {}) {
           }
         }
       }, { ...deps.runnerDeps ?? {}, testQueue: spec.testQueue });
+      if (kind === "c") {
+        let labels = [];
+        try {
+          labels = labelsOf(raw);
+        } catch {
+          labels = [];
+        }
+        for (const entry2 of Array.isArray(labels) ? labels : []) {
+          if (typeof entry2?.fingerprint === "string" && SHA256_PATTERN6.test(entry2.fingerprint) && typeof entry2.label === "string" && entry2.label !== "" && !candidateLabels.has(entry2.fingerprint)) {
+            candidateLabels.set(entry2.fingerprint, entry2.label);
+          }
+        }
+      }
       let projection;
       try {
         projection = selectWitnesses(raw, kind === "b0" ? [] : spec.testDelta.paths);
@@ -35185,7 +35706,8 @@ async function runCandidateEvidence(spec, deps = {}) {
       proofUnavailable(spec.proofRequirement.required, committedRecords(), operationalReason ?? REASON.test_execution_unavailable),
       evidence,
       cleanup,
-      operationalReason
+      operationalReason,
+      labelsResult()
     );
   }
   if (operationalReason !== null) {
@@ -35194,7 +35716,8 @@ async function runCandidateEvidence(spec, deps = {}) {
       proofUnavailable(spec.proofRequirement.required, committedRecords(), operationalReason),
       evidence,
       cleanup,
-      operationalReason
+      operationalReason,
+      labelsResult()
     );
   }
   if (c1.execution !== "completed" || c1.outcome !== "pass") {
@@ -35203,10 +35726,11 @@ async function runCandidateEvidence(spec, deps = {}) {
       initialFailureProof(spec, candidate, REASON.test_candidate_failed),
       evidence,
       cleanup,
-      operationalReason
+      operationalReason,
+      labelsResult()
     );
   }
-  const prove = spec.proofRequirement.required === true && spec.testDelta?.status === "separable";
+  const prove = spec.stage === "prove" && spec.proofRequirement.required === true && spec.testDelta?.status === "separable";
   if (prove) {
     for (const kind of ["b0", "br"]) {
       for (const repetition of [1, 2]) {
@@ -35223,6 +35747,8 @@ async function runCandidateEvidence(spec, deps = {}) {
       committedRecords(),
       persistenceFailed && operationalReason !== REASON.test_deadline_expired ? REASON.evidence_persistence_failed : operationalReason
     );
+  } else if (spec.stage === "run") {
+    regressionProof = deferredProof(spec, candidate);
   } else {
     regressionProof = completeRegressionProof({
       required: spec.proofRequirement.required,
@@ -35239,7 +35765,8 @@ async function runCandidateEvidence(spec, deps = {}) {
     regressionProof,
     evidence,
     cleanup,
-    persistenceFailed ? REASON.evidence_persistence_failed : operationalReason
+    persistenceFailed ? REASON.evidence_persistence_failed : operationalReason,
+    labelsResult()
   );
 }
 
@@ -35247,8 +35774,8 @@ async function runCandidateEvidence(spec, deps = {}) {
 import {
   basename as basename10,
   dirname as dirname15,
-  isAbsolute as isAbsolute28,
-  join as join24,
+  isAbsolute as isAbsolute29,
+  join as join25,
   resolve as resolve11
 } from "node:path";
 
@@ -35639,7 +36166,7 @@ async function validateCompleteInitialTree(context) {
     const top = (await context.deps.readdir(context.paths.runDir)).sort();
     if (JSON.stringify(top) !== JSON.stringify(["attempts", "candidates", "evidence", "manifest.json"])) return false;
     for (const name of ["attempts", "candidates", "evidence"]) {
-      const path = join24(context.paths.runDir, name);
+      const path = join25(context.paths.runDir, name);
       const identity = await context.deps.lstat(path);
       if (!sameIdentity3(identity, context.ownedDirectories.get(path)) || !await verifyPhysicalPath(path, "directory", context.deps) || (await context.deps.readdir(path)).length !== 0) return false;
     }
@@ -35682,9 +36209,9 @@ async function createRunArtifacts(input, dependencyInput = {}) {
     createdAt,
     expiresAt
   };
-  const lockBytes = jsonBytes2(lockValue);
+  const lockBytes = jsonBytes3(lockValue);
   const manifest = initialManifestValue(initial, generation, createdAt, expiresAt);
-  const manifestBytes = jsonBytes2(manifest);
+  const manifestBytes = jsonBytes3(manifest);
   if (lockBytes === null || manifestBytes === null || manifestBytes.length > MAX_RUN_MANIFEST_BYTES) {
     return fail(REASON.artifact_initial_manifest_too_large, { limit: MAX_RUN_MANIFEST_BYTES });
   }
@@ -35700,7 +36227,7 @@ async function createRunArtifacts(input, dependencyInput = {}) {
   };
   try {
     for (const name of ["runs", "patches"]) {
-      const base = join24(object3.stateRoot, name);
+      const base = join25(object3.stateRoot, name);
       if (!await ensureBaseDirectory(base, deps)) return fail(REASON.artifact_base_directory_not_private, { path: base });
     }
     const lock = await openOwnedEmptyFile(budget.paths.initLockPath, deps);
@@ -35714,7 +36241,7 @@ async function createRunArtifacts(input, dependencyInput = {}) {
     if (!finalDirectory.ok) throw new Error("final reservation failed");
     await runBarrier(context, "after-final-directory");
     for (const name of ["candidates", "attempts", "evidence"]) {
-      const path = join24(budget.paths.runDir, name);
+      const path = join25(budget.paths.runDir, name);
       const childDirectory = await createSecureDirectory(path, deps);
       if (childDirectory.created && childDirectory.identity !== null) {
         context.ownedDirectories.set(path, childDirectory.identity);
@@ -35723,10 +36250,10 @@ async function createRunArtifacts(input, dependencyInput = {}) {
       await runBarrier(context, `after-${name}-directory`);
     }
     for (const name of ["candidates", "attempts", "evidence"]) {
-      if (!await syncDirectory2(join24(budget.paths.runDir, name), deps)) throw new Error("child directory sync failed");
+      if (!await syncDirectory2(join25(budget.paths.runDir, name), deps)) throw new Error("child directory sync failed");
     }
     await runBarrier(context, "after-final-directories-synced");
-    const manifestTemp = join24(budget.paths.runDir, `.tmp-manifest.json-${deps.pid}-${deps.randomHex12()}`);
+    const manifestTemp = join25(budget.paths.runDir, `.tmp-manifest.json-${deps.pid}-${deps.randomHex12()}`);
     if (!GENERATION_PATTERN.test(manifestTemp.slice(-12))) throw new Error("invalid temp generation");
     const temp = await openOwnedEmptyFile(manifestTemp, deps);
     if (temp === null || !await writeSyncClose(temp, manifestBytes) || !await verifyOwnedBytes(manifestTemp, manifestBytes, deps)) {
@@ -35779,17 +36306,17 @@ function manifestRef(state, revision = state.manifest.revision) {
 }
 function finalPathForIdentity(state, identity) {
   if (identity.artifactKind === "attempt") {
-    return join24(state.paths.runDir, "attempts", `${identity.laneId}-${ordinal(identity.attemptOrdinal)}.json`);
+    return join25(state.paths.runDir, "attempts", `${identity.laneId}-${ordinal(identity.attemptOrdinal)}.json`);
   }
   if (identity.artifactKind === "evidence") {
-    return join24(
+    return join25(
       state.paths.runDir,
       "evidence",
       `${identity.laneId}-${ordinal(identity.attemptOrdinal)}-${ordinal(identity.evidenceOrdinal)}.json`
     );
   }
   if (identity.artifactKind === "candidate") return state.paths.candidatePaths[identity.laneId] ?? null;
-  if (identity.artifactKind === "plan") return join24(state.paths.runDir, "plan.json");
+  if (identity.artifactKind === "plan") return join25(state.paths.runDir, "plan.json");
   return state.paths.winnerAliasPath;
 }
 function configuredLane(state, laneId2) {
@@ -35905,13 +36432,13 @@ function normalizeEvent(value, state) {
   return null;
 }
 function exactCanonicalPath(value) {
-  return typeof value === "string" && isAbsolute28(value) && value === resolve11(value);
+  return typeof value === "string" && isAbsolute29(value) && value === resolve11(value);
 }
 function validateCleanupPathAgainstState(cleanup, state) {
   const relativePath = relativeJson(state.stateRoot, cleanup.path);
   const expectedTop = cleanup.kind === "planner" ? "plans" : "worktrees";
   const parts = relativePath?.split("/") ?? [];
-  const expected = parts.length === 2 ? join24(state.stateRoot, ...parts) : null;
+  const expected = parts.length === 2 ? join25(state.stateRoot, ...parts) : null;
   return exactCanonicalPath(cleanup.path) && expected !== null && cleanup.path === expected && parts[0] === expectedTop && (cleanup.status === "removed" ? cleanup.recoveryPath === null : exactCanonicalPath(cleanup.recoveryPath) && cleanup.recoveryPath === cleanup.path);
 }
 function validateEventPathsAgainstState(event, state) {
@@ -35941,7 +36468,7 @@ function validateEventPathsAgainstState(event, state) {
   return true;
 }
 function manifestPathsBoundToState(manifest, state) {
-  if (manifest.committedArtifacts.some((entry2) => !samePath(resolve11(entry2.ref.path), resolve11(join24(state.stateRoot, ...entry2.relativePath.split("/")))))) return false;
+  if (manifest.committedArtifacts.some((entry2) => !samePath(resolve11(entry2.ref.path), resolve11(join25(state.stateRoot, ...entry2.relativePath.split("/")))))) return false;
   return manifest.cleanup.every((entry2) => validateCleanupPathAgainstState(entry2, state));
 }
 async function loadCurrentManifest(state) {
@@ -35965,7 +36492,7 @@ function exactTempForEvent(state, identity, relativePathValue, tempRelativePath)
   const finalPath = finalPathForIdentity(state, identity);
   if (finalPath === null || relativeJson(state.stateRoot, finalPath) !== relativePathValue) return false;
   const finalBase = basename10(finalPath);
-  const tempPath = join24(dirname15(finalPath), `.tmp-${finalBase}-${state.deps.pid}-${tempRelativePath.slice(-12)}`);
+  const tempPath = join25(dirname15(finalPath), `.tmp-${finalBase}-${state.deps.pid}-${tempRelativePath.slice(-12)}`);
   return GENERATION_PATTERN.test(tempRelativePath.slice(-12)) && relativeJson(state.stateRoot, tempPath) === tempRelativePath && /^\d+$/.test(String(state.deps.pid));
 }
 async function requireAbsent(path, state) {
@@ -35987,7 +36514,7 @@ async function applyReserved(manifest, event, state) {
   }
   if (identity.artifactKind === "winner" && (manifest.selection === null || manifest.selection.selectedCandidateId !== identity.candidateId)) return false;
   const finalPath = finalPathForIdentity(state, identity);
-  const tempPath = join24(state.stateRoot, ...event.tempRelativePath.split("/"));
+  const tempPath = join25(state.stateRoot, ...event.tempRelativePath.split("/"));
   if (!await requireAbsent(finalPath, state) || !await requireAbsent(tempPath, state)) return false;
   manifest.pendingArtifacts.push({
     ...identityFields(identity),
@@ -36004,7 +36531,7 @@ async function applyCommitted(manifest, event, state) {
   const pending = identity === null ? null : pendingEntry(manifest, identity);
   if (identity === null || pending === null || event.relativePath !== pending.relativePath || event.ref.kind !== artifactKindForIdentity(identity) || event.ref.candidateId !== candidateForIdentity(identity) || event.ref.sha256 !== pending.expectedSha256 || event.ref.bytes !== pending.expectedBytes || event.ref.expiresAt !== state.expiresAt) return false;
   const finalPath = finalPathForIdentity(state, identity);
-  const tempPath = join24(state.stateRoot, ...pending.tempRelativePath.split("/"));
+  const tempPath = join25(state.stateRoot, ...pending.tempRelativePath.split("/"));
   if (!await requireAbsent(tempPath, state) || !await verifyImmutableRef(event.ref, finalPath, state)) return false;
   if (identity.artifactKind === "evidence") {
     const record2 = await readJsonRecord(finalPath, MAX_JSON_ARTIFACT_BYTES, state);
@@ -36136,7 +36663,7 @@ async function publishManifestRevision(state, next) {
   if (state.poisoned || state.checkpointTemp !== null) return null;
   const normalized = normalizeRunManifestV1(next);
   if (normalized === null) return null;
-  const bytes = jsonBytes2(normalized);
+  const bytes = jsonBytes3(normalized);
   if (bytes === null || bytes.length > MAX_RUN_MANIFEST_BYTES) return null;
   let tempGeneration;
   try {
@@ -36145,7 +36672,7 @@ async function publishManifestRevision(state, next) {
     return null;
   }
   if (!GENERATION_PATTERN.test(tempGeneration)) return null;
-  const tempPath = join24(dirname15(state.paths.manifestPath), `.tmp-manifest.json-${state.deps.pid}-${tempGeneration}`);
+  const tempPath = join25(dirname15(state.paths.manifestPath), `.tmp-manifest.json-${state.deps.pid}-${tempGeneration}`);
   state.checkpointTemp = { path: tempPath, identity: null, verified: false };
   const owned = await openOwnedEmptyFile(tempPath, state.deps, (identity) => {
     state.checkpointTemp.identity = identity;
@@ -36280,7 +36807,7 @@ function tempPathForFinal(state, finalPath) {
   } catch {
     return null;
   }
-  return GENERATION_PATTERN.test(generation) ? join24(dirname15(finalPath), `.tmp-${basename10(finalPath)}-${state.deps.pid}-${generation}`) : null;
+  return GENERATION_PATTERN.test(generation) ? join25(dirname15(finalPath), `.tmp-${basename10(finalPath)}-${state.deps.pid}-${generation}`) : null;
 }
 async function currentCommittedForWrite(state, identity, expectedSha256, expectedBytes) {
   const loaded = await loadCurrentManifest(state);
@@ -36335,7 +36862,7 @@ async function writePreparedArtifact(state, { identity, bytes, record: record2 =
   let tempPath;
   if (pending !== null) {
     if (pending.expectedSha256 !== expectedSha256 || pending.expectedBytes !== expectedBytes || pending.relativePath !== relativeJson(state.stateRoot, finalPath)) return fail(REASON.artifact_pending_replay_mismatch);
-    tempPath = join24(state.stateRoot, ...pending.tempRelativePath.split("/"));
+    tempPath = join25(state.stateRoot, ...pending.tempRelativePath.split("/"));
   } else {
     tempPath = tempPathForFinal(state, finalPath);
     if (tempPath === null) return fail(REASON.artifact_temp_name_failed);
@@ -36446,7 +36973,7 @@ async function writeEvidenceArtifact(store, input) {
     }
     const record2 = normalizeEvidenceRecord(object3.record, state, object3.laneId, object3.attemptOrdinal);
     if (record2 === null) return fail(REASON.artifact_evidence_record_invalid);
-    const bytes = jsonBytes2(record2);
+    const bytes = jsonBytes3(record2);
     if (bytes === null || bytes.length > MAX_JSON_ARTIFACT_BYTES) return fail(REASON.evidence_artifact_too_large, { limit: MAX_JSON_ARTIFACT_BYTES });
     return writePreparedArtifact(state, {
       identity: {
@@ -36471,7 +36998,7 @@ async function writeAttemptArtifact(store, input) {
     if (record2 === null || !await verifySealedEvidenceAuthority(record2, state, object3.laneId, object3.ordinal, finalPathForIdentity)) {
       return fail(REASON.artifact_attempt_record_invalid);
     }
-    const bytes = jsonBytes2(record2);
+    const bytes = jsonBytes3(record2);
     if (bytes === null || bytes.length > MAX_JSON_ARTIFACT_BYTES) return fail(REASON.artifact_attempt_too_large, { limit: MAX_JSON_ARTIFACT_BYTES });
     return writePreparedArtifact(state, {
       identity: { artifactKind: "attempt", laneId: object3.laneId, attemptOrdinal: object3.ordinal },
@@ -36510,7 +37037,7 @@ async function writePlanArtifact(store, input) {
   return enqueueWriter(state, async () => {
     const object3 = exactObject(copied, ["record"]).value ?? null;
     const record2 = object3 === null ? null : normalizePlanRecord(object3.record, state);
-    const bytes = record2 === null ? null : jsonBytes2(record2);
+    const bytes = record2 === null ? null : jsonBytes3(record2);
     if (bytes === null) return fail(REASON.artifact_plan_record_invalid);
     return writePreparedArtifact(state, { identity: { artifactKind: "plan" }, bytes });
   });
@@ -36543,12 +37070,12 @@ async function writeWinnerAlias(store, input) {
 }
 
 // src/run-body.mjs
-import { isAbsolute as isAbsolute31 } from "node:path";
+import { isAbsolute as isAbsolute32 } from "node:path";
 
 // src/learn/posteriors.mjs
 import { randomUUID as randomUUID2 } from "node:crypto";
-import { readFile as readFile14 } from "node:fs/promises";
-import { isAbsolute as isAbsolute29, join as join25 } from "node:path";
+import { readFile as readFile16 } from "node:fs/promises";
+import { isAbsolute as isAbsolute30, join as join26 } from "node:path";
 var FILE3 = "posteriors.json";
 var CORRUPT = "posteriors.corrupt.json";
 var SNAPSHOT_FILE = "posteriors.prev.json";
@@ -36557,13 +37084,13 @@ var PRIOR = Object.freeze({ alpha: 1, beta: 1 });
 function cellKeyOf(taskClass, axis) {
   return `${String(taskClass)}::${String(axis)}`;
 }
-var pathsFor3 = (stateRoot) => typeof stateRoot === "string" && stateRoot !== "" && isAbsolute29(stateRoot) ? {
+var pathsFor3 = (stateRoot) => typeof stateRoot === "string" && stateRoot !== "" && isAbsolute30(stateRoot) ? {
   root: stateRoot,
-  file: join25(stateRoot, FILE3),
-  corrupt: join25(stateRoot, CORRUPT),
-  snapshot: join25(stateRoot, SNAPSHOT_FILE),
-  generations: join25(stateRoot, "learning.generations.json"),
-  generationSnapshot: join25(stateRoot, GENERATIONS_SNAPSHOT_FILE)
+  file: join26(stateRoot, FILE3),
+  corrupt: join26(stateRoot, CORRUPT),
+  snapshot: join26(stateRoot, SNAPSHOT_FILE),
+  generations: join26(stateRoot, "learning.generations.json"),
+  generationSnapshot: join26(stateRoot, GENERATIONS_SNAPSHOT_FILE)
 } : null;
 var isPositiveFinite = (value) => Number.isFinite(value) && value > 0;
 var clampArm = (value) => {
@@ -36582,7 +37109,7 @@ function clampCells(raw) {
 async function load(file) {
   let bytes;
   try {
-    bytes = await readFile14(file);
+    bytes = await readFile16(file);
   } catch (error2) {
     if (error2?.code === "ENOENT") return { state: "missing" };
     return { state: "unreadable", failure: fail(REASON.learning_posteriors_read_failed, { detail: errorText(error2) }) };
@@ -36869,7 +37396,7 @@ async function writeSnapshot(paths, bytes) {
 async function writeGenerationSnapshot(paths) {
   let bytes;
   try {
-    bytes = await readFile14(paths.generations);
+    bytes = await readFile16(paths.generations);
   } catch (error2) {
     if (error2?.code !== "ENOENT") return fail(REASON.learning_generations_read_failed, { detail: errorText(error2) });
     bytes = Buffer.from('{\n  "global": 0,\n  "cells": {}\n}\n', "utf8");
@@ -36877,7 +37404,7 @@ async function writeGenerationSnapshot(paths) {
   return writeAtomicBytes2(paths, paths.generationSnapshot, GENERATIONS_SNAPSHOT_FILE, bytes);
 }
 async function writeAtomicBytes2(paths, target, name, bytes) {
-  const tmp = join25(paths.root, `${name}.${process.pid}.${randomUUID2()}.tmp`);
+  const tmp = join26(paths.root, `${name}.${process.pid}.${randomUUID2()}.tmp`);
   const written = await writeFileAtomic(target, bytes, { tempPath: tmp, fsync: true, syncDir: true });
   if (written.ok) return { ok: true };
   return written.stage === "rename" ? fail(REASON.learning_work_publish_failed, { name, detail: written.reason }) : fail(REASON.learning_work_write_failed, { name, detail: written.reason });
@@ -36921,12 +37448,30 @@ function workerInstruction({ task, plan, step, budget, feedback }) {
   }
   return lines.join("\n");
 }
-function workerFeedback(openIds) {
-  return openIds?.length > 0 ? `\uC5F4\uB9B0 \uC774\uC288: ${openIds.join(", ")}` : null;
+var FEEDBACK_CLAIM_CHARS = 400;
+var FAILURE_NAMES_CHARS = 600;
+function openIssueLines(feedback) {
+  const openIds = Array.isArray(feedback?.openIds) ? feedback.openIds : [];
+  if (openIds.length === 0) return null;
+  const entries = Array.isArray(feedback?.entries) ? feedback.entries : [];
+  const byId = new Map(entries.map((entry2) => [entry2?.id, entry2]));
+  return openIds.map((id) => {
+    const entry2 = byId.get(id);
+    const claim = entry2?.issue?.claim;
+    const label = entry2?.label;
+    const body = typeof claim === "string" && claim.trim() !== "" ? clipCounted(claim.trim(), FEEDBACK_CLAIM_CHARS) : typeof label === "string" && label !== "" ? `\uC2E4\uD328\uD55C \uD14C\uC2A4\uD2B8: ${clipCounted(label, FEEDBACK_CLAIM_CHARS)}` : "\uC6B0\uB9AC\uAC00 \uB3CC\uB9B0 \uD14C\uC2A4\uD2B8\uAC00 \uC2E4\uD328\uD588\uB2E4 (\uBCF8\uBB38 \uC5C6\uC74C \u2014 \uAE30\uACC4 \uC99D\uAC70)";
+    return `- ${id}: ${body}`;
+  }).join("\n");
+}
+function workerFeedback(feedback) {
+  const lines = openIssueLines(feedback);
+  return lines === null ? null : `\uC5F4\uB9B0 \uC774\uC288:
+${lines}`;
 }
 function describeMachineEvidence(evidence) {
   if (!evidence || typeof evidence !== "object") return "\uC774 \uC2E4\uD589\uC5D0 \uB300\uD55C \uAE30\uACC4 \uC99D\uAC70\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4.";
   const ids = Array.isArray(evidence.evidenceIds) ? evidence.evidenceIds : [];
+  const failures = Array.isArray(evidence.failures) ? evidence.failures.filter((name) => typeof name === "string" && name !== "") : [];
   if (evidence.execution === "not_run") {
     return ["\uC6B0\uB9AC\uAC00 \uD14C\uC2A4\uD2B8\uB97C \uC2E4\uD589\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4.", `\uBD09\uC778\uB41C \uC99D\uAC70: ${ids.join(", ") || "(\uC5C6\uC74C)"}`].join("\n");
   }
@@ -36937,11 +37482,13 @@ function describeMachineEvidence(evidence) {
     `\uC548\uC815\uC131: ${evidence.stability}`,
     `\uC2E0\uB8B0 \uAC00\uB2A5\uD55C \uB7EC\uB108: ${evidence.trusted === true ? "\uC608" : "\uC544\uB2C8\uC624"}`,
     `\uC644\uACB0: ${evidence.complete === true ? "\uC608" : "\uC544\uB2C8\uC624"}`,
-    `\uBD09\uC778\uB41C \uC99D\uAC70: ${ids.join(", ") || "(\uC5C6\uC74C)"}`
+    `\uBD09\uC778\uB41C \uC99D\uAC70: ${ids.join(", ") || "(\uC5C6\uC74C)"}`,
+    ...failures.length > 0 ? [`\uC2E4\uD328\uD55C \uD14C\uC2A4\uD2B8 ${failures.length}\uAC1C: ${clipCounted(failures.join("; "), FAILURE_NAMES_CHARS)}`] : []
   ].join("\n");
 }
 function verifierInstruction({ task, plan, files, tests, expected, feedback, formatOnly = false }) {
   const binding = JSON.stringify(expected);
+  const recheck = openIssueLines(feedback);
   const schema = expected.phase === "recheck" ? '{"schemaVersion":1,"candidateId":"...","attemptId":"...","candidatePatchSha256":"64 lowercase hex","evidenceIds":["..."],"verdict":"PASS|FAIL","checks":[{"id":"...","status":"resolved|persists","evidence":"..."}],"newIssues":[],"notes":[]}' : '{"schemaVersion":1,"candidateId":"...","attemptId":"...","candidatePatchSha256":"64 lowercase hex","evidenceIds":["..."],"verdict":"PASS|FAIL","summary":"...","issues":[{"category":"correctness|security|requirements|scope|tests","claim":"...","evidence":"...","requiredFix":"..."}],"notes":[]}';
   return [
     formatOnly ? "\uC55E\uC120 \uB2F5\uC740 \uD615\uC2DD\uC774 \uD2C0\uB838\uC2B5\uB2C8\uB2E4. \uB0B4\uC6A9\uC744 \uC7AC\uAC80\uD1A0\uD558\uC9C0 \uB9D0\uACE0 \uC544\uB798 JSON \uD615\uC2DD\uC73C\uB85C\uB9CC \uACB0\uACFC\uB97C \uB2E4\uC2DC \uB0B4\uC138\uC694." : "\uC544\uB798 \uC791\uC5C5\uC758 \uACB0\uACFC\uB97C \uAC80\uD1A0\uD558\uC138\uC694. \uB2F9\uC2E0\uC740 \uC77D\uAE30\uB9CC \uD569\uB2C8\uB2E4 \u2014 \uD30C\uC77C\uC744 \uACE0\uCE58\uC9C0 \uB9C8\uC138\uC694.",
@@ -36958,7 +37505,7 @@ function verifierInstruction({ task, plan, files, tests, expected, feedback, for
     "",
     "\uD14C\uC2A4\uD2B8 \uACB0\uACFC:",
     clipCounted(tests, EXCERPT_CHARS),
-    ...feedback?.openIds?.length > 0 ? ["", `\uB2E4\uC2DC \uD655\uC778\uD560 \uC5F4\uB9B0 \uC774\uC288: ${feedback.openIds.join(", ")}`] : [],
+    ...recheck === null ? [] : ["", "\uB2E4\uC2DC \uD655\uC778\uD560 \uC5F4\uB9B0 \uC774\uC288:", clipCounted(recheck, EXCERPT_CHARS)],
     "",
     "\uC791\uC5C5\uC774 \uC2E4\uC81C\uB85C \uB05D\uB0AC\uB294\uC9C0, \uBE60\uC9C4 \uAC83\uC774\uB098 \uC798\uBABB\uB41C \uAC83\uC774 \uC788\uB294\uC9C0 \uD310\uC815\uD558\uC138\uC694."
   ].join("\n");
@@ -37260,17 +37807,17 @@ import { homedir as homedir2 } from "node:os";
 
 // src/diag.mjs
 import { appendFileSync, closeSync, fsyncSync, openSync } from "node:fs";
-import { mkdir as mkdir8 } from "node:fs/promises";
-import { isAbsolute as isAbsolute30, join as join26 } from "node:path";
+import { mkdir as mkdir9 } from "node:fs/promises";
+import { isAbsolute as isAbsolute31, join as join27 } from "node:path";
 var RUN_LOG_MAX_BYTES = 1048576;
 var LEVELS = /* @__PURE__ */ new Set(["info", "warn", "error"]);
 var LOG_TEXT_MAX = 200;
 var DROPPED = "[dropped]";
 var TRUNCATED_MESSAGE = "log_truncated";
-var RUN_ID_PATTERN4 = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+var RUN_ID_PATTERN5 = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 var WINDOWS_DEVICE_PATTERN3 = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
 function runLogPath(stateRoot, runId) {
-  return join26(stateRoot, "logs", `${runId}.jsonl`);
+  return join27(stateRoot, "logs", `${runId}.jsonl`);
 }
 function clipText(value) {
   return value.length <= LOG_TEXT_MAX ? value : clipPlain(value, LOG_TEXT_MAX - 1);
@@ -37291,7 +37838,7 @@ function flatFields(fields, redact) {
   return out;
 }
 function validTarget(stateRoot, runId) {
-  return typeof stateRoot === "string" && stateRoot !== "" && isAbsolute30(stateRoot) && typeof runId === "string" && RUN_ID_PATTERN4.test(runId) && !WINDOWS_DEVICE_PATTERN3.test(runId);
+  return typeof stateRoot === "string" && stateRoot !== "" && isAbsolute31(stateRoot) && typeof runId === "string" && RUN_ID_PATTERN5.test(runId) && !WINDOWS_DEVICE_PATTERN3.test(runId);
 }
 function unavailableSink(reason) {
   return { path: null, unavailable: true, reason, truncated: false, write() {
@@ -37311,7 +37858,7 @@ async function openRunLog({
   const cap = Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : RUN_LOG_MAX_BYTES;
   let handle;
   try {
-    await mkdir8(join26(stateRoot, "logs"), { recursive: true, mode: 448 });
+    await mkdir9(join27(stateRoot, "logs"), { recursive: true, mode: 448 });
     handle = openSync(path, "ax", 384);
   } catch {
     return unavailableSink("open_failed");
@@ -37917,7 +38464,7 @@ function contentEvidenceRef(record2, path, { attemptId: attemptId2, expectedPath
   const witnesses = ownDataValue(classified.value, "witnessIds");
   const witnessIds = witnesses.ok === true ? exactDenseArray(witnesses.value) : null;
   const suffix = kind.value === "b0" ? "B0" : kind.value === "br" ? "BR" : kind.value === "c" ? "C" : null;
-  if (path !== expectedPath || !isAbsolute31(path) || evidenceId2.ok !== true || recordAttemptId.ok !== true || kind.ok !== true || repetition.ok !== true || classified.ok !== true || outcome.ok !== true || recordAttemptId.value !== attemptId2 || suffix === null || ![1, 2].includes(repetition.value) || evidenceId2.value !== `${attemptId2}/${suffix}/${repetition.value}` || !["pass", "fail", "unknown"].includes(outcome.value) || witnessIds === null || witnessIds.some((witness) => !/^[0-9a-f]{64}$/.test(witness))) return null;
+  if (path !== expectedPath || !isAbsolute32(path) || evidenceId2.ok !== true || recordAttemptId.ok !== true || kind.ok !== true || repetition.ok !== true || classified.ok !== true || outcome.ok !== true || recordAttemptId.value !== attemptId2 || suffix === null || ![1, 2].includes(repetition.value) || evidenceId2.value !== `${attemptId2}/${suffix}/${repetition.value}` || !["pass", "fail", "unknown"].includes(outcome.value) || witnessIds === null || witnessIds.some((witness) => !/^[0-9a-f]{64}$/.test(witness))) return null;
   return deepFreeze({
     evidenceId: evidenceId2.value,
     kind: kind.value,
@@ -38100,7 +38647,16 @@ function buildRunBody(input) {
     issues,
     candidates: candidates.map(contentCandidate),
     attempts,
-    regressionProof: { status: proofStatus, selectedCandidateId, evidenceRefs, omittedEvidenceCount },
+    // ★★ 유예된 증명은 **다음 걸음을 이름으로** 말한다. 실행 9(2026-08-28) 뒤 여섯 칸은
+    //   `orch_prove` 가 지므로, 본문만 읽는 쪽이 「무엇이 남았는가」를 사유 코드 없이 알아야
+    //   한다. 키는 언제나 있고 값만 갈린다 — 있다가 없으면 호출부가 키 존재로 분기한다.
+    regressionProof: {
+      status: proofStatus,
+      next: proofStatus === "deferred" ? "orch_prove" : null,
+      selectedCandidateId,
+      evidenceRefs,
+      omittedEvidenceCount
+    },
     selection,
     artifacts: {
       manifestPath: manifestRef2?.path ?? pathBudget.paths.manifestPath,
@@ -38253,8 +38809,8 @@ async function commitRunLearning(input) {
 
 // src/run-finalization.mjs
 import { randomBytes as randomBytes4 } from "node:crypto";
-import { lstat as lstat9, mkdir as mkdir9, mkdtemp, rm as rm10 } from "node:fs/promises";
-import { join as join27, relative as relative7, resolve as resolve12 } from "node:path";
+import { lstat as lstat9, mkdir as mkdir10, mkdtemp, rm as rm11 } from "node:fs/promises";
+import { join as join28, relative as relative7, resolve as resolve12 } from "node:path";
 var UNKNOWN_VALUE2 = "<unknown>";
 var isBlocked = (result2) => ownDataValue(result2, "blocked").value === true;
 var LEARNING_DISABLED_RESULT = deepFreeze({
@@ -39004,7 +39560,7 @@ async function collectPairedLanes(runtime, collected) {
       }));
       selection = selectCandidates({ candidates, judgeDecisions });
     } else {
-      const judgesRoot = join27(stateRoot, "judges");
+      const judgesRoot = join28(stateRoot, "judges");
       const judgeHaltCode = () => haltReasonCode() === REASON.run_cancelled ? REASON.judge_cancelled : REASON.judge_deadline;
       const runJudge = async (judgeIndex) => {
         const pair = pairs[judgeIndex - 1];
@@ -39016,22 +39572,22 @@ async function collectPairedLanes(runtime, collected) {
         const localNotices = [];
         let decision;
         try {
-          await mkdir9(judgesRoot, { recursive: true });
+          await mkdir10(judgesRoot, { recursive: true });
           const expectedJudgesRoot = resolve12(stateRoot, "judges");
           const canonicalJudgesRoot = await canonical(judgesRoot);
           if (canonicalJudgesRoot === null || relative7(canonicalJudgesRoot, expectedJudgesRoot) !== "" || relative7(canonicalJudgesRoot, stateRoot) === "" || !pathContains(stateRoot, canonicalJudgesRoot)) {
             throw new Error("judge_scratch_root_untrusted");
           }
-          scratch = await mkdtemp(join27(judgesRoot, `${runId}-judge-${judgeIndex}-`));
+          scratch = await mkdtemp(join28(judgesRoot, `${runId}-judge-${judgeIndex}-`));
           const returnedScratch = resolve12(scratch);
-          const [actual, stat14, root] = await Promise.all([
+          const [actual, stat15, root] = await Promise.all([
             canonical(scratch),
             lstat9(scratch, { bigint: true }),
             canonical(judgesRoot)
           ]);
-          if (actual === null || root === null || relative7(root, expectedJudgesRoot) !== "" || relative7(actual, returnedScratch) !== "" || !pathContains(root, actual) || actual === root || stat14.isSymbolicLink() || !stat14.isDirectory()) throw new Error("judge_scratch_identity_unavailable");
+          if (actual === null || root === null || relative7(root, expectedJudgesRoot) !== "" || relative7(actual, returnedScratch) !== "" || !pathContains(root, actual) || actual === root || stat15.isSymbolicLink() || !stat15.isDirectory()) throw new Error("judge_scratch_identity_unavailable");
           scratch = actual;
-          identity = { path: actual, dev: stat14.dev, ino: stat14.ino };
+          identity = { path: actual, dev: stat15.dev, ino: stat15.ino };
           let parsed;
           let corrected = false;
           try {
@@ -39097,9 +39653,9 @@ async function collectPairedLanes(runtime, collected) {
             const childrenProven = await killLiveChildren(identity.path);
             if (childrenProven) {
               try {
-                const [actual, stat14] = await Promise.all([canonical(scratch), lstat9(scratch, { bigint: true })]);
-                if (actual === identity.path && stat14.dev === identity.dev && stat14.ino === identity.ino && stat14.isDirectory() && !stat14.isSymbolicLink()) {
-                  const result2 = await recoveryStage(`judge ${judgeIndex} scratch cleanup`, () => (deps.removeJudgeScratch ?? rm10)(identity.path, { recursive: true, force: false }));
+                const [actual, stat15] = await Promise.all([canonical(scratch), lstat9(scratch, { bigint: true })]);
+                if (actual === identity.path && stat15.dev === identity.dev && stat15.ino === identity.ino && stat15.isDirectory() && !stat15.isSymbolicLink()) {
+                  const result2 = await recoveryStage(`judge ${judgeIndex} scratch cleanup`, () => (deps.removeJudgeScratch ?? rm11)(identity.path, { recursive: true, force: false }));
                   if (result2?.hardStopped !== true) {
                     removed = await lstat9(identity.path).then(() => false, (error2) => error2?.code === "ENOENT");
                   }
@@ -39272,12 +39828,12 @@ async function collectPairedLanes(runtime, collected) {
 }
 
 // src/run-lane-adapters.mjs
-import { join as join28 } from "node:path";
+import { join as join29 } from "node:path";
 
 // src/candidate-lane.mjs
-import { isAbsolute as isAbsolute32 } from "node:path";
+import { isAbsolute as isAbsolute33 } from "node:path";
 import { createHash as createHash8 } from "node:crypto";
-var SHA256_PATTERN6 = /^[0-9a-f]{64}$/;
+var SHA256_PATTERN7 = /^[0-9a-f]{64}$/;
 var OPERATIONAL_RESULTS = /* @__PURE__ */ new Set([
   REASON.provider_reported_failure,
   REASON.provider_deadline_exceeded,
@@ -39396,7 +39952,7 @@ function decideAttempt(input) {
     if (input?.budgetRemaining) return { action: "repair", reason: REASON.verifier_issues_open };
     return { action: "reject", terminalClass: "rejected", reason: REASON.verifier_issues_open };
   }
-  if (input?.proof?.required === true && input.proof.status !== "proved") {
+  if (input?.proof?.required === true && !["proved", "deferred"].includes(input.proof.status)) {
     if (input.proof.repairable === true && input.budgetRemaining) return { action: "repair", reason: REASON.test_proof_not_proven };
     if (input.proof.repairable === true) return { action: "reject", terminalClass: "rejected", reason: REASON.test_proof_not_proven };
     return { action: "accept", terminalClass: "usable_unverified", reason: REASON.evidence_unavailable };
@@ -39444,8 +40000,8 @@ function normalizedScope(scope) {
   return scope ?? { flagged: false, hardViolation: false, allowlisted: false, reasons: [], reasonCount: 0, omittedReasonCount: 0, changedFileCount: 0 };
 }
 function issueBodies(ledger) {
-  const open10 = new Set(ledger?.openIds ?? []);
-  return (ledger?.entries ?? []).filter((entry2) => open10.has(entry2.id)).map((entry2) => ({
+  const open11 = new Set(ledger?.openIds ?? []);
+  return (ledger?.entries ?? []).filter((entry2) => open11.has(entry2.id)).map((entry2) => ({
     id: entry2.id,
     claim: clipWhole(entry2.issue?.claim ?? "", MAX_ISSUE_CLAIM_CHARS - 1),
     evidenceDigest: createHash8("sha256").update(entry2.issue?.evidence ?? entry2.fingerprint ?? "", "utf8").digest("hex"),
@@ -39485,7 +40041,7 @@ async function writeTerminal(deps, attempts, attempt) {
   const ref = exactObject(written?.ref, ["kind", "candidateId", "path", "sha256", "bytes", "expiresAt"]).value ?? null;
   const bytes = Buffer.from(`${JSON.stringify(immutable, null, 2)}
 `, "utf8");
-  if (!written || written.blocked === true || written.ok !== true || ref === null || ref.kind !== "attempt" || ref.candidateId !== attempt.laneId || !isAbsolute32(ref.path) || ref.sha256 !== createHash8("sha256").update(bytes).digest("hex") || ref.bytes !== bytes.length || !Number.isSafeInteger(ref.bytes) || ref.bytes <= 0 || !Number.isSafeInteger(ref.expiresAt) || ref.expiresAt <= 0) {
+  if (!written || written.blocked === true || written.ok !== true || ref === null || ref.kind !== "attempt" || ref.candidateId !== attempt.laneId || !isAbsolute33(ref.path) || ref.sha256 !== createHash8("sha256").update(bytes).digest("hex") || ref.bytes !== bytes.length || !Number.isSafeInteger(ref.bytes) || ref.bytes <= 0 || !Number.isSafeInteger(ref.expiresAt) || ref.expiresAt <= 0) {
     attempts.artifactFailure = immutable;
     return false;
   }
@@ -39527,12 +40083,12 @@ function validClassified2(value, record2) {
     "truncated",
     "diagnostics"
   ]).value ?? null;
-  return exact !== null && ["completed", "not_run", "spawn_error", "timeout", "aborted", "hung", "lingering"].includes(value.execution) && ["pass", "fail", "unknown"].includes(value.outcome) && ["assertion", "collection", "compile", "dependency", "infrastructure", "unknown"].includes(value.failureKind) && ["stable", "flaky", "unknown"].includes(value.stability) && typeof value.reproduction === "boolean" && canonicalStrings(value.witnessIds, { max: 2e4, pattern: SHA256_PATTERN6 }) && canonicalStrings(value.failureFingerprints, { max: 2e4, pattern: SHA256_PATTERN6 }) && (value.outputSha256 === null || SHA256_PATTERN6.test(value.outputSha256)) && Number.isSafeInteger(value.outputChars) && value.outputChars >= 0 && value.planFingerprint === record2.testPlanFingerprint && value.environmentFingerprint === record2.environmentFingerprint && typeof value.truncated === "boolean" && canonicalStrings(value.diagnostics, { max: 8, pattern: /^[a-z0-9_]{1,64}$/ });
+  return exact !== null && ["completed", "not_run", "spawn_error", "timeout", "aborted", "hung", "lingering"].includes(value.execution) && ["pass", "fail", "unknown"].includes(value.outcome) && ["assertion", "collection", "compile", "dependency", "infrastructure", "unknown"].includes(value.failureKind) && ["stable", "flaky", "unknown"].includes(value.stability) && typeof value.reproduction === "boolean" && canonicalStrings(value.witnessIds, { max: 2e4, pattern: SHA256_PATTERN7 }) && canonicalStrings(value.failureFingerprints, { max: 2e4, pattern: SHA256_PATTERN7 }) && (value.outputSha256 === null || SHA256_PATTERN7.test(value.outputSha256)) && Number.isSafeInteger(value.outputChars) && value.outputChars >= 0 && value.planFingerprint === record2.testPlanFingerprint && value.environmentFingerprint === record2.environmentFingerprint && typeof value.truncated === "boolean" && canonicalStrings(value.diagnostics, { max: 8, pattern: /^[a-z0-9_]{1,64}$/ });
 }
 function persistedEvidenceMatches(spec, attempt, sealed, evaluation) {
   if (!Array.isArray(evaluation?.cleanup) || evaluation.cleanup.some((entry2) => {
     const exact = exactObject(entry2, ["kind", "candidateId", "attemptId", "evidenceId", "path", "status", "recoveryPath"]).value ?? null;
-    return exact === null || entry2.kind !== "evidence" || entry2.candidateId !== spec.laneId || entry2.attemptId !== attempt || typeof entry2.evidenceId !== "string" || !isAbsolute32(entry2.path) || entry2.status !== "removed" && entry2.status !== "reaper_pending" || entry2.status === "removed" && entry2.recoveryPath !== null || entry2.status === "reaper_pending" && entry2.recoveryPath !== entry2.path;
+    return exact === null || entry2.kind !== "evidence" || entry2.candidateId !== spec.laneId || entry2.attemptId !== attempt || typeof entry2.evidenceId !== "string" || !isAbsolute33(entry2.path) || entry2.status !== "removed" && entry2.status !== "reaper_pending" || entry2.status === "removed" && entry2.recoveryPath !== null || entry2.status === "reaper_pending" && entry2.recoveryPath !== entry2.path;
   })) return null;
   if (!Array.isArray(evaluation?.evidence) || evaluation.evidence.length > 20) return null;
   const ordered = evaluation.evidence;
@@ -39564,9 +40120,9 @@ function persistedEvidenceMatches(spec, attempt, sealed, evaluation) {
     const expectedId = exactRecord === null ? null : `${attempt}/${record2.kind.toUpperCase()}/${record2.repetition}`;
     const bytes = exactRecord === null ? null : Buffer.from(`${JSON.stringify(record2, null, 2)}
 `, "utf8");
-    const validDelta = record2?.kind === "b0" ? record2.testDeltaSha256 === null : record2?.kind === "br" ? SHA256_PATTERN6.test(record2.testDeltaSha256 ?? "") : record2?.testDeltaSha256 === null || SHA256_PATTERN6.test(record2?.testDeltaSha256 ?? "");
+    const validDelta = record2?.kind === "b0" ? record2.testDeltaSha256 === null : record2?.kind === "br" ? SHA256_PATTERN7.test(record2.testDeltaSha256 ?? "") : record2?.testDeltaSha256 === null || SHA256_PATTERN7.test(record2?.testDeltaSha256 ?? "");
     if (record2?.kind !== "b0" && testDeltaSha256 === void 0) testDeltaSha256 = record2.testDeltaSha256;
-    if (exactRecord === null || !validClassified2(record2?.classified, record2) || record2.schemaVersion !== 1 || !["b0", "br", "c"].includes(record2.kind) || ![1, 2].includes(record2.repetition) || record2.evidenceId !== expectedId || record2.baselineRevision !== spec.baseline?.commit || record2.baselineTree !== spec.baseline?.tree || record2?.attemptId !== attempt || record2.candidateRevision !== sealed.commit || record2.candidateTree !== sealed.treeHash || record2.candidatePatchSha256 !== sealed.patchSha256 || record2.testPlanFingerprint !== sealed.testPlanFingerprint || record2.environmentFingerprint !== spec.frozenTestPlan?.environmentFingerprint || !validDelta || record2.kind !== "b0" && record2.testDeltaSha256 !== testDeltaSha256 || exactRef === null || ref.kind !== "evidence" || ref.candidateId !== spec.laneId || typeof ref.path !== "string" || !isAbsolute32(ref.path) || !SHA256_PATTERN6.test(ref.sha256) || ref.sha256 !== createHash8("sha256").update(bytes).digest("hex") || ref.bytes !== bytes.length || !Number.isSafeInteger(ref.bytes) || ref.bytes <= 0 || !Number.isSafeInteger(ref.expiresAt) || ref.expiresAt <= 0 || paths.has(ref.path) || expiresAt !== null && ref.expiresAt !== expiresAt || typeof record2.evidenceId !== "string" || record2.evidenceId.length === 0 || ids.includes(record2.evidenceId)) return null;
+    if (exactRecord === null || !validClassified2(record2?.classified, record2) || record2.schemaVersion !== 1 || !["b0", "br", "c"].includes(record2.kind) || ![1, 2].includes(record2.repetition) || record2.evidenceId !== expectedId || record2.baselineRevision !== spec.baseline?.commit || record2.baselineTree !== spec.baseline?.tree || record2?.attemptId !== attempt || record2.candidateRevision !== sealed.commit || record2.candidateTree !== sealed.treeHash || record2.candidatePatchSha256 !== sealed.patchSha256 || record2.testPlanFingerprint !== sealed.testPlanFingerprint || record2.environmentFingerprint !== spec.frozenTestPlan?.environmentFingerprint || !validDelta || record2.kind !== "b0" && record2.testDeltaSha256 !== testDeltaSha256 || exactRef === null || ref.kind !== "evidence" || ref.candidateId !== spec.laneId || typeof ref.path !== "string" || !isAbsolute33(ref.path) || !SHA256_PATTERN7.test(ref.sha256) || ref.sha256 !== createHash8("sha256").update(bytes).digest("hex") || ref.bytes !== bytes.length || !Number.isSafeInteger(ref.bytes) || ref.bytes <= 0 || !Number.isSafeInteger(ref.expiresAt) || ref.expiresAt <= 0 || paths.has(ref.path) || expiresAt !== null && ref.expiresAt !== expiresAt || typeof record2.evidenceId !== "string" || record2.evidenceId.length === 0 || ids.includes(record2.evidenceId)) return null;
     ids.push(record2.evidenceId);
     paths.add(ref.path);
     expiresAt = ref.expiresAt;
@@ -39580,6 +40136,20 @@ function failureFingerprints(evaluation) {
   const tests = evaluation?.tests;
   return tests?.trusted === true && tests.complete === true && tests.execution === "completed" ? tests.failureFingerprints ?? [] : [];
 }
+var MAX_FAILURE_NAMES = 12;
+function labelledFailures(evaluation) {
+  const fingerprints = new Set(failureFingerprints(evaluation));
+  const seen = /* @__PURE__ */ new Set();
+  const kept = [];
+  for (const entry2 of Array.isArray(evaluation?.failureLabels) ? evaluation.failureLabels : []) {
+    if (typeof entry2?.fingerprint !== "string" || typeof entry2?.label !== "string" || entry2.label === "" || !fingerprints.has(entry2.fingerprint) || seen.has(entry2.fingerprint)) continue;
+    seen.add(entry2.fingerprint);
+    kept.push({ fingerprint: entry2.fingerprint, label: entry2.label });
+  }
+  return kept.sort((left, right) => compareUtf8(left.label, right.label));
+}
+var machineLabels = (evaluation) => Object.fromEntries(labelledFailures(evaluation).map(({ fingerprint, label }) => [fingerprint, label]));
+var failingTestNames = (evaluation) => labelledFailures(evaluation).slice(0, MAX_FAILURE_NAMES).map((entry2) => entry2.label);
 function recovery(code, spec, attempt, parent) {
   return deepFreeze({ code, path: spec.authoringWorktree.path, lastSealedParent: parent ?? null, attemptId: attempt ?? null });
 }
@@ -39781,7 +40351,8 @@ async function runCandidateLane(spec, deps) {
     const machineLedger = applyMachineIssues(ledger, {
       trusted: evaluation.tests?.trusted === true,
       completed: evaluation.tests?.complete === true && evaluation.tests?.execution === "completed",
-      failureFingerprints: evaluation.tests?.failureFingerprints ?? []
+      failureFingerprints: evaluation.tests?.failureFingerprints ?? [],
+      labels: machineLabels(evaluation)
     });
     if (machineLedger?.ok === false) {
       const attempt2 = normalizedAttempt({ spec, binding, ordinal: ordinal2, retryOf, writerResult: "sealed", sealed, writerUsage, verifierUsage, result: "rejected", feedback: ledger });
@@ -39825,6 +40396,7 @@ async function runCandidateLane(spec, deps) {
             stability: evaluation.tests?.stability ?? "unknown",
             trusted: evaluation.tests?.trusted === true,
             complete: evaluation.tests?.complete === true,
+            failures: failingTestNames(evaluation),
             evidenceIds: [...sealed.evidenceIds]
           },
           formatCorrection: formatAttempt === 1,
@@ -39931,8 +40503,8 @@ async function runCandidateLane(spec, deps) {
       });
       const exactPersisted = exactObject(persisted, ["sourceAttemptId", "ref", "empty", "files"]).value ?? null;
       const ref = exactObject(persisted?.ref, ["kind", "candidateId", "path", "sha256", "bytes", "expiresAt"]).value ?? null;
-      const validFiles = canonicalStrings(persisted?.files, { max: 1e4 }) && persisted.files.every((path) => path.length > 0 && path.length <= 1024 && !isAbsolute32(path) && !path.includes("\\") && !path.split("/").some((part) => part === "" || part === "." || part === ".."));
-      if (exactPersisted === null || ref === null || persisted.ref.kind !== "candidate" || persisted.ref.candidateId !== spec.laneId || !isAbsolute32(persisted.ref.path) || persisted.sourceAttemptId !== latestTerminalSeal.attemptId || persisted.ref.sha256 !== latestTerminalSeal.sealed.patchSha256 || !SHA256_PATTERN6.test(persisted.ref.sha256) || !Number.isSafeInteger(persisted.ref.bytes) || persisted.ref.bytes < 0 || !Number.isSafeInteger(persisted.ref.expiresAt) || persisted.ref.expiresAt <= 0 || typeof persisted.empty !== "boolean" || persisted.empty !== (persisted.ref.bytes === 0) || !validFiles || persisted.empty && persisted.files.length !== 0) {
+      const validFiles = canonicalStrings(persisted?.files, { max: 1e4 }) && persisted.files.every((path) => path.length > 0 && path.length <= 1024 && !isAbsolute33(path) && !path.includes("\\") && !path.split("/").some((part) => part === "" || part === "." || part === ".."));
+      if (exactPersisted === null || ref === null || persisted.ref.kind !== "candidate" || persisted.ref.candidateId !== spec.laneId || !isAbsolute33(persisted.ref.path) || persisted.sourceAttemptId !== latestTerminalSeal.attemptId || persisted.ref.sha256 !== latestTerminalSeal.sealed.patchSha256 || !SHA256_PATTERN7.test(persisted.ref.sha256) || !Number.isSafeInteger(persisted.ref.bytes) || persisted.ref.bytes < 0 || !Number.isSafeInteger(persisted.ref.expiresAt) || persisted.ref.expiresAt <= 0 || typeof persisted.empty !== "boolean" || persisted.empty !== (persisted.ref.bytes === 0) || !validFiles || persisted.empty && persisted.files.length !== 0) {
         throw new Error("candidate artifact failed");
       }
       patch = cloneData(persisted);
@@ -40084,7 +40656,7 @@ function createPreparedLaneAdapters(input) {
     testQueue,
     evidenceCache
   } = preparation;
-  const { laneProviders, callProvider, progress, faultRegistry } = PREPARATION_PRIVATE.get(preparation);
+  const { laneProviders, callProvider, progress, faultRegistry, provisionEvidenceWorktree = null } = PREPARATION_PRIVATE.get(preparation);
   const providers = laneProviders[laneIndex];
   const {
     deps,
@@ -40129,6 +40701,29 @@ function createPreparedLaneAdapters(input) {
   const collectPatchAtRevision2 = deps.collectPatchAtRevision ?? collectPatchAtRevision;
   const inspectPatch2 = deps.inspectPatch ?? inspectPatch;
   const listIgnoredPaths2 = deps.listIgnoredPaths ?? listIgnoredPaths;
+  let ignoredBaseline = null;
+  const rememberIgnoredBaseline = async () => {
+    if (ignoredBaseline !== null) return;
+    ignoredBaseline = new Set(await stage(label("ignored path baseline"), () => listIgnoredPaths2(laneWorktree)) ?? []);
+  };
+  const createEvidenceWorktree = async (spec, worktreeDeps) => {
+    const created = await (deps.createRevisionWorktree ?? createRevisionWorktree)(spec, worktreeDeps);
+    if (created?.ok !== true || typeof provisionEvidenceWorktree !== "function") return created;
+    const provisioned = await stage(
+      label("evidence dependency provisioning"),
+      () => provisionEvidenceWorktree(created.path),
+      { mayTouchWorktree: true, worktreePath: created.path }
+    );
+    if (provisioned?.ok === true) return created;
+    await (deps.removeWorktree ?? removeWorktree)(created, { deadlineAt, signal: new AbortController().signal }).catch(() => null);
+    return {
+      ok: false,
+      blocked: true,
+      reasonCode: typeof provisioned?.reasonCode === "string" ? provisioned.reasonCode : REASON.deps_unavailable,
+      error: typeof provisioned?.error === "string" ? provisioned.error : "",
+      recovery: typeof provisioned?.recovery === "string" ? provisioned.recovery : ""
+    };
+  };
   const identity = (role, attemptId2 = null) => ({ laneId: laneId2, attemptId: attemptId2, role, judgeIndex: null });
   const label = (value) => preparation.candidateCount === 1 ? value : `${laneId2} ${value}`;
   return {
@@ -40147,6 +40742,7 @@ function createPreparedLaneAdapters(input) {
     }),
     callWriter: async (value) => {
       let result2;
+      await rememberIgnoredBaseline();
       try {
         result2 = await callProvider({
           provider: providers.writer,
@@ -40159,7 +40755,7 @@ function createPreparedLaneAdapters(input) {
             plan,
             step: value.ordinal,
             budget,
-            feedback: workerFeedback(value.feedback.openIds)
+            feedback: workerFeedback(value.feedback)
           }),
           workspace: laneWorktree.path,
           tools: [...WORKER_TOOLS]
@@ -40234,7 +40830,8 @@ function createPreparedLaneAdapters(input) {
     },
     evaluateAttempt: async ({ attemptId: attemptId2, sealed }) => {
       const stored = attemptDeltas.get(attemptId2);
-      const ignored = await stage(label("ignored path listing"), () => listIgnoredPaths2(laneWorktree));
+      const ignoredNow = await stage(label("ignored path listing"), () => listIgnoredPaths2(laneWorktree));
+      const ignored = Array.isArray(ignoredNow) ? ignoredNow.filter((path) => !(ignoredBaseline?.has(path) ?? false)) : ignoredNow;
       const scope = await stage(label("patch inspection"), () => inspectPatch2({
         files: stored.delta.entries.map((entry2) => entry2.path),
         worktree: laneWorktree.path,
@@ -40326,6 +40923,10 @@ function createPreparedLaneAdapters(input) {
       const evidenceRunner = deps.runCandidateEvidence ?? runCandidateEvidence;
       progress("tests", Number(attemptId2.slice(-3)), identity("worker", attemptId2));
       const evidence = await stage(label("candidate evidence"), () => evidenceRunner({
+        // ★ 실행 안의 단계는 언제나 `run` 이다 — 여섯 칸은 `orch_prove` 가 진다(실행 9, 2026-08-28:
+        //   증명 42분이 55분 상한을 다섯 번째 스위트 실행에서 넘겨 초록 후보를 unverified 로 냈다).
+        //   키 `stage` 는 이 스코프의 함수 `stage` 와 이름만 같다 — 속성 이름이라 가려지지 않는다.
+        stage: "run",
         runId,
         laneId: laneId2,
         attemptId: attemptId2,
@@ -40340,7 +40941,7 @@ function createPreparedLaneAdapters(input) {
       }, {
         sourceWorktree: laneWorktree,
         stateRoot,
-        createRevisionWorktree: deps.createRevisionWorktree ?? createRevisionWorktree,
+        createRevisionWorktree: createEvidenceWorktree,
         revisionIdentity: revisionIdentity2,
         // ★ S1 신고의 관측 지점. 자식이 실제로 떴는지를 아는 곳은 여기 하나뿐이다 — 레인 요약도
         //   attempt 기록도 이 사실을 안 들고 나온다. 어느 레인의 어느 시도였든 한 번이라도
@@ -40378,7 +40979,7 @@ function createPreparedLaneAdapters(input) {
           return pending.then((rawResult) => {
             const recordBytes = Buffer.from(`${JSON.stringify(value.record, null, 2)}
 `, "utf8");
-            const expectedPath = join28(
+            const expectedPath = join29(
               artifactPaths2.runDir,
               "evidence",
               `${laneId2}-${String(value.attemptOrdinal).padStart(3, "0")}-${String(value.evidenceOrdinal).padStart(3, "0")}.json`
@@ -40498,7 +41099,7 @@ function createPreparedLaneAdapters(input) {
       const settlement = classifyWriterResult(rawResult, {
         kind: "attempt",
         candidateId: laneId2,
-        path: join28(artifactPaths2.runDir, "attempts", `${laneId2}-${String(record2.ordinal).padStart(3, "0")}.json`),
+        path: join29(artifactPaths2.runDir, "attempts", `${laneId2}-${String(record2.ordinal).padStart(3, "0")}.json`),
         bytes: recordBytes.length,
         sha256: sha256(recordBytes)
       });
@@ -40768,25 +41369,25 @@ async function assessPreCreditRisk({
 }
 
 // src/run-read.mjs
-import { readFile as readFile15, readdir as readdir6, stat as stat12 } from "node:fs/promises";
-import { isAbsolute as isAbsolute33, join as join29 } from "node:path";
-var RUN_ID_PATTERN5 = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+import { readFile as readFile17, readdir as readdir7, stat as stat13 } from "node:fs/promises";
+import { isAbsolute as isAbsolute34, join as join30 } from "node:path";
+var RUN_ID_PATTERN6 = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 var WINDOWS_DEVICE_PATTERN4 = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
 var LOG_LEVELS = Object.freeze(["info", "warn", "error"]);
 var LOG_TAIL_LEVELS = Object.freeze(["warn", "error"]);
 var LOG_TAIL_LIMIT = 20;
 var RECENT_RUNS_DEFAULT = 10;
 var RECENT_RUNS_MAX = 50;
-var usableStateRoot = (stateRoot) => typeof stateRoot === "string" && stateRoot !== "" && isAbsolute33(stateRoot);
-var usableRunId = (runId) => typeof runId === "string" && RUN_ID_PATTERN5.test(runId) && !WINDOWS_DEVICE_PATTERN4.test(runId);
-var runDir = (stateRoot, runId) => join29(stateRoot, "runs", runId);
-var attemptPath = (stateRoot, runId, laneId2, attemptOrdinal2) => join29(runDir(stateRoot, runId), "attempts", `${laneId2}-${ordinal(attemptOrdinal2)}.json`);
+var usableStateRoot = (stateRoot) => typeof stateRoot === "string" && stateRoot !== "" && isAbsolute34(stateRoot);
+var usableRunId = (runId) => typeof runId === "string" && RUN_ID_PATTERN6.test(runId) && !WINDOWS_DEVICE_PATTERN4.test(runId);
+var runDir = (stateRoot, runId) => join30(stateRoot, "runs", runId);
+var attemptPath = (stateRoot, runId, laneId2, attemptOrdinal2) => join30(runDir(stateRoot, runId), "attempts", `${laneId2}-${ordinal(attemptOrdinal2)}.json`);
 var runIdText = (runId) => typeof runId === "string" && runId !== "" ? runId : errorText(runId);
 var displayCode = (value) => typeof value === "string" ? normalizeLegacyReasonCode(value) ?? value : null;
 async function readBytes(path, maxBytes) {
   let bytes;
   try {
-    bytes = await readFile15(path);
+    bytes = await readFile17(path);
   } catch (error2) {
     return { status: error2?.code === "ENOENT" ? "missing" : "unreadable" };
   }
@@ -40799,9 +41400,9 @@ async function readRunManifest({ stateRoot, runId } = {}) {
 async function loadManifest(stateRoot, runId) {
   if (!usableStateRoot(stateRoot)) return { blocked: fail(REASON.state_root_not_absolute) };
   if (!usableRunId(runId)) return { blocked: fail(REASON.status_run_not_found, { runId: runIdText(runId) }) };
-  const read2 = await readBytes(join29(runDir(stateRoot, runId), "manifest.json"), MAX_RUN_MANIFEST_BYTES);
+  const read2 = await readBytes(join30(runDir(stateRoot, runId), "manifest.json"), MAX_RUN_MANIFEST_BYTES);
   if (read2.status === "missing") {
-    const dir = await stat12(runDir(stateRoot, runId)).catch(() => null);
+    const dir = await stat13(runDir(stateRoot, runId)).catch(() => null);
     if (dir?.isDirectory()) return { blocked: fail(REASON.status_run_unreadable) };
     return { blocked: fail(REASON.status_run_not_found, { runId }) };
   }
@@ -40873,7 +41474,7 @@ async function readRunPlan({ stateRoot, runId } = {}) {
   const { manifest } = loaded;
   const entry2 = manifest.committedArtifacts.find((item) => item.artifactKind === "plan") ?? null;
   if (entry2 === null) return deepFreeze({ ok: true, plan: null });
-  const path = join29(runDir(stateRoot, runId), "plan.json");
+  const path = join30(runDir(stateRoot, runId), "plan.json");
   const read2 = await readBytes(path, MAX_JSON_ARTIFACT_BYTES);
   if (read2.status !== "ok" || !samePath(entry2.ref.path, path) || read2.bytes.length !== entry2.ref.bytes || sha256(read2.bytes) !== entry2.ref.sha256) return fail(REASON.artifact_replay_mismatch);
   let parsed;
@@ -40945,7 +41546,7 @@ async function readRunLogTail({ stateRoot, runId, levels, limit } = {}) {
 async function directoryNames(path, keep) {
   let entries;
   try {
-    entries = await readdir6(path, { withFileTypes: true });
+    entries = await readdir7(path, { withFileTypes: true });
   } catch (error2) {
     return error2?.code === "ENOENT" ? [] : null;
   }
@@ -40953,15 +41554,15 @@ async function directoryNames(path, keep) {
 }
 async function mtimeMs(path) {
   try {
-    return (await stat12(path)).mtimeMs;
+    return (await stat13(path)).mtimeMs;
   } catch {
     return null;
   }
 }
 async function listRunIds({ stateRoot, limit } = {}) {
   if (!usableStateRoot(stateRoot)) return fail(REASON.state_root_not_absolute);
-  const dirs = await directoryNames(join29(stateRoot, "runs"), (entry2) => entry2.isDirectory());
-  const logs = await directoryNames(join29(stateRoot, "logs"), (entry2) => entry2.isFile() && entry2.name.endsWith(".jsonl"));
+  const dirs = await directoryNames(join30(stateRoot, "runs"), (entry2) => entry2.isDirectory());
+  const logs = await directoryNames(join30(stateRoot, "logs"), (entry2) => entry2.isFile() && entry2.name.endsWith(".jsonl"));
   if (dirs === null || logs === null) return fail(REASON.status_run_unreadable);
   const journal = await readRuns(stateRoot, { limit: Number.MAX_SAFE_INTEGER });
   const rows = new Map(journal.ok ? journal.runs.map((run3) => [run3.runId, run3]) : []);
@@ -41092,7 +41693,7 @@ async function refuseWhenNoResumeRoom({ resume, budget, runId, cleanupWorktrees,
 }
 
 // src/run-worktrees.mjs
-import { join as join30 } from "node:path";
+import { join as join31 } from "node:path";
 var WORKTREE_HANDLE_KEYS = Object.freeze([
   "ok",
   "path",
@@ -41233,7 +41834,7 @@ async function createLaneAWorktree({
 }) {
   const createWorktree2 = deps.createWorktree ?? createWorktree;
   const laneAExpected = {
-    path: join30(stateRoot, "worktrees", makeWorktreeId({ runId, purpose: "lane-a" })),
+    path: join31(stateRoot, "worktrees", makeWorktreeId({ runId, purpose: "lane-a" })),
     projectPath: canonicalProject,
     stateRoot,
     runId,
@@ -41326,7 +41927,7 @@ async function createLaneBWorktree({
 }) {
   const createRevisionWorktree2 = deps.createRevisionWorktree ?? createRevisionWorktree;
   const laneBExpected = {
-    path: join30(stateRoot, "worktrees", makeWorktreeId({ runId, purpose: "lane-b" })),
+    path: join31(stateRoot, "worktrees", makeWorktreeId({ runId, purpose: "lane-b" })),
     projectPath: canonicalProject,
     stateRoot,
     runId,
@@ -41372,8 +41973,8 @@ async function createLaneBWorktree({
 }
 
 // src/run-planner.mjs
-import { lstat as lstat10, mkdir as mkdir10, mkdtemp as mkdtemp2, rm as rm11 } from "node:fs/promises";
-import { join as join31, relative as relative8, resolve as resolve13 } from "node:path";
+import { lstat as lstat10, mkdir as mkdir11, mkdtemp as mkdtemp2, rm as rm12 } from "node:fs/promises";
+import { join as join32, relative as relative8, resolve as resolve13 } from "node:path";
 function pathContains2(parent, child) {
   return relative8(parent, child) === "" || contained(parent, child);
 }
@@ -41393,7 +41994,7 @@ async function runPlannerPhase({
   killLiveChildren,
   callProvider
 }) {
-  const plansRoot = join31(stateRoot, "plans");
+  const plansRoot = join32(stateRoot, "plans");
   let planDir = null;
   let planDirIdentity = null;
   const plannerNotices = [...configNotices, ...provisionNotices];
@@ -41407,7 +42008,7 @@ async function runPlannerPhase({
     try {
       const [actual, current] = await Promise.all([canonical(planDir), lstat10(planDir, { bigint: true })]);
       if (actual === null || relative8(actual, planDirIdentity.path) !== "" || current.dev !== planDirIdentity.dev || current.ino !== planDirIdentity.ino || !current.isDirectory() || current.isSymbolicLink()) return false;
-      const removal = await recoveryStage("planner scratch cleanup", () => (deps.removePlannerScratch ?? rm11)(planDirIdentity.path, { recursive: true, force: false }));
+      const removal = await recoveryStage("planner scratch cleanup", () => (deps.removePlannerScratch ?? rm12)(planDirIdentity.path, { recursive: true, force: false }));
       if (removal?.hardStopped === true) return false;
       return await lstat10(planDirIdentity.path).then(() => false, (error2) => error2?.code === "ENOENT");
     } catch (error2) {
@@ -41419,8 +42020,8 @@ async function runPlannerPhase({
     const plannedRoot = await canonical(plansRoot);
     const expectedPlansRoot = resolve13(stateRoot, "plans");
     if (plannedRoot === null || relative8(plannedRoot, expectedPlansRoot) !== "" || relative8(plannedRoot, stateRoot) === "" || !pathContains2(stateRoot, plannedRoot)) throw new Error("planner_scratch_root_untrusted");
-    await mkdir10(plansRoot, { recursive: true });
-    planDir = await mkdtemp2(join31(plansRoot, `${runId}-planner-`));
+    await mkdir11(plansRoot, { recursive: true });
+    planDir = await mkdtemp2(join32(plansRoot, `${runId}-planner-`));
     const returnedPlanDir = resolve13(planDir);
     const [canonicalPlanDir, planStat] = await Promise.all([canonical(planDir), lstat10(planDir, { bigint: true })]);
     const canonicalPlansRoot = await canonical(plansRoot);
@@ -41565,6 +42166,11 @@ function createProviderCall({
       attemptId: attemptId2 ?? "",
       tools: Array.isArray(tools) ? tools.join(",") : ""
     });
+    const spawnedAt = now();
+    let lastEventAt = spawnedAt;
+    let events = 0;
+    let spawnedChild = false;
+    let threw = true;
     try {
       result2 = await stage(`${kind} provider`, () => provider.run({
         role: binding.role,
@@ -41575,21 +42181,26 @@ function createProviderCall({
         tools,
         allowedTools: tools,
         signal: deadline,
-        onSpawn: (child) => onSpawn(child, {
-          late: deadline?.aborted === true,
-          planner: kind === "planner" || nonWorktree,
-          worktreePath: nonWorktree ? null : workspace,
-          ownerWorktreePath: workspace,
-          laneId: laneId2,
-          attemptId: attemptId2,
-          role: binding.role,
-          judgeIndex,
-          reportIdentity: candidateCount === 2
-        }),
+        onSpawn: (child) => {
+          spawnedChild = true;
+          return onSpawn(child, {
+            late: deadline?.aborted === true,
+            planner: kind === "planner" || nonWorktree,
+            worktreePath: nonWorktree ? null : workspace,
+            ownerWorktreePath: workspace,
+            laneId: laneId2,
+            attemptId: attemptId2,
+            role: binding.role,
+            judgeIndex,
+            reportIdentity: candidateCount === 2
+          });
+        },
         // ★★ 접힌 `phase` 를 **양쪽 갈래에** 쓴다. 예전에는 후보가 하나일 때만 날 `kind` 가
         //   올라가서 같은 단계가 `writer`·`verifier_format`·`judge_format` 이라는 다른 이름으로
         //   보였다 — `candidates` 값이 사용자가 읽는 단어를 바꾸는 결함이다(WS0 §4).
         onProgress: (event) => {
+          events += 1;
+          lastEventAt = now();
           if (deadline?.aborted !== true) {
             try {
               runOptions.onProgress?.(candidateCount === 1 ? { phase: phase2, step, ...runFacts, event } : { phase: phase2, step, laneId: laneId2, attemptId: attemptId2, role: binding.role, judgeIndex, ...runFacts, event });
@@ -41599,18 +42210,37 @@ function createProviderCall({
         },
         runId
       }), { mayTouchWorktree: !nonWorktree && kind !== "planner", worktreePath: workspace });
+      threw = false;
       recordProviderOutcome(provider.id, kind, laneId2, result2);
       if (result2?.hardStopped === true) throw new Error("provider_effect_unknown");
       return result2;
     } finally {
       usageAccumulator.settle(ticket, { promptTokens: result2?.promptTokens ?? null, evalTokens: result2?.evalTokens ?? null });
+      const settledAt = now();
+      const cut = threw || result2?.hardStopped === true || result2?.truncated === true;
+      logLine2(cut ? "warn" : "info", null, "provider settle", {
+        vendor: provider.id,
+        kind,
+        role: binding.role,
+        laneId: laneId2 ?? "",
+        attemptId: attemptId2 ?? "",
+        elapsedMs: Math.max(0, settledAt - spawnedAt),
+        quietMs: Math.max(0, settledAt - lastEventAt),
+        events,
+        spawned: spawnedChild,
+        doneReason: typeof result2?.doneReason === "string" ? result2.doneReason : "",
+        truncated: result2?.truncated === true,
+        hardStopped: result2?.hardStopped === true,
+        hung: result2?.hung === true,
+        threw
+      });
     }
   };
 }
 
 // src/config.mjs
-import { mkdir as mkdir11, readFile as readFile16 } from "node:fs/promises";
-import { isAbsolute as isAbsolute34, join as join32 } from "node:path";
+import { mkdir as mkdir12, readFile as readFile18 } from "node:fs/promises";
+import { isAbsolute as isAbsolute35, join as join33 } from "node:path";
 import { TextDecoder as TextDecoder2 } from "node:util";
 var FILENAME2 = "settings.ini";
 var LOCKNAME = "settings.lock";
@@ -41704,7 +42334,7 @@ function settingsTextOf(raw) {
 }
 async function readSettingsStatus(stateRoot) {
   try {
-    const text2 = settingsTextOf(await readFile16(join32(stateRoot, FILENAME2)));
+    const text2 = settingsTextOf(await readFile18(join33(stateRoot, FILENAME2)));
     if (text2 === null) return { settings: toSettings({}), readable: false };
     const ini = parseIni(text2);
     const schema = classifySettingsSchema(text2, ini);
@@ -41890,19 +42520,19 @@ function patchIniText(text2, entries) {
   return out.join("");
 }
 var tempCounter5 = 0;
-async function writeSettings(stateRoot, patch, { models = null, readSettingsFile = readFile16, writeSettingsFile = writeFileAtomic } = {}) {
-  if (typeof stateRoot !== "string" || stateRoot === "" || !isAbsolute34(stateRoot)) {
+async function writeSettings(stateRoot, patch, { models = null, readSettingsFile = readFile18, writeSettingsFile = writeFileAtomic } = {}) {
+  if (typeof stateRoot !== "string" || stateRoot === "" || !isAbsolute35(stateRoot)) {
     return reject(REASON.state_root_not_absolute);
   }
   const normalized = normalizePatch(patch);
   if (!normalized.ok) return normalized;
-  const file = join32(stateRoot, FILENAME2);
+  const file = join33(stateRoot, FILENAME2);
   try {
-    await mkdir11(stateRoot, { recursive: true });
+    await mkdir12(stateRoot, { recursive: true });
   } catch (error2) {
     return reject(REASON.state_directory_create_failed, { detail: errorText(error2) });
   }
-  const held = await withLock(join32(stateRoot, LOCKNAME), async () => {
+  const held = await withLock(join33(stateRoot, LOCKNAME), async () => {
     let raw;
     try {
       const bytes = await readSettingsFile(file);
@@ -42240,7 +42870,7 @@ function validateQualityRequest(options) {
     return invalid2(REASON.config_role_override_conflict);
   }
   if (typeof options.task !== "string" || options.task.trim() === "") return invalid2(REASON.config_task_missing);
-  if (typeof options.projectPath !== "string" || options.projectPath === "" || !isAbsolute35(options.projectPath)) {
+  if (typeof options.projectPath !== "string" || options.projectPath === "" || !isAbsolute36(options.projectPath)) {
     return invalid2(REASON.config_project_path_invalid, { path: show(options.projectPath) });
   }
   const isolation = options.isolation ?? "worktree";
@@ -42262,10 +42892,9 @@ function validateQualityRequest(options) {
   return null;
 }
 var MAX_BUDGET = 10;
-var MAX_WAIT_MS = 33e5;
 var HARD_STOP_GRACE_MS = 1e4;
 var HARD_STOP = /* @__PURE__ */ Symbol("bom-orch:hard-stop");
-var RUN_ID_PATTERN6 = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+var RUN_ID_PATTERN7 = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 var UNKNOWN_VALUE4 = "<unknown>";
 var NO_VENDORS = "(none)";
 function show(value) {
@@ -42317,6 +42946,11 @@ async function runOrchestration(spec) {
       "hostSignal",
       "resumeRunId",
       "scopeAllow",
+      // ★ 오너 결정 B(2026-08-31). 화이트리스트에 없으면 `toEngineOptions` 가 실어 보낸 값이
+      //   여기서 조용히 잘려 `classifyProofRequirement` 는 항상 부재(=required)를 본다 —
+      //   그 자체는 fail-closed 라 안전 쪽이지만, `require_proof:false` 를 지정한 호출자가
+      //   자기 선택이 반영됐다고 믿는데 실제로는 무시되는 결함이 된다.
+      "requireProof",
       "deps"
     ]);
     if (snapshot === null) {
@@ -42405,10 +43039,10 @@ async function prepareRunNamespace(options, deps) {
     redact
   } = context;
   const halt = (envelope) => deepFreeze({ ok: false, envelope });
-  if (![1, 2].includes(candidateCount) || candidateCount === 2 && (runOptions.writer !== void 0 || runOptions.worker !== void 0 || runOptions.verifier !== void 0) || typeof task !== "string" || task.trim() === "" || typeof projectPath !== "string" || projectPath === "" || !isAbsolute35(projectPath) || (runOptions.isolation ?? "worktree") !== "worktree" || !Number.isInteger(budget) || budget < 1 || budget > MAX_BUDGET || !Number.isSafeInteger(deadlineAt)) {
+  if (![1, 2].includes(candidateCount) || candidateCount === 2 && (runOptions.writer !== void 0 || runOptions.worker !== void 0 || runOptions.verifier !== void 0) || typeof task !== "string" || task.trim() === "" || typeof projectPath !== "string" || projectPath === "" || !isAbsolute36(projectPath) || (runOptions.isolation ?? "worktree") !== "worktree" || !Number.isInteger(budget) || budget < 1 || budget > MAX_BUDGET || !Number.isSafeInteger(deadlineAt)) {
     return halt(failure({ status: "invalid", reasonCode: REASON.run_preparation_input_invalid }));
   }
-  const runId = typeof deps.runId === "string" && RUN_ID_PATTERN6.test(deps.runId) ? deps.runId : makeRunId({ now, random: typeof deps.random === "function" ? deps.random : Math.random });
+  const runId = typeof deps.runId === "string" && RUN_ID_PATTERN7.test(deps.runId) ? deps.runId : makeRunId({ now, random: typeof deps.random === "function" ? deps.random : Math.random });
   context.setRunIdentity?.({ runId });
   const requestedRoot = typeof deps.stateRoot === "string" && deps.stateRoot !== "" ? deps.stateRoot : resolveStateRoot();
   const canonicalStateRoot = deps.canonicalStateRoot ?? canonical;
@@ -42479,6 +43113,7 @@ async function prepareRunNamespace(options, deps) {
   const sweepRuns2 = deps.sweepRuns ?? sweepRuns;
   const sweepLogs2 = deps.sweepLogs ?? sweepLogs;
   const sweepPlans2 = deps.sweepPlans ?? sweepPlans;
+  const sweepProofs2 = deps.sweepProofs ?? sweepProofs;
   const sweepNow = now();
   let sweptRemoved = 0;
   let sweptSkipped = 0;
@@ -42488,6 +43123,7 @@ async function prepareRunNamespace(options, deps) {
     ["plans", sweepPlans2, [stateRoot, sweepNow]],
     ["patches", sweepPatches2, [stateRoot, sweepNow, { excludeRunId: runId }]],
     ["runs", sweepRuns2, [stateRoot, sweepNow, { excludeRunId: runId }]],
+    ["proofs", sweepProofs2, [stateRoot, sweepNow, { excludeRunId: runId }]],
     ["logs", sweepLogs2, [{ stateRoot, now: sweepNow }]]
   ]) {
     try {
@@ -42551,7 +43187,7 @@ async function prepareRunNamespace(options, deps) {
   }
   const frozenTestPlan = deepFreeze(clonedTestPlan);
   const taskClass = classifyTask({ task, testSource: frozenTestPlan.source ?? null });
-  const proofRequirement = classifyProofRequirement({ task, taskClass });
+  const proofRequirement = classifyProofRequirement({ requireProof: runOptions.requireProof });
   const configNotices = frozenTestPlanNotices(derivedTestPlan);
   const baselineConfig = frozenTestPlanConfig(derivedTestPlan);
   const scopeAllow = unionScopeAllow(runOptions.scopeAllow, baselineConfig?.scope?.allow);
@@ -42908,7 +43544,17 @@ async function prepareRunNamespace(options, deps) {
     // 서수를 받고, 종료 경로는 여기서 알림을 짓는다 — 두 소비자가 같은 값을 읽는다.
     resume
   };
+  const provisionEvidenceWorktree = (worktreePath) => provisionDependencies2({
+    config: baselineConfig,
+    baselineCommit: baseline.commit,
+    worktreePath,
+    stateRoot,
+    runId,
+    signal: deadline,
+    onSpawn: (child) => onSpawn(child, { worktreePath, ownerWorktreePath: worktreePath })
+  });
   PREPARATION_PRIVATE.set(prepared, {
+    provisionEvidenceWorktree,
     taskClass,
     decisions,
     decisionSources,
@@ -43129,14 +43775,14 @@ async function orchestrateQuality(options, onLogOpened = null) {
       canonical(handle.stateRoot),
       canonical(handle.path)
     ]);
-    if (root === null || declaredRoot !== root || path === null || !pathContains3(join33(root, "worktrees"), path) || authoringWorktreePaths.has(path)) return null;
+    if (root === null || declaredRoot !== root || path === null || !pathContains3(join34(root, "worktrees"), path) || authoringWorktreePaths.has(path)) return null;
     let expectedId;
     try {
       expectedId = makeWorktreeId({ runId: activeRunId, purpose: handle.purpose });
     } catch {
       return null;
     }
-    return handle.worktreeId === expectedId && path === join33(root, "worktrees", expectedId) ? path : null;
+    return handle.worktreeId === expectedId && path === join34(root, "worktrees", expectedId) ? path : null;
   };
   const onSpawn = (child, {
     late = false,
@@ -43337,7 +43983,7 @@ async function orchestrateQuality(options, onLogOpened = null) {
 }
 
 // src/run-inspect.mjs
-import { isAbsolute as isAbsolute36, relative as relative10, resolve as resolve15, sep as sep2 } from "node:path";
+import { isAbsolute as isAbsolute37, relative as relative10, resolve as resolve15, sep as sep2 } from "node:path";
 function validRunIdForGrammar(value) {
   return /^[a-z0-9][a-z0-9_-]{0,63}$/.test(value) && !/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/.test(value);
 }
@@ -43485,7 +44131,7 @@ async function inspectArtifactRefs(input, dependencyInput = {}) {
   const object3 = exactObject(input, ["stateRoot", "refs", "nowMs"]).value ?? null;
   const deps = readonlyDeps(dependencyInput);
   const refs = exactDenseArray(object3?.refs, 1e4);
-  if (object3 === null || deps === null || refs === null || !isSafeCount(object3.nowMs) || !boundedString3(object3.stateRoot, 32768) || !isAbsolute36(object3.stateRoot) || await canonicalRoot(object3.stateRoot, deps) === null) return fail(REASON.artifact_inspection_input_invalid);
+  if (object3 === null || deps === null || refs === null || !isSafeCount(object3.nowMs) || !boundedString3(object3.stateRoot, 32768) || !isAbsolute37(object3.stateRoot) || await canonicalRoot(object3.stateRoot, deps) === null) return fail(REASON.artifact_inspection_input_invalid);
   const inspected2 = [];
   for (const ref of refs) inspected2.push(await inspectOneRef(object3.stateRoot, ref, object3.nowMs, deps));
   return deepFreeze({ ok: true, refs: inspected2 });
@@ -43510,6 +44156,10 @@ function toEngineOptions(value, context) {
     writer: value.writer,
     // ☞ 태스크 8 이 읽는다: `decide({ allowed: { single: options.allowSingle === true } })`.
     allowSingle: value.allow_single === true,
+    // ★ 오너 결정 B(2026-08-31). `classifyProofRequirement` 가 보는 유일한 입력이라 그대로
+    //   흘려보낸다 — 여기서 `=== true`/`=== false` 로 좁히면 그 좁힘 규칙이 분류기의 fail-closed
+    //   규칙과 두 자리에서 따로 살게 된다. `validateArgs` 를 지난 값은 이미 boolean 이다.
+    requireProof: value.require_proof,
     // 재개(WS3 §0-R1). 인자가 없으면 `undefined` 여야 한다 — 엔진의 화이트리스트에서 「재개하지
     // 않음」은 키의 부재이고, `null` 이나 `''` 을 흘려보내면 그것이 이름으로 취급된다.
     resumeRunId: value.resume_run_id,
@@ -43525,6 +44175,15 @@ function toEngineOptions(value, context) {
     //   ★ `instanceof` 가 아니라 엔진과 **같은 오리 검사**다(리뷰 소견): cross-realm/vm 에서 온
     //     진짜 신호는 instanceof 에 떨어져 조용히 사라지는데, 엔진의 검증은 그 신호를 받는다 —
     //     두 검사가 갈리면 한쪽만 아는 값이 생긴다.
+    hostSignal: context?.hostSignal !== null && typeof context?.hostSignal === "object" && typeof context.hostSignal.aborted === "boolean" && typeof context.hostSignal.addEventListener === "function" ? context.hostSignal : void 0,
+    deps: toEngineDeps(context)
+  };
+}
+function toProveOptions(value, context) {
+  return {
+    runId: value.run_id,
+    waitMs: value.wait_ms,
+    onProgress: typeof context?.onProgress === "function" ? context.onProgress : void 0,
     hostSignal: context?.hostSignal !== null && typeof context?.hostSignal === "object" && typeof context.hostSignal.aborted === "boolean" && typeof context.hostSignal.addEventListener === "function" ? context.hostSignal : void 0,
     deps: toEngineDeps(context)
   };
@@ -43552,13 +44211,13 @@ async function inspectJournalArtifacts(stateRoot, refs, dependencyInput) {
 }
 
 // src/tools/apply.mjs
-import { readFile as readFile18, stat as stat13 } from "node:fs/promises";
-import { isAbsolute as isAbsolute38, join as join35 } from "node:path";
+import { readFile as readFile20, stat as stat14 } from "node:fs/promises";
+import { isAbsolute as isAbsolute39, join as join36 } from "node:path";
 
 // src/apply-patch.mjs
 import { createHash as createHash9 } from "node:crypto";
-import { copyFile, lstat as lstat11, mkdir as mkdir12, readFile as readFile17, writeFile as writeFile3 } from "node:fs/promises";
-import { dirname as dirname16, isAbsolute as isAbsolute37, join as join34, relative as relative11, sep as sep3 } from "node:path";
+import { copyFile, lstat as lstat11, mkdir as mkdir13, readFile as readFile19, writeFile as writeFile3 } from "node:fs/promises";
+import { dirname as dirname16, isAbsolute as isAbsolute38, join as join35, relative as relative11, sep as sep3 } from "node:path";
 var MAX_FILES = 200;
 var MAX_DIRTY_SAMPLE = 10;
 var fail2 = (reasonCode, params = {}) => ({ blocked: true, reasonCode, params });
@@ -43670,14 +44329,14 @@ function sameFileIdentity2(before, after) {
   return before.isFile() && after.isFile() && before.dev === after.dev && before.ino === after.ino && Object.is(before.birthtimeMs, after.birthtimeMs);
 }
 async function backupWorkingTree(repoPath, scratch, patchPaths, writeBackupManifest) {
-  const base = join34(scratch, "backup");
-  if (!await mkdir12(base, { recursive: true }).then(() => true, () => false)) {
+  const base = join35(scratch, "backup");
+  if (!await mkdir13(base, { recursive: true }).then(() => true, () => false)) {
     return { ok: false, detail: "the working-tree backup directory could not be created" };
   }
   const entries = [];
   const directories = /* @__PURE__ */ new Map();
   for (const path of patchPaths) {
-    const full = join34(repoPath, path);
+    const full = join35(repoPath, path);
     if (!contained(repoPath, full)) return { ok: false, occupied: true };
     const ancestors = await inspectAncestors(repoPath, full);
     if (!ancestors.safe) return { ok: false, occupied: true };
@@ -43689,14 +44348,14 @@ async function backupWorkingTree(repoPath, scratch, patchPaths, writeBackupManif
       continue;
     }
     if (!first.stats.isFile()) return { ok: false, occupied: true };
-    const bytes = await readFile17(full).catch(() => null);
+    const bytes = await readFile19(full).catch(() => null);
     const second = await lstat11(full).catch(() => null);
     const afterAncestors = await inspectAncestors(repoPath, full);
     if (bytes === null || second === null || !sameFileIdentity2(first.stats, second) || !sameAncestorChain(ancestors, afterAncestors) || modeOf(first.stats) !== modeOf(second)) {
       return { ok: false, detail: `the working-tree path ${path} changed while it was being backed up` };
     }
     const backup = String(entries.length);
-    const saved = join34(base, backup);
+    const saved = join35(base, backup);
     if (!await writeFile3(saved, bytes, { flag: "wx", mode: 384 }).then(() => true, () => false)) {
       return { ok: false, detail: `the working-tree path ${path} could not be copied into the backup` };
     }
@@ -43725,7 +44384,7 @@ async function backupWorkingTree(repoPath, scratch, patchPaths, writeBackupManif
   };
   const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}
 `);
-  const manifestPath = join34(base, "manifest.json");
+  const manifestPath = join35(base, "manifest.json");
   if (!await writeBackupManifest(manifestPath, manifestBytes).then(() => true, () => false)) {
     return { ok: false, detail: "the working-tree backup manifest could not be written" };
   }
@@ -43749,8 +44408,8 @@ async function compareWorkingTree(repoPath, entries) {
       changed.push(entry2.path);
       continue;
     }
-    const saved = await readFile17(entry2.saved).catch(() => null);
-    const current = await readFile17(entry2.full).catch(() => null);
+    const saved = await readFile19(entry2.saved).catch(() => null);
+    const current = await readFile19(entry2.full).catch(() => null);
     const second = await lstat11(entry2.full).catch(() => null);
     const afterAncestors = await inspectAncestors(repoPath, entry2.full);
     if (saved === null || current === null || second === null || !sameFileIdentity2(first.stats, second) || !sameAncestorChain(ancestors, afterAncestors) || modeOf(second) !== entry2.mode || !current.equals(saved)) changed.push(entry2.path);
@@ -43784,7 +44443,7 @@ async function classifyFailedWrite(git, options) {
       blocked: fail2(REASON.apply_rollback_incomplete, {
         path: repoPath,
         count: changed.length,
-        backup: join34(scratch, "backup"),
+        backup: join35(scratch, "backup"),
         // 수가 **맨 앞**이다: `{detail}` 은 200자에서 잘리므로, 뒤에 두면 잃은 개수가 먼저 사라진다.
         detail: `${changed.length} paths differ from or could not be safely compared with the pre-write snapshot: ${namedList(changed)}`
       })
@@ -43807,7 +44466,7 @@ async function classifyCompletedWrite(options) {
     blocked: fail2(REASON.apply_rollback_incomplete, {
       path: repoPath,
       count: changed.length,
-      backup: join34(scratch, "backup"),
+      backup: join35(scratch, "backup"),
       detail: `${changed.length} paths differ from or could not be safely compared with the pre-write snapshot: ${namedList(changed)}`
     })
   };
@@ -43846,8 +44505,8 @@ async function copyRealIndex(git, scratch, repoPath) {
   if (named?.ok !== true) return null;
   const real = named.stdout.trim();
   if (real === "") return null;
-  const target = join34(scratch, "index-copy");
-  return copyFile(isAbsolute37(real) ? real : join34(repoPath, real), target).then(() => target, () => null);
+  const target = join35(scratch, "index-copy");
+  return copyFile(isAbsolute38(real) ? real : join35(repoPath, real), target).then(() => target, () => null);
 }
 async function applyPatchToRepository(spec, deps = {}) {
   const run3 = typeof deps?.run === "function" ? deps.run : runGit;
@@ -43983,8 +44642,8 @@ async function applyPatchToRepository(spec, deps = {}) {
     }
     const room = await openWorkspace();
     if (room === null) return fail2(REASON.apply_git_failed, { detail: "no state root was given for the temporary index" });
-    const objectDir = join34(room, "objects");
-    const made = await mkdir12(objectDir, { recursive: true }).then(() => true, () => false);
+    const objectDir = join35(room, "objects");
+    const made = await mkdir13(objectDir, { recursive: true }).then(() => true, () => false);
     if (!made) return fail2(REASON.apply_git_failed, { detail: "the temporary object store could not be created" });
     const named = await git(["rev-parse", "--git-path", "objects"]);
     if (named.ok !== true) return gitFail(named);
@@ -43992,11 +44651,11 @@ async function applyPatchToRepository(spec, deps = {}) {
     if (userObjects === "") return fail2(REASON.apply_git_failed, { detail: "git named no object directory for this repository" });
     const scoped = {
       GIT_OBJECT_DIRECTORY: objectDir,
-      GIT_ALTERNATE_OBJECT_DIRECTORIES: quotedAlternate(isAbsolute37(userObjects) ? userObjects : join34(repoPath, userObjects))
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: quotedAlternate(isAbsolute38(userObjects) ? userObjects : join35(repoPath, userObjects))
     };
     let ancestorEnv = scoped;
     if (isFullObjectId(baseline?.tree)) {
-      const baselineIndex = join34(room, "baseline-index");
+      const baselineIndex = join35(room, "baseline-index");
       const seeded = await git(["read-tree", baseline.tree], { ...scoped, GIT_INDEX_FILE: baselineIndex });
       if (gitDidNotComplete(seeded)) return gitFail(seeded);
       if (seeded.ok === true) ancestorEnv = { ...scoped, GIT_INDEX_FILE: baselineIndex };
@@ -44005,7 +44664,7 @@ async function applyPatchToRepository(spec, deps = {}) {
         if (writable?.ok !== true) return gitFail(writable);
       }
     }
-    const fakeAncestor = join34(room, "fake-ancestor");
+    const fakeAncestor = join35(room, "fake-ancestor");
     const ancestor = await applyGit([
       "apply",
       `--build-fake-ancestor=${fakeAncestor}`,
@@ -44019,7 +44678,7 @@ async function applyPatchToRepository(spec, deps = {}) {
     }
     const blocking = state.tracked.filter((one) => one.staged || patchPaths.has(one.path));
     if (blocking.length > 0) return fail2(REASON.apply_worktree_dirty, { count: blocking.length, path: repoPath });
-    const env = { ...scoped, GIT_INDEX_FILE: join34(room, "index") };
+    const env = { ...scoped, GIT_INDEX_FILE: join35(room, "index") };
     const readTree = await git(["read-tree", "HEAD"], env);
     if (readTree.ok !== true) return gitFail(readTree);
     const probe = await applyGit(["apply", "--3way", "--cached", "--whitespace=nowarn"], env);
@@ -44122,7 +44781,7 @@ async function applyPatchToRepository(spec, deps = {}) {
 }
 
 // src/tools/apply.mjs
-var winnerPatchPath = (stateRoot, runId) => join35(stateRoot, "patches", `${runId}.patch`);
+var winnerPatchPath = (stateRoot, runId) => join36(stateRoot, "patches", `${runId}.patch`);
 var envelopeStatusOf = (reasonCode) => reasonCode === REASON.apply_run_not_found ? "invalid" : statusOfReasonCode(reasonCode);
 var refuse2 = (reasonCode, { runId, params } = {}) => failure({
   status: envelopeStatusOf(reasonCode),
@@ -44178,10 +44837,28 @@ function winnerTreeOf(manifest) {
   const candidate = Array.isArray(manifest?.candidateRefs) ? manifest.candidateRefs.find((one) => one.candidateId === candidateId) : null;
   return typeof candidate?.treeHash === "string" ? candidate.treeHash : null;
 }
+var PROOF_FAILED = Object.freeze(PROOF_STATUSES.filter((one) => one === "not_proven" || one === "flaky"));
+async function proofGate({ stateRoot, runId, manifest, allowUnproven }, wired = {}) {
+  if (manifest?.proofRequirement?.required !== true) {
+    return { ok: true, proof: { status: "not_applicable", attemptId: null, overridden: false } };
+  }
+  const read2 = typeof wired.readProofRecord === "function" ? wired.readProofRecord : readProofRecord;
+  const got = await read2({ stateRoot, runId });
+  const record2 = got?.ok === true ? got.record : null;
+  const status = PROOF_STATUSES.includes(record2?.status) ? record2.status : null;
+  const attemptId2 = typeof record2?.attemptId === "string" ? record2.attemptId : null;
+  if (PROOF_FAILED.includes(status)) {
+    return { ok: false, reasonCode: REASON.apply_proof_failed, params: { runId } };
+  }
+  if (status === "proved" && record2.treeHash === winnerTreeOf(manifest) && record2.patchSha256 === manifest.winnerAlias?.sha256) {
+    return { ok: true, proof: { status, attemptId: attemptId2, overridden: false } };
+  }
+  return allowUnproven === true ? { ok: true, proof: { status: status ?? "unavailable", attemptId: attemptId2, overridden: true } } : { ok: false, reasonCode: REASON.apply_proof_missing, params: { runId } };
+}
 async function inspectApplyScope({ manifest, project, wired, boundary }) {
   const tree = winnerTreeOf(manifest);
   if (tree === null) return { blocked: true, reasonCode: REASON.scope_index_unreadable };
-  const index = join35(boundary.scratch, "scope-index");
+  const index = join36(boundary.scratch, "scope-index");
   const seeded = await boundary.git(["read-tree", tree], { GIT_INDEX_FILE: index });
   if (seeded?.ok !== true) return { blocked: true, reasonCode: REASON.scope_index_unreadable };
   const readConfig = typeof wired.readProjectConfig === "function" ? wired.readProjectConfig : readProjectConfig;
@@ -44211,7 +44888,7 @@ async function projectOf(stateRoot, runId) {
   if (read2?.ok !== true) return read2;
   const row = read2.runs.find((one) => one.runId === runId) ?? null;
   const project = row?.project;
-  return { ok: true, project: typeof project === "string" && project !== "" && isAbsolute38(project) ? project : null };
+  return { ok: true, project: typeof project === "string" && project !== "" && isAbsolute39(project) ? project : null };
 }
 var FORWARDED_INSPECTION_CODES = /* @__PURE__ */ new Set([
   REASON.git_cli_unavailable,
@@ -44228,10 +44905,10 @@ var carryFailure = (source, runId) => failure({
   recovery: source.recovery,
   runId
 });
-async function applyRun({ stateRoot, runId, manifest, patchPath, checkOnly }, wired = {}) {
+async function applyRun({ stateRoot, runId, manifest, patchPath, checkOnly, proof }, wired = {}) {
   let patchBytes = null;
   try {
-    patchBytes = await readFile18(patchPath);
+    patchBytes = await readFile20(patchPath);
   } catch {
     return refuse2(REASON.apply_patch_unreadable, { runId, params: { path: patchPath } });
   }
@@ -44303,6 +44980,7 @@ async function applyRun({ stateRoot, runId, manifest, patchPath, checkOnly }, wi
     runId,
     applied: outcome.applied,
     checkOnly,
+    proof,
     mode: outcome.mode,
     staged: outcome.staged,
     verifiedBy: outcome.verifiedBy,
@@ -44342,6 +45020,7 @@ async function applyRun({ stateRoot, runId, manifest, patchPath, checkOnly }, wi
       runId,
       applied: outcome.applied,
       checkOnly,
+      proof,
       mode: outcome.mode,
       staged: outcome.staged,
       verifiedBy: outcome.verifiedBy,
@@ -44357,7 +45036,14 @@ async function applyRun({ stateRoot, runId, manifest, patchPath, checkOnly }, wi
     }),
     // ★ 값을 여기서 **고르지 않는다**(WS2 §3): `src/confidence.mjs` 가 도구별 표의 정본이고,
     //   `test/guards/confidence-literals.test.mjs` 가 이 자리의 리터럴을 금지한다.
-    confidence: confidenceOfApply({ applied: outcome.applied, verified: outcome.verifiedBy !== null }),
+    // ★ 리뷰 확인(Task 7 수정): `overridden` 을 나르지 않으면 `allow_unproven` 이 연 REAL apply가
+    //   git apply 성공 + 사후 확인 통과만으로 `verified` 를 낸다 — 증명된 적용과 구별되지 않는다.
+    //   `proof.overridden` 이 `proofGate` 가 이미 낸 값이므로 여기서는 나르기만 한다.
+    confidence: confidenceOfApply({
+      applied: outcome.applied,
+      verified: outcome.verifiedBy !== null,
+      overridden: proof.overridden === true
+    }),
     notice,
     runId
   });
@@ -44377,18 +45063,466 @@ async function runOrchApply(value, context) {
   const patchPath = winnerPatchPath(stateRoot, runId);
   let entry2 = null;
   try {
-    entry2 = await stat13(patchPath);
+    entry2 = await stat14(patchPath);
   } catch (error2) {
     return error2?.code === "ENOENT" ? refuse2(REASON.apply_patch_missing, { runId, params: { runId } }) : refuse2(REASON.apply_patch_unreadable, { runId, params: { path: patchPath } });
   }
   if (!entry2.isFile()) return refuse2(REASON.apply_patch_unreadable, { runId, params: { path: patchPath } });
+  const gate = await proofGate({
+    stateRoot,
+    runId,
+    manifest: read2.manifest,
+    allowUnproven: value.allow_unproven === true
+  }, wired);
+  if (gate.ok !== true) return refuse2(gate.reasonCode, { runId, params: gate.params });
   return applyRun({
     stateRoot,
     runId,
     manifest: read2.manifest,
     patchPath,
-    checkOnly: value.check_only === true
+    checkOnly: value.check_only === true,
+    proof: gate.proof
   }, wired);
+}
+
+// src/proof-stage.mjs
+import { readFile as readFile21 } from "node:fs/promises";
+import { isAbsolute as isAbsolute40, join as join37 } from "node:path";
+var PROOF_LANE = "prove";
+var MAX_EVIDENCE_ROWS = 8;
+var ordinalText2 = (ordinal2) => String(ordinal2).padStart(3, "0");
+async function recordedTestDeltaSha(manifest, candidateRef, read2) {
+  const entry2 = (manifest.evidenceRefs ?? []).find((one) => one.laneId === candidateRef.candidateId && one.attemptId === candidateRef.sourceAttemptId && one.kind === "c");
+  if (entry2 === void 0) return void 0;
+  let parsed;
+  try {
+    parsed = JSON.parse((await read2(entry2.ref.path)).toString("utf8"));
+  } catch {
+    return void 0;
+  }
+  const value = parsed?.testDeltaSha256;
+  if (value === null) return null;
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : void 0;
+}
+async function runProofStage({ stateRoot, runId, waitMs, onProgress, hostSignal } = {}, deps = {}) {
+  const now = typeof deps.now === "function" ? deps.now : Date.now;
+  const readManifest2 = deps.readRunManifest ?? readRunManifest;
+  const readJournal = deps.readRuns ?? readRuns;
+  const inspect = deps.inspectRepo ?? inspectRepo;
+  const acquire = deps.acquireProofLock ?? acquireProofLock;
+  const nextOrdinal = deps.nextProofOrdinal ?? nextProofOrdinal;
+  const openWorktree = deps.createWorktree ?? createWorktree;
+  const dropWorktree = deps.removeWorktree ?? removeWorktree;
+  const run3 = deps.runGit ?? runGit;
+  const identify = deps.revisionIdentity ?? revisionIdentity;
+  const derivePlan = deps.deriveFrozenTestPlan ?? deriveFrozenTestPlan;
+  const planConfig = deps.frozenTestPlanConfig ?? frozenTestPlanConfig;
+  const applyPatch = deps.applyPatchBytes ?? applyPatchBytes;
+  const snapshot = deps.snapshotStep ?? snapshotStep;
+  const listDelta = deps.listRevisionDelta ?? listRevisionDelta;
+  const collectPatch2 = deps.collectPatchAtRevision ?? collectPatchAtRevision;
+  const splitDelta = deps.splitTestOnlyDelta ?? splitTestOnlyDelta;
+  const makeCellWorktree = deps.createRevisionWorktree ?? createRevisionWorktree;
+  const provision = deps.provisionDependencies ?? provisionDependencies;
+  const runTests2 = deps.runFrozenTests ?? runFrozenTests;
+  const runEvidence = deps.runCandidateEvidence ?? runCandidateEvidence;
+  const writeRecord2 = deps.writeProofRecord ?? writeProofRecord;
+  const writeEvidence = deps.writeProofEvidence ?? writeProofEvidence;
+  const kill = deps.treeKill ?? treeKill;
+  const readBytes2 = deps.readFile ?? readFile21;
+  const refuse3 = (reasonCode, params, disputed = false) => ({
+    ok: false,
+    reasonCode,
+    ...params === void 0 ? {} : { params },
+    ...disputed ? { disputed: true } : {}
+  });
+  const progress = (phase2, extra = {}) => {
+    if (typeof onProgress !== "function") return;
+    try {
+      onProgress({ phase: phase2, runId, laneId: PROOF_LANE, role: "tests", step: 0, budget: 6, candidates: 1, ...extra });
+    } catch {
+    }
+  };
+  if (!usableRunId(runId)) return refuse3(REASON.proof_run_not_found, { runId: runIdText(runId) });
+  const read2 = await readManifest2({ stateRoot, runId });
+  if (read2.ok !== true) {
+    if (read2.reasonCode === REASON.state_root_not_absolute) return refuse3(read2.reasonCode);
+    return read2.reasonCode === REASON.status_run_not_found ? refuse3(REASON.proof_run_not_found, { runId }) : refuse3(REASON.proof_run_unreadable, { runId });
+  }
+  const manifest = read2.manifest;
+  const startedAt = now();
+  progress("preflight");
+  if (manifest.proofRequirement.required !== true) {
+    const ordinal2 = await nextOrdinal({ stateRoot, runId });
+    if (!Number.isSafeInteger(ordinal2) || ordinal2 < 1) {
+      return refuse3(REASON.proof_record_unreadable, { path: proofDir(stateRoot, runId) });
+    }
+    const record2 = {
+      schemaVersion: 1,
+      runId,
+      candidateId: manifest.selection?.selectedCandidateId ?? null,
+      attemptId: proofAttemptId(runId, ordinal2),
+      ordinal: ordinal2,
+      treeHash: null,
+      patchSha256: null,
+      planFingerprint: manifest.frozenTestPlan.planFingerprint,
+      environmentFingerprint: manifest.frozenTestPlan.environmentFingerprint,
+      testDeltaSha256: null,
+      status: "not_applicable",
+      repairable: false,
+      reasonCodes: [REASON.proof_not_required],
+      evidenceIds: [],
+      witnessIds: [],
+      startedAt,
+      finishedAt: now(),
+      expiresAt: manifest.expiresAt,
+      cost: { testRuns: { count: 0, totalMs: 0 } }
+    };
+    const written = await writeRecord2({ stateRoot, runId, record: record2 });
+    if (written?.ok !== true) return refuse3(REASON.proof_record_unreadable, { path: proofRecordPath(stateRoot, runId) });
+    progress("seal");
+    return { ok: true, record: written.record ?? record2, refused: false, notRequired: true, evidence: [] };
+  }
+  const selectedCandidateId = manifest.selection?.selectedCandidateId ?? null;
+  if (selectedCandidateId === null || manifest.winnerAlias === null) {
+    return refuse3(REASON.proof_candidate_unavailable, { runId });
+  }
+  const candidateRef = (manifest.candidateRefs ?? []).find((one) => one.candidateId === selectedCandidateId) ?? null;
+  if (candidateRef === null || candidateRef.patchRef === null || candidateRef.treeHash === null || candidateRef.sourceAttemptId === null) {
+    return refuse3(REASON.proof_candidate_unavailable, { runId });
+  }
+  const journal = await readJournal(stateRoot, { limit: Number.MAX_SAFE_INTEGER });
+  const row = journal?.ok === true ? journal.runs.find((one) => one.runId === runId) ?? null : null;
+  const project = typeof row?.project === "string" && row.project !== "" && isAbsolute40(row.project) ? row.project : null;
+  if (project === null) return refuse3(REASON.proof_project_unknown, { runId });
+  const inspected2 = await inspect(project);
+  if (inspected2?.ok !== true) return refuse3(REASON.proof_project_unusable, { path: project });
+  const lock = await acquire({ stateRoot, runId, pid: process.pid, nowMs: now() });
+  if (lock?.ok !== true) {
+    return lock?.reasonCode === REASON.proof_in_progress ? refuse3(REASON.proof_in_progress, { runId }) : refuse3(REASON.proof_record_unreadable, { path: proofDir(stateRoot, runId) });
+  }
+  let anchor = null;
+  let halt;
+  const children = /* @__PURE__ */ new Set();
+  const onAbort = () => {
+    for (const pid of children) void Promise.resolve(kill(pid)).catch(() => false);
+  };
+  try {
+    const ordinal2 = await nextOrdinal({ stateRoot, runId });
+    if (!Number.isSafeInteger(ordinal2) || ordinal2 < 1) {
+      return refuse3(REASON.proof_record_unreadable, { path: proofDir(stateRoot, runId) });
+    }
+    const purpose = `${PROOF_LANE}-${ordinalText2(ordinal2)}`;
+    const effectiveWaitMs = Number.isFinite(waitMs) && waitMs > 0 ? Math.ceil(Math.min(waitMs, MAX_WAIT_MS)) : MAX_WAIT_MS;
+    if (!Number.isSafeInteger(startedAt + effectiveWaitMs)) {
+      return refuse3(REASON.run_deadline_unrepresentable);
+    }
+    const deadlineAt = startedAt + effectiveWaitMs;
+    halt = haltSignal(timeoutSignal(Math.max(1, deadlineAt - now())), hostSignal);
+    halt.addEventListener("abort", onAbort, { once: true });
+    progress("worktree");
+    anchor = await openWorktree({
+      projectPath: project,
+      stateRoot,
+      runId,
+      worktreeId: makeWorktreeId({ runId, purpose }),
+      purpose
+    });
+    if (anchor?.ok !== true) return refuse3(REASON.proof_project_unusable, { path: project });
+    const reset = await run3({
+      args: ["reset", "--hard", manifest.baseline.commit],
+      cwd: anchor.path,
+      timeoutMs: WORKTREE_TIMEOUT_MS
+    });
+    if (reset?.ok !== true) return refuse3(REASON.proof_baseline_unavailable, { path: project });
+    const cleaned = await run3({ args: ["clean", "-xdf"], cwd: anchor.path, timeoutMs: WORKTREE_TIMEOUT_MS });
+    if (cleaned?.ok !== true) return refuse3(REASON.proof_baseline_unavailable, { path: project });
+    const baselineIdentity = await identify(anchor, manifest.baseline.commit);
+    if (baselineIdentity?.ok !== true || baselineIdentity.commit !== manifest.baseline.commit || baselineIdentity.tree !== manifest.baseline.tree) {
+      return refuse3(REASON.proof_baseline_unavailable, { path: project });
+    }
+    const source = {
+      ...anchor,
+      baseline: manifest.baseline.commit,
+      baselineIdentity: { commit: manifest.baseline.commit, tree: manifest.baseline.tree },
+      lastSnapshot: manifest.baseline.commit
+    };
+    progress("preflight");
+    const preliminary = await derivePlan(source.path, { projectConfigCommit: manifest.baseline.commit });
+    if (preliminary?.blocked === true) {
+      return refuse3(REASON.proof_environment_drift, { runId }, true);
+    }
+    const provisionedAnchor = await provision({
+      config: planConfig(preliminary),
+      baselineCommit: manifest.baseline.commit,
+      worktreePath: source.path,
+      stateRoot,
+      runId,
+      signal: halt
+    });
+    if (provisionedAnchor?.ok !== true) {
+      return {
+        ok: false,
+        blocked: true,
+        reasonCode: typeof provisionedAnchor?.reasonCode === "string" ? provisionedAnchor.reasonCode : REASON.deps_unavailable,
+        error: typeof provisionedAnchor?.error === "string" ? provisionedAnchor.error : "",
+        recovery: typeof provisionedAnchor?.recovery === "string" ? provisionedAnchor.recovery : ""
+      };
+    }
+    const plan = await derivePlan(source.path, { projectConfigCommit: manifest.baseline.commit });
+    if (plan?.blocked === true || plan?.planFingerprint !== manifest.frozenTestPlan.planFingerprint || plan?.environmentFingerprint !== manifest.frozenTestPlan.environmentFingerprint) {
+      return refuse3(REASON.proof_environment_drift, { runId }, true);
+    }
+    const postPlanCleaned = await run3({ args: ["clean", "-xdf"], cwd: anchor.path, timeoutMs: WORKTREE_TIMEOUT_MS });
+    if (postPlanCleaned?.ok !== true) return refuse3(REASON.proof_baseline_unavailable, { path: project });
+    progress("preflight");
+    const patchPath = join37(stateRoot, "patches", `${runId}.patch`);
+    let patch = null;
+    try {
+      patch = await readBytes2(patchPath);
+    } catch {
+      return refuse3(REASON.proof_candidate_unavailable, { runId });
+    }
+    if (patch.length !== manifest.winnerAlias.bytes || sha256(patch) !== manifest.winnerAlias.sha256) {
+      return refuse3(REASON.proof_candidate_mismatch, { runId }, true);
+    }
+    const applied = await applyPatch(source, { patch, sha256: manifest.winnerAlias.sha256 });
+    if (applied?.ok !== true) return refuse3(REASON.proof_candidate_mismatch, { runId }, true);
+    source.lastSnapshot = applied.commit;
+    const sealed = await snapshot(source, `bom-orch proof ${runId} ${purpose}`);
+    if (sealed?.ok !== true || sealed.changed !== false || sealed.commit !== applied.commit) {
+      return refuse3(REASON.proof_candidate_mismatch, { runId }, true);
+    }
+    const candidateIdentity = await identify(source, applied.commit);
+    if (candidateIdentity?.ok !== true || candidateIdentity.tree !== candidateRef.treeHash) {
+      return refuse3(REASON.proof_candidate_mismatch, { runId }, true);
+    }
+    progress("preflight");
+    const delta = await listDelta(source, { from: manifest.baseline.commit, to: applied.commit });
+    if (delta?.ok !== true || !Array.isArray(delta.entries)) {
+      return refuse3(REASON.proof_delta_mismatch, { runId }, true);
+    }
+    const testDelta = await splitDelta({
+      entries: delta.entries,
+      baselineRevision: manifest.baseline.commit,
+      candidateRevision: applied.commit,
+      testPlan: plan,
+      // 앵커는 baseline 바이트 그대로에서 패치만 얹은 트리라 무시 경로의 기준선이 비어 있다.
+      ignoredPaths: [],
+      unsafePaths: delta.unsafePaths ?? [],
+      candidateWorktree: source
+    }, { collectPatchAtRevision: collectPatch2 });
+    const recorded = await recordedTestDeltaSha(manifest, candidateRef, readBytes2);
+    const observed = testDelta?.status === "separable" ? testDelta.sha256 : null;
+    if (recorded === void 0 || recorded !== observed) {
+      return refuse3(REASON.proof_delta_mismatch, { runId }, true);
+    }
+    progress("tests");
+    const testQueue = createSerialTestQueue({ now });
+    const cache = /* @__PURE__ */ new Map();
+    const attemptId2 = proofAttemptId(runId, ordinal2);
+    let cell = 0;
+    const onSpawn = (child) => {
+      if (child !== null && typeof child === "object" && Number.isInteger(child.pid)) children.add(child.pid);
+      cell += 1;
+      progress("tests", { step: cell });
+      return true;
+    };
+    const createProofWorktree = async (spec, worktreeDeps) => {
+      const created = await makeCellWorktree(spec, worktreeDeps);
+      if (created?.ok !== true) return created;
+      const provisioned = await provision({
+        config: planConfig(plan),
+        baselineCommit: manifest.baseline.commit,
+        worktreePath: created.path,
+        stateRoot,
+        runId,
+        signal: halt
+      });
+      if (provisioned?.ok === true) return created;
+      await Promise.resolve(dropWorktree(created)).catch(() => null);
+      return {
+        ok: false,
+        blocked: true,
+        reasonCode: typeof provisioned?.reasonCode === "string" ? provisioned.reasonCode : REASON.deps_unavailable,
+        error: typeof provisioned?.error === "string" ? provisioned.error : "",
+        recovery: typeof provisioned?.recovery === "string" ? provisioned.recovery : ""
+      };
+    };
+    const outcome = await runEvidence({
+      runId,
+      laneId: PROOF_LANE,
+      attemptId: attemptId2,
+      stage: "prove",
+      baseline: manifest.baseline,
+      candidate: {
+        commit: applied.commit,
+        treeHash: candidateIdentity.tree,
+        patchSha256: manifest.winnerAlias.sha256,
+        testPlanFingerprint: plan.planFingerprint
+      },
+      frozenTestPlan: plan,
+      proofRequirement: manifest.proofRequirement,
+      testDelta,
+      deadlineAt,
+      testQueue,
+      cache
+    }, {
+      sourceWorktree: source,
+      stateRoot,
+      createRevisionWorktree: createProofWorktree,
+      revisionIdentity: identify,
+      runFrozenTests: runTests2,
+      removeWorktree: dropWorktree,
+      // ★ 러너는 `ref.candidateId !== spec.laneId` 를 persistence 실패로 센다. 증명 기록의 ref 는
+      //   레인을 모르므로(증명 디렉터리에는 레인이 없다) 여기서 붙인다 — 안 붙이면 여섯 칸이
+      //   전부 버려지고 결과가 `evidence_persistence_failed` 로 접힌다.
+      // ★ `expiresAt` 은 **필수 인자**다(`writeProofEvidence` 의 첫 줄이 그것 없이는 거부한다).
+      //   빠뜨리면 칸마다 `{ok:false}` 가 되고, 러너는 그것을 `evidence_persistence_failed` 로
+      //   세어 남은 칸을 끊는다 — 여섯 칸을 다 돌고도 결과가 언제나 `unavailable` 이 된다.
+      persistEvidence: async ({ record: record3 }) => {
+        const written2 = await writeEvidence({
+          stateRoot,
+          runId,
+          ordinal: ordinal2,
+          kind: record3.kind,
+          repetition: record3.repetition,
+          record: record3,
+          expiresAt: manifest.expiresAt
+        });
+        return written2?.ok === true ? { ok: true, ref: { ...written2.ref, candidateId: PROOF_LANE } } : { ok: false };
+      },
+      onSpawn
+    });
+    const halted = outcome.operationalFailure?.code ?? null;
+    if (halted === REASON.test_deadline_expired || halted === REASON.run_deadline_exceeded) {
+      return refuse3(REASON.run_deadline_exceeded, { runId });
+    }
+    if (halted === REASON.run_cancelled || hostSignal?.aborted === true) {
+      return refuse3(REASON.run_cancelled, { runId });
+    }
+    progress("seal");
+    const proof = outcome.regressionProof;
+    const record2 = {
+      schemaVersion: 1,
+      runId,
+      candidateId: selectedCandidateId,
+      attemptId: attemptId2,
+      ordinal: ordinal2,
+      treeHash: candidateIdentity.tree,
+      patchSha256: manifest.winnerAlias.sha256,
+      planFingerprint: plan.planFingerprint,
+      environmentFingerprint: plan.environmentFingerprint,
+      testDeltaSha256: observed,
+      status: proof.status,
+      repairable: proof.repairable === true,
+      reasonCodes: [...proof.reasonCodes],
+      evidenceIds: [...proof.evidenceIds],
+      witnessIds: [...proof.witnessIds],
+      startedAt,
+      finishedAt: now(),
+      // 증명은 그 실행과 **같은 날** 만료된다 — 실행이 사라진 뒤에 남은 증명은 가리킬 것이 없다.
+      expiresAt: manifest.expiresAt,
+      cost: { testRuns: testQueue.testRuns() }
+    };
+    const written = await writeRecord2({ stateRoot, runId, record: record2 });
+    if (written?.ok !== true) return refuse3(REASON.proof_record_unreadable, { path: proofRecordPath(stateRoot, runId) });
+    return {
+      ok: true,
+      record: written.record ?? record2,
+      refused: false,
+      evidence: (outcome.evidence ?? []).slice(0, MAX_EVIDENCE_ROWS).map((entry2) => ({
+        evidenceId: entry2.record.evidenceId,
+        kind: entry2.record.kind,
+        repetition: entry2.record.repetition,
+        outcome: entry2.record.classified?.outcome ?? "unknown",
+        witnessCount: Array.isArray(entry2.record.classified?.witnessIds) ? entry2.record.classified.witnessIds.length : 0
+      }))
+    };
+  } finally {
+    if (halt !== void 0) halt.removeEventListener?.("abort", onAbort);
+    if (anchor?.ok === true) {
+      await Promise.resolve(dropWorktree(anchor)).catch(() => null);
+    }
+    await Promise.resolve(lock.release()).catch(() => null);
+  }
+}
+
+// src/tools/prove.mjs
+var PATH_CHARS2 = 1024;
+var clipPath2 = (value, limit) => typeof value === "string" && value.length > limit ? `${value.slice(0, limit - 1)}\u2026` : value ?? null;
+var evidenceRow = (entry2) => ({
+  evidenceId: entry2.evidenceId,
+  kind: entry2.kind,
+  repetition: entry2.repetition,
+  outcome: entry2.outcome,
+  witnessCount: entry2.witnessCount
+});
+async function runOrchProve(value, context) {
+  const options = toProveOptions(value, context);
+  const wired = options.deps;
+  const stateRoot = typeof wired.stateRoot === "string" && wired.stateRoot !== "" ? wired.stateRoot : resolveStateRoot();
+  const stage = typeof wired.runProofStage === "function" ? wired.runProofStage : runProofStage;
+  const outcome = await stage({
+    stateRoot,
+    runId: options.runId,
+    waitMs: options.waitMs,
+    onProgress: options.onProgress,
+    hostSignal: options.hostSignal
+  }, wired);
+  if (outcome.ok !== true) {
+    const disputed = outcome.disputed === true;
+    return failure({
+      status: statusOfReasonCode(outcome.reasonCode),
+      reasonCode: outcome.reasonCode,
+      params: outcome.params,
+      ...disputed ? { confidence: confidenceOfProve({ refused: true }) } : {},
+      // 쓸 수 있는 이름일 때만 최상위에 싣는다 — 모양이 아닌 이름은 문장 안에서만 보이고
+      // 거기서는 `MAX_PARAM_CHARS` 가 자른다(`src/tools/apply.mjs` 의 같은 판단).
+      ...usableRunId(options.runId) ? { runId: options.runId } : {},
+      // ★ 프로비저너(`src/deps-provision.mjs`)는 앵커·셀 실패에서 이미 렌더된 `error`/`recovery`
+      //   를 들고 온다(`src/proof-stage.mjs` ~:338-345) — `{file}`/`{detail}` 을 그 문장에 채운
+      //   것은 프로비저너이지 이 관문이 아니고, 여기서 다시 `params` 없이 레지스트리에 넘기면
+      //   `safeRender` 가 그 자리표시자를 못 채워 던지고 일반 문구로 강등된다(`carryFailure`,
+      //   `src/tools/apply.mjs`:309 와 같은 자세). 문자열일 때만 나른다 — 거부(`refuse()`)는
+      //   이 둘을 안 주므로 영향이 없다.
+      ...typeof outcome.error === "string" ? { error: outcome.error } : {},
+      ...typeof outcome.recovery === "string" ? { recovery: outcome.recovery } : {}
+    });
+  }
+  const record2 = outcome.record;
+  const testRuns = record2.cost.testRuns;
+  const notApplicable = record2.status === "not_applicable";
+  const body = {
+    runId: record2.runId,
+    candidateId: record2.candidateId,
+    attemptId: record2.attemptId,
+    status: record2.status,
+    repairable: record2.repairable,
+    reasonCodes: [...record2.reasonCodes],
+    evidence: (outcome.evidence ?? []).map(evidenceRow),
+    // 벽시계는 기록의 두 시각에서 뺀다 — 두 번째 시계를 만들면 봉투와 기록이 갈린다.
+    cost: { elapsedMs: Math.max(record2.finishedAt - record2.startedAt, 0), testRuns },
+    path: clipPath2(proofRecordPath(stateRoot, record2.runId), PATH_CHARS2)
+  };
+  return success({
+    content: JSON.stringify(body),
+    // 바닥 한 장 — 증거 목록이 상한을 넘겨도 **무엇을 증명했는가**는 남는다. 이것이 없으면
+    // `success()` 가 본문을 `{"truncatedReport":true}` 로 조용히 갈아치운다.
+    contentFallback: JSON.stringify({
+      runId: record2.runId,
+      status: record2.status,
+      attemptId: record2.attemptId,
+      repairable: record2.repairable,
+      cost: { elapsedMs: Math.max(record2.finishedAt - record2.startedAt, 0), testRuns },
+      reduced: "floor"
+    }),
+    confidence: confidenceOfProve({ status: record2.status }),
+    // 유예된 증명이 실행에서 그랬듯, 「증명했다」와 「못 했다」는 조악값으로도 갈린다.
+    stopReason: record2.status === "proved" ? "verified" : "unverified",
+    reasonCode: notApplicable ? REASON.proof_not_required : void 0,
+    runId: record2.runId
+  });
 }
 
 // src/tools/reward.mjs
@@ -44623,7 +45757,7 @@ async function runOrchReward(value, context) {
 }
 
 // src/tools/stats.mjs
-import { join as join36 } from "node:path";
+import { join as join38 } from "node:path";
 var AXIS_NOTES = Object.freeze({
   mix: renderNotice("stats_axis_single_only"),
   placement: renderNotice("stats_placement_shared_cell"),
@@ -44828,8 +45962,8 @@ var blockedByStateSchema = (stateSchema) => {
   return reason === null ? null : failure({ status: "blocked", ...reason });
 };
 var snapshotFor = (stateRoot) => {
-  const path = join36(stateRoot, SNAPSHOT_FILE);
-  const generationPath = join36(stateRoot, GENERATIONS_SNAPSHOT_FILE);
+  const path = join38(stateRoot, SNAPSHOT_FILE);
+  const generationPath = join38(stateRoot, GENERATIONS_SNAPSHOT_FILE);
   return {
     path,
     generationPath,
@@ -45013,13 +46147,13 @@ async function runOrchStats(value, context) {
 }
 
 // src/tools/status.mjs
-import { join as join37 } from "node:path";
+import { join as join39 } from "node:path";
 var ISSUE_CLAIM_CHARS = 500;
 var JUDGE_RATIONALE_CHARS = 2e3;
 var DEFECT_CLAIM_CHARS = 1e3;
 var DEFECT_EVIDENCE_CHARS = 1e3;
 var PLAN_CONTENT_CHARS2 = 1200;
-var PATH_CHARS2 = 1024;
+var PATH_CHARS3 = 1024;
 var CODE_CHARS = 200;
 var PREVIEW_CHARS = TASK_PREVIEW_CHARS;
 var LOG_TEXT_CHARS = 400;
@@ -45036,6 +46170,11 @@ var readerFailure = (blocked, notices = []) => failure({
 var displayCode2 = (value) => typeof value === "string" ? normalizeLegacyReasonCode(value) ?? value : null;
 var finiteOrNull = (value) => Number.isFinite(value) ? value : null;
 var stringOrNull = (value) => typeof value === "string" ? value : null;
+var proofRow = (proof) => proof === null || typeof proof !== "object" ? null : {
+  status: clipped(proof.status ?? null, CODE_CHARS),
+  attemptId: clipped(proof.attemptId ?? null, CODE_CHARS),
+  finishedAt: finiteOrNull(proof.finishedAt ?? null)
+};
 var clipped = (value, limit) => {
   if (typeof value !== "string") return null;
   return value.length <= limit ? value : clipWhole(value, limit - 1);
@@ -45050,7 +46189,7 @@ function listingRow(run3) {
     reasonCode: clipped(displayCode2(run3.reasonCode), CODE_CHARS),
     startedAt: finiteOrNull(run3.startedAt),
     finishedAt: finiteOrNull(run3.finishedAt),
-    project: clipped(run3.project, PATH_CHARS2),
+    project: clipped(run3.project, PATH_CHARS3),
     taskPreview: clipped(run3.taskPreview, PREVIEW_CHARS),
     hasRunDir: run3.hasRunDir === true,
     hasLog: run3.hasLog === true
@@ -45233,7 +46372,7 @@ function runBody(input, rung) {
   const manifest = input.manifest.manifest;
   const attempts = input.attempts.attempts ?? [];
   const lines = input.log.lines ?? [];
-  const logPath = clipped(input.log.path, PATH_CHARS2);
+  const logPath = clipped(input.log.path, PATH_CHARS3);
   const omittedCounts = {
     logLines: (input.log.omitted ?? 0) + (withLog ? 0 : lines.length),
     logLinesUnparsable: input.log.unparsable ?? 0
@@ -45252,7 +46391,7 @@ function runBody(input, rung) {
     error: rendered?.error ?? null,
     recovery: rendered?.recovery ?? null,
     journal: input.journal.state,
-    project: clipped(row?.project ?? null, PATH_CHARS2),
+    project: clipped(row?.project ?? null, PATH_CHARS3),
     taskPreview: clipped(row?.taskPreview ?? null, PREVIEW_CHARS),
     // ★★ 시작 시각의 정본은 `startedAt` 이고 `at` 은 옛 행의 폴백이다(최종 리뷰 I8): `at` 은
     //   그 줄이 **쓰인** 시각이라 종료 행에서는 언제나 `finishedAt` 이상이고, 그것을 시작으로
@@ -45262,17 +46401,19 @@ function runBody(input, rung) {
     // ★ 재개의 출처. 이 값이 없으면 아래 attempt 서수가 3 부터 시작하는 이유를 어느 읽기 경로도
     //   말하지 못한다 — 그 사실이 남는 다른 채널은 로그의 `info` 줄뿐이고 꼬리가 그것을 거른다.
     resumedFrom: clipped(row?.resumedFrom ?? null, CODE_CHARS),
-    manifest: input.manifest.read
+    manifest: input.manifest.read,
+    // ★ 바닥까지 간다 — 「적용해도 되나」를 읽는 사람이 마지막까지 들고 가야 하는 사실이다.
+    proof: proofRow(input.proof ?? null)
   };
   const artifacts = {
-    runDir: clipped(input.paths.runDir, PATH_CHARS2),
-    manifestPath: clipped(input.paths.manifestPath, PATH_CHARS2),
-    candidatePaths: floor ? [] : (manifest?.candidateRefs ?? []).filter((candidate) => candidate.patchRef !== null).map((candidate) => clipped(candidate.patchRef.path, PATH_CHARS2)),
+    runDir: clipped(input.paths.runDir, PATH_CHARS3),
+    manifestPath: clipped(input.paths.manifestPath, PATH_CHARS3),
+    candidatePaths: floor ? [] : (manifest?.candidateRefs ?? []).filter((candidate) => candidate.patchRef !== null).map((candidate) => clipped(candidate.patchRef.path, PATH_CHARS3)),
     // ★ 매니페스트가 적어 둔 경로다 — 정본 정규화기는 32,768 까지 받으므로(`normalizeArtifactRef`)
     //   이 자리가 바닥에서 유계인 유일한 이유가 이 상한이다.
-    winnerPath: clipped(manifest?.winnerAlias?.path ?? null, PATH_CHARS2),
+    winnerPath: clipped(manifest?.winnerAlias?.path ?? null, PATH_CHARS3),
     // ★ 같은 이유로 유계다 — 이 경로도 매니페스트의 ref 가 적어 둔 값이다(32,768 까지 온다).
-    planPath: clipped(input.plan?.plan?.path ?? null, PATH_CHARS2),
+    planPath: clipped(input.plan?.plan?.path ?? null, PATH_CHARS3),
     logPath
   };
   if (floor) {
@@ -45363,7 +46504,7 @@ async function oneRun(stateRoot, runId) {
     if (!logKnows && !journalKnows) {
       const logUnreadable = tail.ok !== true && tail.reasonCode === REASON.status_run_unreadable;
       if (journal.state === "unreadable" || logUnreadable) {
-        const unreadableNotices = journal.state === "unreadable" ? [renderNotice("run_journal_unreadable", { reason: journal.error })] : [renderNotice("status_log_unreadable", { path: join37(stateRoot, "logs", `${runId}.jsonl`) })];
+        const unreadableNotices = journal.state === "unreadable" ? [renderNotice("run_journal_unreadable", { reason: journal.error })] : [renderNotice("status_log_unreadable", { path: join39(stateRoot, "logs", `${runId}.jsonl`) })];
         return readerFailure(fail(REASON.status_run_unreadable), unreadableNotices);
       }
       return readerFailure(manifest);
@@ -45382,17 +46523,20 @@ async function oneRun(stateRoot, runId) {
   const plan = planRead === null ? { read: "absent", reasonCode: null, plan: null } : planRead.ok === true ? { read: planRead.plan === null ? "absent" : "ok", reasonCode: null, plan: planRead.plan } : { read: "unreadable", reasonCode: planRead.reasonCode, plan: null };
   const notices = [];
   if (journal.state === "unreadable") notices.push(renderNotice("run_journal_unreadable", { reason: journal.error }));
-  const log = tail.ok === true ? { read: "ok", path: tail.path, present: tail.present, lines: tail.lines.map((line) => ({ ...line })), omitted: tail.omitted, unparsable: tail.unparsable } : { read: "unreadable", path: join37(stateRoot, "logs", `${runId}.jsonl`), present: false, lines: [], omitted: 0, unparsable: 0 };
+  const log = tail.ok === true ? { read: "ok", path: tail.path, present: tail.present, lines: tail.lines.map((line) => ({ ...line })), omitted: tail.omitted, unparsable: tail.unparsable } : { read: "unreadable", path: join39(stateRoot, "logs", `${runId}.jsonl`), present: false, lines: [], omitted: 0, unparsable: 0 };
   if (log.read === "unreadable") notices.push(renderNotice("status_log_unreadable", { path: log.path }));
+  const proofRead = await readProofRecord({ stateRoot, runId });
+  const proof = proofRead?.ok === true && proofRead.record !== null ? { status: proofRead.record.status, attemptId: proofRead.record.attemptId, finishedAt: proofRead.record.finishedAt } : null;
   return statusRunEnvelope({
     runId,
     journal,
+    proof,
     manifest: { read: manifestRead, manifest: readManifest2 ? manifest.manifest : null },
     attempts: { read: attempts.ok === true ? "ok" : "unreadable", attempts: attempts.attempts ?? [] },
     issues,
     plan,
     log,
-    paths: { runDir: join37(stateRoot, "runs", runId), manifestPath: join37(stateRoot, "runs", runId, "manifest.json") }
+    paths: { runDir: join39(stateRoot, "runs", runId), manifestPath: join39(stateRoot, "runs", runId, "manifest.json") }
   }, { notices });
 }
 async function runOrchStatus(value, context) {
@@ -45413,7 +46557,7 @@ var TOOL_SPECS = Object.freeze([
   }),
   Object.freeze({
     name: "orch_run",
-    description: "Orchestrate one task across two vendor CLIs: a worker edits inside a disposable git worktree, this server runs the tests itself, and a verifier reads the result without changing it. The result is a patch you can apply to your own repository. project must be an absolute path, because the working directory of an MCP stdio server is whatever the host handed down and is not fixed. Pass resume_run_id to continue an earlier run: its sealed attempts are read instead of run again, and this call spends its budget on what is left - every lane starts at the same attempt number, so both candidates get the same number of fresh attempts. That works only when the source tree and the test environment are exactly the ones that run was built on; otherwise the call is refused and nothing starts, so call again without the argument.",
+    description: "Orchestrate one task across two vendor CLIs: a worker edits inside a disposable git worktree, this server runs the tests itself, and a verifier reads the result without changing it. The result is a patch you can apply to your own repository. This call reports the regression proof as deferred - orch_prove runs it for the selected candidate. project must be an absolute path, because the working directory of an MCP stdio server is whatever the host handed down and is not fixed. Pass resume_run_id to continue an earlier run: its sealed attempts are read instead of run again, and this call spends its budget on what is left - every lane starts at the same attempt number, so both candidates get the same number of fresh attempts. That works only when the source tree and the test environment are exactly the ones that run was built on; otherwise the call is refused and nothing starts, so call again without the argument.",
     args: Object.freeze({
       // 설계 §8.2. 기본값은 **여기**가 권위다 — 엔진 기본값(budget 1 · waitMs 0)은
       // 라이브러리로서의 최소값이라 도구 층에서 설계값으로 덮는다.
@@ -45452,6 +46596,16 @@ var TOOL_SPECS = Object.freeze([
         required: false,
         default: false,
         description: "Explicitly allow this run to proceed with only one provider."
+      }),
+      // ★ 오너 결정 B(2026-08-31, 실측): 과제 글자로 증명 필요를 짐작하던 분류기가 라이브
+      //   실행에서 "고치세요" 를 놓쳐 증명 없이 통과했다 — 키워드 목록은 완비될 수 없으므로
+      //   기본을 fail-closed 로 뒤집는다. `classifyProofRequirement` 가 보는 것은 이 값
+      //   하나뿐이다(`src/engine.mjs` 호출부).
+      require_proof: Object.freeze({
+        type: "boolean",
+        required: false,
+        default: true,
+        description: "Whether the selected candidate needs the six-suite regression proof before orch_apply can apply it. The default is fail-closed: true, so orch_apply refuses the patch until orch_prove has proved it (or the caller passes allow_unproven there). Pass false only for a task whose patch needs no regression proof, such as documentation or prose."
       }),
       writer: Object.freeze({
         type: "string",
@@ -45536,13 +46690,25 @@ var TOOL_SPECS = Object.freeze([
     })
   }),
   Object.freeze({
-    name: "orch_apply",
-    // ★ 인자 둘의 권위는 WS0 §1.4 와 `contract/envelope.json` 이다. WS0 §1.4 가 함께 적은
-    //   `three_way`·`candidate_id` 는 **안 받는다** — 그 이유는 `src/tools/apply.mjs` 머리말에 있다.
-    description: "Apply a finished run's patch to your own repository. This is the explicit step: orch_run leaves the patch on disk and never applies it for you, so nothing reaches your working tree until this call is made. It refuses, each with its own registered code, a run this state root does not hold, a run whose records cannot be read, and a run whose patch is gone or is not a file. Pass check_only to have the call report what it would do and change nothing. orch_status is where a run_id comes from.",
+    name: "orch_prove",
+    // ★ 인자 둘의 권위는 설계 2026-08-28 §1.1 이다. `wait_ms` 의 두 수는 `orch_run` 과 **같은
+    //   규칙**이고(기본 1,800,000 · 상한 `MAX_WAIT_MS`), 그것이 이 도구가 존재하는 이유의 절반이다:
+    //   실행 9 는 증명 여섯 번이 55분 상한에 안 들어가 잘렸다(2026-08-28 실측).
+    description: "Run the six-suite regression proof for the candidate a finished run selected, and write the result under this server state root. orch_run no longer proves: it runs the candidate suite twice and reports the proof as deferred, and this call runs the remaining four cells - the baseline twice, and the baseline with the candidate test files twice - against a worktree it rebuilds from the run's own manifest. It refuses, each with its own registered code, a run this state root does not hold, a run whose baseline commit or frozen test plan no longer reproduces, and a candidate whose tree or test delta no longer matches what the run recorded. It applies nothing and writes not one byte into the run directory. orch_apply reads what this call writes, so call it before you apply. orch_status is where a run_id comes from.",
     args: Object.freeze({
       run_id: Object.freeze({ type: "string", required: true }),
-      check_only: Object.freeze({ type: "boolean", required: false, default: false })
+      wait_ms: Object.freeze({ type: "number", min: 0, required: false, default: 18e5 })
+    })
+  }),
+  Object.freeze({
+    name: "orch_apply",
+    // ★ 인자 셋의 권위는 WS0 §1.4 와 `contract/envelope.json` 이다. WS0 §1.4 가 함께 적은
+    //   `three_way`·`candidate_id` 는 **안 받는다** — 그 이유는 `src/tools/apply.mjs` 머리말에 있다.
+    description: "Apply a finished run's patch to your own repository. This is the explicit step: orch_run leaves the patch on disk and never applies it for you, so nothing reaches your working tree until this call is made. It refuses, each with its own registered code, a run this state root does not hold, a run whose records cannot be read, and a run whose patch is gone or is not a file. Pass check_only to have the call report what it would do and change nothing. A run whose task needed a regression proof is refused until orch_prove has proved this exact patch, unless allow_unproven is passed, which never lifts a proof that ran and failed. orch_status is where a run_id comes from.",
+    args: Object.freeze({
+      run_id: Object.freeze({ type: "string", required: true }),
+      check_only: Object.freeze({ type: "boolean", required: false, default: false }),
+      allow_unproven: Object.freeze({ type: "boolean", required: false, default: false })
     })
   }),
   Object.freeze({
@@ -45847,6 +47013,7 @@ var HANDLERS = {
   orch_config: runOrchConfig,
   orch_stats: runOrchStats,
   orch_status: runOrchStatus,
+  orch_prove: runOrchProve,
   orch_apply: runOrchApply,
   orch_reward: runOrchReward,
   orch_reset: runOrchReset

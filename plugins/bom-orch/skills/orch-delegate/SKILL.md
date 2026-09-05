@@ -1,6 +1,6 @@
 ---
 name: orch-delegate
-description: Hand a coding task to another vendor's CLI and get it cross-checked. The result is a patch file that nothing applies for you; orch_apply is the explicit step that puts it in your repository. If the call is cut off, read the run back with orch_status.
+description: Hand a coding task to another vendor's CLI and get it cross-checked. The result is a patch file that nothing applies for you; orch_prove runs the regression proof before you apply, and orch_apply is the explicit step that puts it in your repository. If the call is cut off, read the run back with orch_status.
 ---
 
 # Delegating a task and cross-checking it
@@ -22,13 +22,17 @@ It names the next safe action; `REASON_CODES.md` at the plugin root lists every 
 | `orch_run` | `wait_ms` | optional | `1800000` | number >= 0 |
 | `orch_run` | `candidates` | optional | `1` | `1`, `2` |
 | `orch_run` | `allow_single` | optional | `false` | — |
+| `orch_run` | `require_proof` | optional | `true` | — |
 | `orch_run` | `resume_run_id` | optional | — | — |
 | `orch_run` | `scope_allow` | optional | — | — |
 | `orch_run` | `writer` | optional | — | `claude`, `codex` |
 | `orch_status` | `run_id` | optional | — | — |
 | `orch_status` | `runs` | optional | `10` | integer 1-50 |
+| `orch_prove` | `run_id` | required | — | — |
+| `orch_prove` | `wait_ms` | optional | `1800000` | number >= 0 |
 | `orch_apply` | `run_id` | required | — | — |
 | `orch_apply` | `check_only` | optional | `false` | — |
+| `orch_apply` | `allow_unproven` | optional | `false` | — |
 
 - `task` — what to do; the more specific, the better.
 - `project` — an **absolute path** to a git repository. This server's working directory is
@@ -39,6 +43,9 @@ It names the next safe action; `REASON_CODES.md` at the plugin root lists every 
   After it passes no new provider, test or judge call starts and only existing artifacts survive.
 - `candidates` — how many independent candidates to run. `2` uses both providers with a
   per-lane `budget` and cannot be combined with `allow_single`.
+- `require_proof` — whether the selected candidate needs the regression proof before `orch_apply`
+  can apply it. Defaults to `true` (fail-closed): pass `false` only for a task whose patch needs
+  no regression proof, such as documentation or prose.
 - `isolation` — one value today: vendor CLI tool-permission flags were measured not to
   constrain the worker's shell, so the disposable worktree is the only isolation that holds.
 - `scope_allow` — globs (POSIX style, `**` allowed) for paths this task is expected to change,
@@ -58,9 +65,11 @@ It names the next safe action; `REASON_CODES.md` at the plugin root lists every 
 ★ **`candidates: 2` roughly doubles the provider, writer and test cost.** Both lanes write, both
 cross-check, and regression evidence is produced once per lane.
 
-★ **Regression proof multiplies the test runs.** A run that must prove a regression runs your
-whole test suite up to six times in series per candidate per attempt, against two for a run that
-needs no proof — 22 at the default `budget: 5`. `cost.testRuns` reports it, `preflight.warnings` predicts it.
+★ **Regression proof runs once, in `orch_prove`.** In `orch_run` the whole test suite runs twice
+per candidate per attempt (`c-1` and `c-2`) and the proof is reported as `deferred` — 10 serial
+suite runs at the default `budget: 5`, 20 with `candidates: 2`. The regression proof itself — the
+whole suite six times against two baselines — is run once by `orch_prove`, for the selected
+candidate only. `cost.testRuns` reports it, `preflight.warnings` predicts it.
 
 ★ **`allow_single` defaults to `false`.** Calling `orch_run` asks for cross-checking and one vendor
 alone betrays that request. Turning it on is what gives the `mix` axis a second arm — see orch-learn.
@@ -123,7 +132,8 @@ advance — such a run is flagged and still judged on its evidence like any othe
 
 `artifacts.manifestPath` and `artifacts.candidatePaths` are **absolute paths**; `artifacts.expiresAt`
 is when this server's cleanup may delete them. `regressionProof.status` matters for a run that needs
-regression proof — the default for code work unless the task reads as a feature, refactor, or docs change.
+regression proof — every run needs it by default (fail-closed) unless `orch_run` was called with
+`require_proof: false`.
 
 ★ **Retention and manual cleanup.** The default state root is `~/.bom-orch` (or the exact absolute `BOM_ORCH_HOME` you set).
 Patches, run records, and logs expire after 30 days; disposable scratch rooms after 6 hours; `effect_unknown` worktrees after 30 days; and the private npm cache after 30 idle days.
@@ -173,6 +183,23 @@ your own user's privileges inside the disposable worktree — never on a reposit
 ★ **Models are not chosen here.** Which vendor runs which role is decided by configuration and
 learning; to change it, see the orch-model skill, which also says where the names come from.
 
+## Proving the patch
+
+`orch_run` no longer proves. Each attempt runs the candidate suite twice, and the finished run
+reports `regressionProof.status: "deferred"` with `regressionProof.next: "orch_prove"`.
+`orch_prove` takes that `run_id` and runs the four remaining cells against the run's selected
+candidate: the baseline twice, and the baseline with the candidate's test files twice. It rebuilds
+a worktree from the run's own manifest, so it refuses with a `proof_*` code when the baseline
+commit is gone, the frozen test plan no longer reproduces, or the candidate tree or test delta
+no longer matches what the run recorded. Those three mismatches come back `disputed`: the record
+and the reproduction disagree, and nothing was run.
+
+★ **The six suite runs live here now, not in the run.** One call proves one candidate.
+`wait_ms` is that call's own deadline, `cost.testRuns` reports what it spent, the result is written
+under `<stateRoot>/proofs/<run_id>/`, and nothing is applied.
+
+The order is `orch_run` → read the result → `orch_prove` → `orch_apply`.
+
 ## Applying the patch
 
 `orch_apply` takes the `run_id` of a finished run and puts that run's patch into your repository.
@@ -193,6 +220,13 @@ run is on this state root, that its records read cleanly, and that the patch its
 a file. Each of those refusals carries its own registered reason code: apply-specific gates use an
 `apply_*` code, while state_root_not_absolute and learning_journal_read_failed stay exact. Thus
 "there is no such run" and "the patch was already reclaimed" never arrive as the same answer. `check_only: true` asks for the report without the change.
+
+★ **The proof is checked before anything is written.** `orch_run` does not prove a regression any
+more; `orch_prove` does, for the one candidate you are about to apply. A run whose task needed a
+proof is refused with `apply_proof_missing` until that proof exists and names this patch's tree and
+bytes, and with `apply_proof_failed` when the proof ran and did not hold. `allow_unproven: true`
+applies anyway on the first refusal and never on the second, and the body says which happened: a
+proof row carries `{status, attemptId, overridden}` on every success, `check_only` included.
 
 ★ **A run with no representative patch cannot be applied.** A `tie` and a `none` leave nothing under
 `patch.path`, and the cleanup reclaims patch files on its own schedule, so a missing-patch refusal is

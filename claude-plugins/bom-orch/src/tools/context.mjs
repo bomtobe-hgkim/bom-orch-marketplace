@@ -1,6 +1,6 @@
 // src/tools/context.mjs
 /**
- * `orch_run`·`orch_models`·`orch_config`·`orch_stats`·`orch_reward` 다섯 핸들러가 공유하는
+ * `orch_run`·`orch_prove`·`orch_models`·`orch_config`·`orch_stats`·`orch_reward` 여섯 핸들러가 공유하는
  * 배선 — `context` 를 엔진 의존성으로 옮기는 자리 하나(`toEngineDeps`/`toEngineOptions`)와,
  * 최근 실행·정정 대상 실행이 남긴 artifact ref 를 실측하는 자리 하나(`inspectJournalArtifacts`).
  *
@@ -13,7 +13,7 @@
 import { inspectArtifactRefs } from '../run-inspect.mjs';
 
 /**
- * `context` 의 어느 필드가 엔진의 어디로 가는가 — 다섯 핸들러가 같은 계약을 쓴다.
+ * `context` 의 어느 필드가 엔진의 어디로 가는가 — 여섯 핸들러가 같은 계약을 쓴다.
  *
  * ★ 왜 한자리에 모으는가(실측): 예전에는 `orch_run` 이 `stateRoot` 를 **최상위 옵션**으로
  *   넘겼는데 엔진은 `deps.stateRoot` 만 읽었다. 그래서 `callTool(name, args, { stateRoot })`
@@ -58,6 +58,10 @@ export function toEngineOptions(value, context) {
     writer: value.writer,
     // ☞ 태스크 8 이 읽는다: `decide({ allowed: { single: options.allowSingle === true } })`.
     allowSingle: value.allow_single === true,
+    // ★ 오너 결정 B(2026-08-31). `classifyProofRequirement` 가 보는 유일한 입력이라 그대로
+    //   흘려보낸다 — 여기서 `=== true`/`=== false` 로 좁히면 그 좁힘 규칙이 분류기의 fail-closed
+    //   규칙과 두 자리에서 따로 살게 된다. `validateArgs` 를 지난 값은 이미 boolean 이다.
+    requireProof: value.require_proof,
     // 재개(WS3 §0-R1). 인자가 없으면 `undefined` 여야 한다 — 엔진의 화이트리스트에서 「재개하지
     // 않음」은 키의 부재이고, `null` 이나 `''` 을 흘려보내면 그것이 이름으로 취급된다.
     resumeRunId: value.resume_run_id,
@@ -73,6 +77,33 @@ export function toEngineOptions(value, context) {
     //   ★ `instanceof` 가 아니라 엔진과 **같은 오리 검사**다(리뷰 소견): cross-realm/vm 에서 온
     //     진짜 신호는 instanceof 에 떨어져 조용히 사라지는데, 엔진의 검증은 그 신호를 받는다 —
     //     두 검사가 갈리면 한쪽만 아는 값이 생긴다.
+    hostSignal: context?.hostSignal !== null && typeof context?.hostSignal === 'object' &&
+      typeof context.hostSignal.aborted === 'boolean' && typeof context.hostSignal.addEventListener === 'function'
+      ? context.hostSignal : undefined,
+    deps: toEngineDeps(context),
+  };
+}
+
+/**
+ * 검증을 통과한 `orch_prove` 인자를 증명 단계의 옵션으로 옮긴다.
+ *
+ * ★ 왜 `toEngineOptions` 옆에 있고 그것을 재사용하지 않는가: 두 도구가 공유하는 것은 **호스트
+ *   배선 둘**(`onProgress`·`hostSignal`)과 `deps` 뿐이고, 나머지 열 개 키는 증명에 아무 뜻이
+ *   없다. 재사용하면 `task: undefined`·`budget: undefined` 를 들고 증명 단계로 가고, 그러면
+ *   화이트리스트를 가진 쪽이 「호출자가 준 적 없는 키」를 검증하게 된다.
+ *
+ * ★ `hostSignal` 의 오리 검사는 `toEngineOptions` 와 **글자까지 같다**(cross-realm/vm 에서 온
+ *   진짜 신호는 `instanceof` 에 떨어져 조용히 사라진다). 두 검사가 갈리면 같은 호스트 취소가
+ *   도구마다 다르게 도착한다.
+ *
+ * ★ 2026-08-28 실측: 실행 9 는 55분 상한에 잘렸다. 증명이 자기 호출을 갖게 된 지금 `wait_ms`
+ *   는 **그 호출 하나의** 마감이고, 이 자리가 그것을 나르는 유일한 이음매다.
+ */
+export function toProveOptions(value, context) {
+  return {
+    runId: value.run_id,
+    waitMs: value.wait_ms,
+    onProgress: typeof context?.onProgress === 'function' ? context.onProgress : undefined,
     hostSignal: context?.hostSignal !== null && typeof context?.hostSignal === 'object' &&
       typeof context.hostSignal.aborted === 'boolean' && typeof context.hostSignal.addEventListener === 'function'
       ? context.hostSignal : undefined,

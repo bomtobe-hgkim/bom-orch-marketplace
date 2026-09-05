@@ -224,6 +224,7 @@ async function run({
     evalTokens: runResult.usage?.outputTokens ?? null,
     truncated,
     doneReason,
+    hung: runResult.hung === true, // 끊은 뒤에도 파이프가 안 닫혔다(run-cli) — settle 로그 줄이 싣는 한 비트.
     // notice 는 답변이 아니라 실행에 대한 진술이다 — content 에 이어붙이지 않는다.
     notice: sandboxNotice(role, platform),
     // 실패가 아니면 null 이다. 키 자체는 항상 있다(위 unstarted 의 이유와 같다).

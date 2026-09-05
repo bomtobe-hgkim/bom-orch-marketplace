@@ -8,7 +8,7 @@
  * 만들 수 없다. 사용자 저장소 적용기(`src/apply-patch.mjs`)와 공유하는 것은 값이 같은
  * 타임아웃과 객체 id 판정뿐이다. 두 적용기의 복구·커밋 권한은 의도적으로 합치지 않는다.
  *
- * ★ 실측 폐포: **18개 모듈 / 6,220줄**(자기 자신 466 포함) — 저장소와 엔진은 0개다.
+ * ★ 실측 폐포: **18개 모듈 / 6,337줄**(자기 자신 496 포함) — 저장소와 엔진은 0개다.
  */
 import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
@@ -116,6 +116,15 @@ export function createWorktreePatchOperations({
     if (typeof expectedSha !== 'string' || !SHA256_PATTERN.test(expectedSha)) {
       return fail(REASON.worktree_patch_digest_invalid);
     }
+    // ★ `allowIgnored` 는 기본 `false` 다 — 나머지 두 옵션과 같은 자리에서, 같은 셰이프로
+    //   검증한다. `undefined`(안 준 것)만 false 로 접고, 그 밖의 비 boolean 은 다른 스펙
+    //   결함과 같은 사유(`worktree_patch_bytes_invalid`)로 fail-closed 한다 — 조용히 false 로
+    //   접으면 호출자가 오타(`allowIgnored: 'true'`)를 넣었을 때 그대로 엄격 모드로 통과해
+    //   버그가 숨는다.
+    if (options.allowIgnored !== undefined && typeof options.allowIgnored !== 'boolean') {
+      return fail(REASON.worktree_patch_bytes_invalid);
+    }
+    const allowIgnored = options.allowIgnored === true;
     const actualSha = createHash('sha256').update(patch).digest('hex');
     if (actualSha !== expectedSha) {
       return fail(REASON.worktree_patch_digest_mismatch);
@@ -126,8 +135,27 @@ export function createWorktreePatchOperations({
     const run = deps?.run ?? runGit;
     const original = await resolveRevisionIdentity({ run, cwd: paths.path, revision: 'HEAD', requireExact: false });
     if (original.blocked) return original;
+    // ★★ 기본은 `--ignored=matching` 로 무시된 항목까지 pristine 판정에 넣는다 — 레인/재시도
+    //   패치는 **손대지 않은** 트리에만 얹혀야 하고(무시된 산출물이 있다는 것 자체가 워크트리가
+    //   더 이상 그때 그 바닥이 아니라는 신호다), 이 검사가 느슨해지면 조용히 섞여든 빌드
+    //   산출물 위에 패치가 얹혀서 다음 스텝이 뭘 보고 있는지 아무도 모르게 된다.
+    //
+    //   `allowIgnored:true` 는 그 규칙의 **유일한** 예외다: 증거 셀(`br`)의 워크트리는
+    //   `createWorktree` 가 만들자마자 그 자리에서 lockfile 로 `node_modules/` 를 심는다
+    //   (레인은 `createEvidenceWorktree`(`src/run-lane-adapters.mjs`), prove 는
+    //   `createProofWorktree`(`src/proof-stage.mjs`)) — 그 뒤에야 이 함수가 테스트 전용
+    //   델타를 얹는다. 그 `node_modules/` 는 침입이 아니라 **이번 실행이 기록한 환경 그
+    //   자체**다. 실행 10, prove attempt 3(2026-08-31) 실측: `tests.provisionDeps:
+    //   'lockfile-install'` 켜진 여섯 칸 증명에서 c/1·b0/1·b0/2 가 초록으로 끝난 뒤 br/1 이
+    //   `--ignored=matching` 에 걸려 `worktree_not_pristine` → `test_delta_apply_failed` 로
+    //   죽었고 증명 전체가 `unavailable` 로 기록됐다(`cost.testRuns.count` 4). b0/c 는 이
+    //   함수를 아예 안 부르고, provisioning 이 없으면 `node_modules/` 도 없어 통과했으므로
+    //   실행 1~9 나 어떤 단위 테스트도 이 자리를 밟지 못했다.
+    const pristineArgs = allowIgnored
+      ? ['status', '--porcelain', '-z']
+      : ['status', '--porcelain', '-z', '--ignored=matching'];
     const pristine = await run({
-      args: ['status', '--porcelain', '-z', '--ignored=matching'],
+      args: pristineArgs,
       cwd: paths.path,
       timeoutMs: WORKTREE_TIMEOUT_MS,
     }).catch(() => null);
@@ -232,8 +260,10 @@ export function createWorktreePatchOperations({
         }
         return identity;
       }
+      // ★ 같은 `allowIgnored` 로 같은 완화다 — 사전 pristine 검사가 통과시킨 무시 경로를
+      //   사후 clean 검사가 다시 걸어 넣으면(둘이 다른 인자를 쓰면) 위 예외가 반쪽만 선다.
       const clean = await run({
-        args: ['status', '--porcelain', '-z', '--ignored=matching'],
+        args: pristineArgs,
         cwd: paths.path,
         timeoutMs: WORKTREE_TIMEOUT_MS,
       }).catch(() => null);

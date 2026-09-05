@@ -86,8 +86,8 @@ easier to know now than after the first `unverified`.
 
 `verified` needs machine evidence this server can read from your own test run. Where a row says
 witness-capable, that evidence also says which test covered which changed file — what a run that
-needs regression proof must show, and that is the default for code work unless the task reads as
-a feature, refactor, or docs change. Where it says parsed only, the evidence is the outcome and
+needs regression proof must show, and every run needs it by default (fail-closed) unless `orch_run`
+was called with `require_proof: false`. Where it says parsed only, the evidence is the outcome and
 nothing more, but it is still cross-checked against your test command's exit code: a runner that
 exits 0 while its own report says failures is caught, and the run is credited with no outcome
 rather than a pass.
@@ -162,7 +162,7 @@ codex plugin add bom-orch@bom-orch-marketplace
 
 ### Confirm it loaded
 
-Open a new host session and check that all eight `orch_*` tools are present, then
+Open a new host session and check that all nine `orch_*` tools are present, then
 call `orch_models`. Neither step spends model tokens. If nothing appeared at all,
 start from [Troubleshooting](#troubleshooting).
 
@@ -183,8 +183,8 @@ remote process identity and distributed-filesystem locking are not supported.
 Pin a released tag instead of tracking `main`:
 
 ```powershell
-claude plugin marketplace add bomtobe-hgkim/bom-orch-marketplace@v1.0.1 --scope user
-codex plugin marketplace add bomtobe-hgkim/bom-orch-marketplace --ref v1.0.1
+claude plugin marketplace add bomtobe-hgkim/bom-orch-marketplace@v1.1.0 --scope user
+codex plugin marketplace add bomtobe-hgkim/bom-orch-marketplace --ref v1.1.0
 ```
 
 Claude Code:
@@ -260,7 +260,7 @@ ride on every envelope and are the only two fields left out here:
 ```json
 {
   "status": "succeeded",
-  "content": "{\"runId\":\"run-golden\",\"stopReason\":\"verified\",\"reasonCode\":\"lane_verified\",\"stepCount\":10,\"baseline\":{\"commit\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"tree\":\"cccccccccccccccccccccccccccccccccccccccc\",\"dirty\":true,\"dirtyFiles\":[\"docs/notes.md\",\"src/lane-a/000-changed-module.mjs\"]},\"patch\":{\"path\":\"/golden/state/patches/run-golden.patch\"},\"scope\":{\"flagged\":false,\"hardViolation\":false,\"allowlisted\":false,\"reasonCount\":2,\"omittedReasonCount\":0},\"worktree\":{\"transplanted\":true,\"ignoredPathCount\":16,\"sharedRuleCount\":0,\"cleanup\":{\"removed\":true,\"unregistered\":true,\"tracked\":false}},\"blockers\":[],\"learning\":null,\"plan\":{\"provider\":\"claude\",\"content\":null,\"source\":\"model\"},\"steps\":[],\"verdict\":{\"candidateId\":\"lane-a\",\"attemptId\":\"run-golden/lane-a/010\",\"verdict\":\"PASS\"},\"issues\":[{\"candidateId\":\"lane-a\",\"openIssueIds\":[],\"openIssueCount\":0,\"resolvedOmittedCount\":0}],\"candidates\":[{\"candidateId\":\"lane-a\",\"patch\":{\"path\":\"/golden/state/runs/run-golden/candidates/lane-a.patch\"},\"proofStatus\":\"proved\",\"openIssueIds\":[],\"openIssueCount\":0}],\"attempts\":[],\"regressionProof\":{\"status\":\"proved\",\"selectedCandidateId\":\"lane-a\",\"evidenceRefs\":[],\"omittedEvidenceCount\":0},\"selection\":{\"outcome\":\"winner\",\"selectedCandidateId\":\"lane-a\"},\"artifacts\":{\"manifestPath\":\"/golden/state/runs/run-golden/manifest.json\",\"candidatePaths\":[\"/golden/state/runs/run-golden/candidates/lane-a.patch\"],\"omittedCount\":0},\"cost\":{\"elapsedMs\":1234567,\"providers\":{\"claude\":{\"calls\":12,\"promptTokens\":1234567,\"evalTokens\":1234567},\"codex\":{\"calls\":9,\"promptTokens\":1234567,\"evalTokens\":1234567}},\"testRuns\":{\"count\":6,\"totalMs\":1098765}},\"omittedCounts\":{\"issues\":0,\"attempts\":10,\"evidence\":0,\"files\":22,\"artifacts\":0,\"scopeReasons\":2,\"blockers\":1,\"planChars\":66},\"reduced\":\"floor\"}",
+  "content": "{\"runId\":\"run-golden\",\"stopReason\":\"verified\",\"reasonCode\":\"lane_verified\",\"stepCount\":10,\"baseline\":{\"commit\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"tree\":\"cccccccccccccccccccccccccccccccccccccccc\",\"dirty\":true,\"dirtyFiles\":[\"docs/notes.md\",\"src/lane-a/000-changed-module.mjs\"]},\"patch\":{\"path\":\"/golden/state/patches/run-golden.patch\"},\"scope\":{\"flagged\":false,\"hardViolation\":false,\"allowlisted\":false,\"reasonCount\":2,\"omittedReasonCount\":0},\"worktree\":{\"transplanted\":true,\"ignoredPathCount\":16,\"sharedRuleCount\":0,\"cleanup\":{\"removed\":true,\"unregistered\":true,\"tracked\":false}},\"blockers\":[],\"learning\":null,\"plan\":{\"provider\":\"claude\",\"content\":null,\"source\":\"model\"},\"steps\":[],\"verdict\":{\"candidateId\":\"lane-a\",\"attemptId\":\"run-golden/lane-a/010\",\"verdict\":\"PASS\"},\"issues\":[{\"candidateId\":\"lane-a\",\"openIssueIds\":[],\"openIssueCount\":0,\"resolvedOmittedCount\":0}],\"candidates\":[{\"candidateId\":\"lane-a\",\"patch\":{\"path\":\"/golden/state/runs/run-golden/candidates/lane-a.patch\"},\"proofStatus\":\"deferred\",\"openIssueIds\":[],\"openIssueCount\":0}],\"attempts\":[],\"regressionProof\":{\"status\":\"deferred\",\"next\":\"orch_prove\",\"selectedCandidateId\":\"lane-a\",\"evidenceRefs\":[],\"omittedEvidenceCount\":0},\"selection\":{\"outcome\":\"winner\",\"selectedCandidateId\":\"lane-a\"},\"artifacts\":{\"manifestPath\":\"/golden/state/runs/run-golden/manifest.json\",\"candidatePaths\":[\"/golden/state/runs/run-golden/candidates/lane-a.patch\"],\"omittedCount\":0},\"cost\":{\"elapsedMs\":1234567,\"providers\":{\"claude\":{\"calls\":12,\"promptTokens\":1234567,\"evalTokens\":1234567},\"codex\":{\"calls\":9,\"promptTokens\":1234567,\"evalTokens\":1234567}},\"testRuns\":{\"count\":2,\"totalMs\":1098765}},\"omittedCounts\":{\"issues\":0,\"attempts\":10,\"evidence\":0,\"files\":22,\"artifacts\":0,\"scopeReasons\":2,\"blockers\":1,\"planChars\":66},\"reduced\":\"floor\"}",
   "confidence": "verified",
   "runId": "run-golden",
   "stopReason": "verified",
@@ -278,7 +278,7 @@ Parsed, and abridged here to 9 of its 22 top-level keys, the same run reads:
   "reasonCode": "lane_verified",
   "patch": { "path": "/golden/state/patches/run-golden.patch" },
   "verdict": { "candidateId": "lane-a", "attemptId": "run-golden/lane-a/010", "verdict": "PASS" },
-  "regressionProof": { "status": "proved", "selectedCandidateId": "lane-a", "evidenceRefs": [], "omittedEvidenceCount": 0 },
+  "regressionProof": { "status": "deferred", "next": "orch_prove", "selectedCandidateId": "lane-a", "evidenceRefs": [], "omittedEvidenceCount": 0 },
   "selection": { "outcome": "winner", "selectedCandidateId": "lane-a" },
   "cost": {
     "elapsedMs": 1234567,
@@ -286,7 +286,7 @@ Parsed, and abridged here to 9 of its 22 top-level keys, the same run reads:
       "claude": { "calls": 12, "promptTokens": 1234567, "evalTokens": 1234567 },
       "codex": { "calls": 9, "promptTokens": 1234567, "evalTokens": 1234567 }
     },
-    "testRuns": { "count": 6, "totalMs": 1098765 }
+    "testRuns": { "count": 2, "totalMs": 1098765 }
   },
   "reduced": "floor"
 }
@@ -299,7 +299,7 @@ is what the server's own test runs showed, and `cost` is measured, not estimated
 complete field list, every rung, and the closed vocabulary behind `stopReason` and
 `reasonCode` ship with the plugin as skills and as `REASON_CODES.md`.
 
-## The eight tools
+## The nine tools
 
 | Tool | What it does |
 |---|---|
@@ -308,6 +308,7 @@ complete field list, every rung, and the closed vocabulary behind `stopReason` a
 | `orch_config` | Reads or updates the model and effort behind each tier |
 | `orch_stats` | Read-only learning statistics: a compact summary by default, raw alpha/beta with `view:full`, plus optional recent runs |
 | `orch_status` | Reads one finished run back off disk, or lists the recent runs when called with no arguments |
+| `orch_prove` | Runs the six-suite regression proof for a finished run's selected candidate and writes it under the state root; applies nothing |
 | `orch_apply` | Applies a finished run's patch to your repository — the explicit step `orch_run` never takes on its own |
 | `orch_reward` | Human correction of a past run's automatic grade. Idempotent |
 | `orch_reset` | Clears learned posteriors only when called with `confirm:true`; optionally narrowed by task class |
@@ -328,10 +329,10 @@ where somebody still deciding whether to install can see it.
 |---|---|
 | **Structured verifier, not prose** | The verifier returns structured JSON checks and issues. Callers that treated a prose approval as a pass need to be updated. |
 | **`candidates: 2` roughly doubles cost** | Two lanes each author, each cross-verify, and each run their own regression evidence. Provider, writer, and test calls all roughly double. |
-| **Regression proof multiplies the test runs** | A run that must prove a regression runs your whole test suite up to six times in series per candidate per attempt, against two for a run that needs no proof — the candidate twice, the baseline twice, and the baseline carrying that lane's new tests twice. Only the two plain baseline runs are shared across the whole run, because the evidence cache keys them by the baseline tree and the frozen test plan alone; the other four are that lane's own, and the candidate pair is never cached at all, so it runs again on every attempt. Six is therefore the ceiling for one candidate and one attempt: at the default `budget: 5` the run's ceiling is 22 serial suite runs, and 42 with `candidates: 2`. `cost.testRuns` reports what it actually took, and preflight warns before any credit is spent when those runs cannot fit inside `wait_ms`. |
+| **The regression proof runs once, in `orch_prove`** | In `orch_run` the whole test suite runs twice per candidate per attempt — the candidate twice (`c-1`, `c-2`) — and the run reports the proof as `deferred`. The regression proof itself — the whole suite six times against two baselines: the candidate twice, the plain baseline twice, and the baseline carrying that lane's new tests twice — is run once by `orch_prove`, for the selected candidate only. A run's own ceiling is therefore 10 serial suite runs at the default `budget: 5`, and 20 with `candidates: 2`; six is what one `orch_prove` call costs. `cost.testRuns` reports what it actually took, and preflight warns before any credit is spent when those runs cannot fit inside `wait_ms`. |
 | **One shared deadline** | `wait_ms` bounds the whole run, not each lane. It is one shared deadline; after it passes, no new provider, test, or judge call starts. |
 | **A `tie` has no patch** | When the judges disagree, both candidate patches stay on disk as recoverable artifacts and there is no representative patch. Read both and choose yourself. |
-| **Untrusted tests cap the grade** | If no test command was found, the result stops at `unverified`. A runner whose evidence cannot say which test covers which changed file does not stop ordinary work from reaching `verified` — but a run that needs regression proof (a bug fix that has to show the failure reproduced) stops at `unverified`. |
+| **Untrusted tests cap the grade** | If no test command was found, the result stops at `unverified`. A runner whose evidence cannot say which test covers which changed file does not stop ordinary work from reaching `verified` — but a run that needs regression proof (the default, unless `orch_run` was called with `require_proof: false`) stops at `unverified`. |
 | **Long paths block early** | A state root deep enough to overflow the response budget ends as `blocked` before any worktree is created. Point `BOM_ORCH_HOME` at a shorter directory and call again. |
 | **Patches are not applied automatically** | The result is a patch file path. You read it, then you apply it — with `git apply`, or by calling `orch_apply` with that run's `run_id`, which is the only call here that writes outside this server's own state directory. |
 | **The run baseline and apply-time HEAD are separate facts** | A clean start may reuse the starting HEAD. When uncommitted work is transplanted, the baseline instead becomes a server-created synthetic snapshot that contains it. An explicit `orch_apply` first checks the target working tree as it stands; only when direct application does not fit may it use that baseline for a verified three-way onto the target's current committed HEAD. A full apply report distinguishes `baseline`, `head`, and `repository.dirty`. Apply-time scope approval comes only from `scope.allow` in the `.bom-orch.json` committed at that HEAD; the earlier call's `scope_allow` is not retained. If the final pre-write recheck sees a HEAD move, it returns `apply_head_moved` without applying anything; that check and `git apply` are separate processes, so avoid concurrent repository changes. Follow the failure envelope's top-level `recovery` for the next safe action. |

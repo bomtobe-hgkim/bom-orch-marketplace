@@ -194,7 +194,7 @@ function createPreparedLaneAdapters(input) {
     runId, stateRoot, deadlineAt, frozenTestPlan, baseline, proofRequirement, scopeAllow,
     plan, artifactPaths, artifactStore, manifestAuthority, artifactRevisionAuthority, testQueue, evidenceCache,
   } = preparation;
-  const { laneProviders, callProvider, progress, faultRegistry } = PREPARATION_PRIVATE.get(preparation);
+  const { laneProviders, callProvider, progress, faultRegistry, provisionEvidenceWorktree = null } = PREPARATION_PRIVATE.get(preparation);
   const providers = laneProviders[laneIndex];
   const {
     deps, task, budget, deadline, now, stage, recoveryStage, onSpawn, killLiveChildren, haltReasonCode,
@@ -220,6 +220,38 @@ function createPreparedLaneAdapters(input) {
   const collectPatchAtRevision = deps.collectPatchAtRevision ?? defaultCollectPatchAtRevision;
   const inspectPatch = deps.inspectPatch ?? defaultInspectPatch;
   const listIgnoredPaths = deps.listIgnoredPaths ?? defaultListIgnoredPaths;
+  // ★★ 워커가 받은 워크트리에 **이미 있던** 무시 경로는 워커의 쓰기가 아니다. `lockfile-install` 은 워커보다
+  //   먼저 `node_modules/` 를 만들고 그것은 무시 규칙에 걸린다. 그 목록을 그대로 `splitTestOnlyDelta` 에 주면
+  //   신뢰된 계획(어댑터 장착) 아래서는 후보 전부가 `test_delta_ignored_path` = 하드 정책 위반으로 접힌다 —
+  //   2026-08-28 라이브 실측(실행 4): 테스트 0회, 두 후보 거절. 이 저장소 자신의 스위트가 어댑터 없이 돌던
+  //   동안은 분리기가 그 앞에서 `test_plan_untrusted` 로 돌아가 한 번도 안 드러났다. 기준선은 첫 워커
+  //   호출 **직전**에 한 번 잡고, 평가 때는 그 뒤 새로 생긴 것만 넘긴다. 기준선을 못 읽으면 빈 기준선이다
+  //   — 그쪽은 거짓 거절이지 거짓 통과가 아니다.
+  let ignoredBaseline = null;
+  //   조회는 다른 이음매처럼 `stage` 를 지난다 — 공유 하드스톱이 매달린 git 을 끊어야 하고, 그 throw 는
+  //   삼키지 않는다(엔진 테스트가 이 이음매의 하드스톱 복종을 잰다). `null`(못 읽음)만 빈 기준선이다.
+  const rememberIgnoredBaseline = async () => {
+    if (ignoredBaseline !== null) return;
+    ignoredBaseline = new Set((await stage(label('ignored path baseline'), () => listIgnoredPaths(laneWorktree))) ?? []);
+  };
+  // ★★ 증거 워크트리는 만든 직후 레인과 같은 프로비저닝을 받는다(`src/engine.mjs` 의 클로저, 그 WHY 도 거기).
+  //   거부되면 그 증거는 없는 것이다 — 빈 트리에서 돌린 테스트는 「후보가 틀렸다」가 아니라 「의존성이
+  //   없었다」인데 그 둘을 봉투가 가르지 못한다. 만든 워크트리는 여기서 회수한다: 증거 러너는 `ok`
+  //   아닌 생성을 자기 것으로 안 세므로 안 지운다.
+  const createEvidenceWorktree = async (spec, worktreeDeps) => {
+    const created = await (deps.createRevisionWorktree ?? defaultCreateRevisionWorktree)(spec, worktreeDeps);
+    if (created?.ok !== true || typeof provisionEvidenceWorktree !== 'function') return created;
+    const provisioned = await stage(label('evidence dependency provisioning'), () => provisionEvidenceWorktree(created.path),
+      { mayTouchWorktree: true, worktreePath: created.path });
+    if (provisioned?.ok === true) return created;
+    await (deps.removeWorktree ?? defaultRemoveWorktree)(created, { deadlineAt, signal: new AbortController().signal }).catch(() => null);
+    return {
+      ok: false, blocked: true,
+      reasonCode: typeof provisioned?.reasonCode === 'string' ? provisioned.reasonCode : REASON.deps_unavailable,
+      error: typeof provisioned?.error === 'string' ? provisioned.error : '',
+      recovery: typeof provisioned?.recovery === 'string' ? provisioned.recovery : '',
+    };
+  };
   const identity = (role, attemptId = null) => ({ laneId, attemptId, role, judgeIndex: null });
   const label = (value) => preparation.candidateCount === 1 ? value : `${laneId} ${value}`;
 
@@ -239,6 +271,7 @@ function createPreparedLaneAdapters(input) {
     }),
     callWriter: async (value) => {
       let result;
+      await rememberIgnoredBaseline();
       try {
         result = await callProvider({
           provider: providers.writer,
@@ -251,7 +284,7 @@ function createPreparedLaneAdapters(input) {
             plan,
             step: value.ordinal,
             budget,
-            feedback: workerFeedback(value.feedback.openIds),
+            feedback: workerFeedback(value.feedback),
           }),
           workspace: laneWorktree.path,
           tools: [...WORKER_TOOLS],
@@ -352,7 +385,8 @@ function createPreparedLaneAdapters(input) {
     },
     evaluateAttempt: async ({ attemptId, sealed }) => {
       const stored = attemptDeltas.get(attemptId);
-      const ignored = await stage(label('ignored path listing'), () => listIgnoredPaths(laneWorktree));
+      const ignoredNow = await stage(label('ignored path listing'), () => listIgnoredPaths(laneWorktree));
+      const ignored = Array.isArray(ignoredNow) ? ignoredNow.filter((path) => !(ignoredBaseline?.has(path) ?? false)) : ignoredNow;
       const scope = await stage(label('patch inspection'), () => inspectPatch({
         files: stored.delta.entries.map((entry) => entry.path),
         worktree: laneWorktree.path,
@@ -464,13 +498,17 @@ function createPreparedLaneAdapters(input) {
       const evidenceRunner = deps.runCandidateEvidence ?? runCandidateEvidence;
       progress('tests', Number(attemptId.slice(-3)), identity('worker', attemptId));
       const evidence = await stage(label('candidate evidence'), () => evidenceRunner({
+        // ★ 실행 안의 단계는 언제나 `run` 이다 — 여섯 칸은 `orch_prove` 가 진다(실행 9, 2026-08-28:
+        //   증명 42분이 55분 상한을 다섯 번째 스위트 실행에서 넘겨 초록 후보를 unverified 로 냈다).
+        //   키 `stage` 는 이 스코프의 함수 `stage` 와 이름만 같다 — 속성 이름이라 가려지지 않는다.
+        stage: 'run',
         runId, laneId, attemptId, baseline,
         candidate: { ...sealed }, frozenTestPlan, proofRequirement, testDelta,
         deadlineAt, testQueue, cache: evidenceCache,
       }, {
         sourceWorktree: laneWorktree,
         stateRoot,
-        createRevisionWorktree: deps.createRevisionWorktree ?? defaultCreateRevisionWorktree,
+        createRevisionWorktree: createEvidenceWorktree,
         revisionIdentity,
         // ★ S1 신고의 관측 지점. 자식이 실제로 떴는지를 아는 곳은 여기 하나뿐이다 — 레인 요약도
         //   attempt 기록도 이 사실을 안 들고 나온다. 어느 레인의 어느 시도였든 한 번이라도

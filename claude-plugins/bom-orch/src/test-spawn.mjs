@@ -7,7 +7,7 @@
  *   모른다 — 고정값 대조·자식 환경 조립·confidence 판정은 전부 러너에 남아 있고, 여기 오는 것은
  *   이미 검증된 `{command, args, cwd, env}` 넷뿐이다. 그래서 이 파일에는 `git` 도
  *   `project-config` 도 `reason-*` 도 없다.
- * ★ 실측 폐포: **2개 모듈 / 432줄**(자기 자신 352 포함) — `deadline`(80) 하나뿐이다. 이 저장소에서 가장 얕은 잎이고, 그것이 이 파일이 하는 일의 크기다.
+ * ★ 실측 폐포: **2개 모듈 / 461줄**(자기 자신 352 포함) — `deadline`(109) 하나뿐이다. 이 저장소에서 가장 얕은 잎이고, 그것이 이 파일이 하는 일의 크기다.
  * ★ 수입하는 쪽(실측 grep): `src/test-runner.mjs`(`DEFAULT_TIMEOUT_MS`·`WINDOWS`·`spawnAndCollect`)와 `test/test-runner.test.mjs`(상한 상수 넷). 둘뿐이다.
  */
 

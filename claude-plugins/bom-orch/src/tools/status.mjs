@@ -39,6 +39,7 @@ import { statusOfReasonCode } from '../run-faults.mjs';
 import { confidenceOfStatus } from '../confidence.mjs';
 import { resolveStateRoot } from '../state-root.mjs';
 import { TASK_PREVIEW_CHARS, readRuns } from '../learn/journal.mjs';
+import { readProofRecord } from '../proof-record.mjs';
 import {
   LOG_TAIL_LEVELS,
   RECENT_RUNS_DEFAULT,
@@ -167,6 +168,23 @@ const displayCode = (value) => (typeof value === 'string' ? normalizeLegacyReaso
 
 const finiteOrNull = (value) => (Number.isFinite(value) ? value : null);
 const stringOrNull = (value) => (typeof value === 'string' ? value : null);
+
+/**
+ * 실행 하나가 가진 **증명**의 세 값. 파일이 없으면 `null` 이다.
+ *
+ * ★★ 왜 실행 행에 붙나(실측): 실행 9(`run-mtcz280y-01xnz4`, 2026-08-28)는 55분 상한이 다섯 번째
+ *   스위트 실행에서 끊어 증명 없이 끝났고, 그 뒤로 증명은 `orch_prove` 가 따로 돈다. 그래서
+ *   「이 실행은 증명이 있나」는 매니페스트가 답할 수 없는 질문이 됐다 — 후보 행의 `proofStatus`
+ *   는 실행이 끝난 시점의 값(`deferred`)이라 영원히 그대로다. 답이 사는 파일은 하나이고, 그것을
+ *   읽는 자리가 여기다.
+ * ★ 상한은 **읽기에서 다시** 건다(이 파일의 규율): 이 바이트는 우리가 이번에 쓴 것이 아닐 수
+ *   있고, 바닥이 유계가 아니면 카나리가 스텁을 훑는다.
+ */
+const proofRow = (proof) => (proof === null || typeof proof !== 'object' ? null : {
+  status: clipped(proof.status ?? null, CODE_CHARS),
+  attemptId: clipped(proof.attemptId ?? null, CODE_CHARS),
+  finishedAt: finiteOrNull(proof.finishedAt ?? null),
+});
 
 /**
  * 디스크에서 온 문자열 한 조각 — 상한을 다시 걸고, 글자를 쪼개지 않는다(반쪽 서로게이트는
@@ -545,6 +563,8 @@ function runBody(input, rung) {
     //   말하지 못한다 — 그 사실이 남는 다른 채널은 로그의 `info` 줄뿐이고 꼬리가 그것을 거른다.
     resumedFrom: clipped(row?.resumedFrom ?? null, CODE_CHARS),
     manifest: input.manifest.read,
+    // ★ 바닥까지 간다 — 「적용해도 되나」를 읽는 사람이 마지막까지 들고 가야 하는 사실이다.
+    proof: proofRow(input.proof ?? null),
   };
   const artifacts = {
     runDir: clipped(input.paths.runDir, PATH_CHARS),
@@ -607,7 +627,7 @@ function runBody(input, rung) {
  *
  * @param {object} input `{runId, journal:{state,row}, manifest:{read,manifest}, attempts:{read,attempts},
  *   issues:[{candidateId,read,reasonCode,issues}], log:{read,path,present,lines,omitted,unparsable},
- *   paths:{runDir,manifestPath}}`
+ *   paths:{runDir,manifestPath}, proof:{status,attemptId,finishedAt}|null}`
  * @param {{rung?: string, notices?: string[]}} [options] `rung` 을 주면 사다리를 타지 않고 그 단을
  *   그대로 만든다 — 카나리가 **모든 단**을 재려면 단을 고를 수 있어야 한다.
  */
@@ -719,9 +739,17 @@ async function oneRun(stateRoot, runId) {
     ? { read: 'ok', path: tail.path, present: tail.present, lines: tail.lines.map((line) => ({ ...line })), omitted: tail.omitted, unparsable: tail.unparsable }
     : { read: 'unreadable', path: join(stateRoot, 'logs', `${runId}.jsonl`), present: false, lines: [], omitted: 0, unparsable: 0 };
   if (log.read === 'unreadable') notices.push(renderNotice('status_log_unreadable', { path: log.path }));
+  // ★ 매니페스트와 **독립**이다: 증명은 실행 기록 밖(`proofs/<runId>/`)에 살고, 매니페스트를
+  //   못 읽는 실행도 증명은 읽힐 수 있다. 못 읽으면 `null` 이다 — 이 도구는 읽기만 하고,
+  //   증명 기록의 판독 실패를 실행의 삼중값으로 번역하지 않는다.
+  const proofRead = await readProofRecord({ stateRoot, runId });
+  const proof = proofRead?.ok === true && proofRead.record !== null
+    ? { status: proofRead.record.status, attemptId: proofRead.record.attemptId, finishedAt: proofRead.record.finishedAt }
+    : null;
   return statusRunEnvelope({
     runId,
     journal,
+    proof,
     manifest: { read: manifestRead, manifest: readManifest ? manifest.manifest : null },
     attempts: { read: attempts.ok === true ? 'ok' : 'unreadable', attempts: attempts.attempts ?? [] },
     issues,

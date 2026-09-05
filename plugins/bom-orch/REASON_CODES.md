@@ -4,7 +4,7 @@
 
 Every failure this server reports carries a `reasonCode`. The coarse `stopReason` beside it is
 derived from the code, never chosen separately, so one code always ends a run the same way.
-This table is generated from `src/reason-codes.mjs` (the vocabulary) and `src/reason-text.mjs` (the wording): 408 codes.
+This table is generated from `src/reason-codes.mjs` (the vocabulary) and `src/reason-text.mjs` (the wording): 422 codes.
 
 The `Message` and `Recovery` columns are the templates this server renders, so they keep their
 `{placeholders}`; a real result fills them in with the values from that run.
@@ -20,6 +20,8 @@ The `Message` and `Recovery` columns are the templates this server renders, so t
 | `apply_patch_empty` | `blocked` | The patch this run left is empty, so there is nothing to apply and {path} was not touched | Call orch_status with this run_id: an empty patch means the delegate changed no file |
 | `apply_patch_missing` | `blocked` | Run {runId} has no patch to apply on this state root: it left no representative patch, or the cleanup has already reclaimed it | Call orch_status with this run_id to see which candidate patches are still on disk |
 | `apply_patch_unreadable` | `infrastructure_failed` | Something is at {path} but it is not a readable patch file | Look at what occupies that path, then start a new run rather than applying whatever is there |
+| `apply_proof_failed` | `rejected` | The regression proof for run {runId} did not pass, so nothing was applied; allow_unproven does not override a proof that ran and disagreed | Read the proof record for the failing cell, fix the candidate and start a new run; a failed proof is a fact about the patch, not about this call |
+| `apply_proof_missing` | `blocked` | Run {runId} needs a regression proof and this state root has none that matches the patch about to be applied, so nothing was applied | Call orch_prove with this run_id and apply once it reports proved, or pass allow_unproven true to apply without a proof |
 | `apply_run_not_found` | `blocked` | No run named {runId} is on this state root, so there is nothing to apply | Call orch_status with no arguments to list the recent runs |
 | `apply_project_unknown` | `blocked` | The records of run {runId} do not name the repository it was started in, so there is no repository to apply its patch to | Locate the repository that run was started in from your own records, then apply the retained representative patch there with git apply; orch_apply cannot infer the target |
 | `apply_project_unusable` | `blocked` | The repository this run was started in, {path}, is missing, is not a git repository, or has no commit to apply against | Restore that repository, or apply the patch yourself with git apply where you want the changes |
@@ -244,6 +246,18 @@ The `Message` and `Recovery` columns are the templates this server renders, so t
 | `preflight_gateway_env_unsupported` | `blocked` | This host selects a vendor gateway deployment ({names}), which this server does not support | Unset {names} in the shell that starts this server, or start it from a shell without them, then retry the run |
 | `preflight_no_provider_available` | `blocked` | No vendor CLI answered the preflight, so no role could be filled | Check the installation and PATH, then retry the run |
 | `preflight_provider_unavailable` | `blocked` | The {role} role was pinned to {vendor}, which the preflight reported unavailable | Install that vendor CLI and check that PATH reaches it, then retry the run |
+| `proof_baseline_unavailable` | `blocked` | The baseline commit this run was written against is gone from {path}, so the b0 cells have no tree to run on | Start a new run against the repository as it is now; a pruned baseline cannot be rebuilt from the run records |
+| `proof_candidate_mismatch` | `policy_failure` | Applying this run's patch to the reproduced baseline does not rebuild the tree the run recorded for its selected candidate, so the proof would vouch for a different tree | Start a new run against the repository as it is now rather than proving a tree nobody selected |
+| `proof_candidate_unavailable` | `blocked` | Run {runId} has no single selected candidate to prove: it ended in a tie or with no candidate, or its representative patch is no longer on this state root | Call orch_status with this run_id to see how the selection ended |
+| `proof_delta_mismatch` | `policy_failure` | The test-only delta recomputed for this candidate does not match the digest the run recorded, so the br cells would measure a different set of test files | Start a new run against the repository as it is now; a proof cannot be spliced onto a delta the run never measured |
+| `proof_environment_drift` | `policy_failure` | The frozen test plan re-derived from this run's baseline no longer carries the plan and environment fingerprints the run recorded, so evidence collected now would not be evidence for that run | Restore the toolchain and test command this run used, or start a new run in the environment as it is now |
+| `proof_in_progress` | `blocked` | Another proof of run {runId} is already running on this state root, so this call did not start a second one | Wait for that proof to finish and read its record; a lock left by a killed process expires on its own and the next call reclaims it |
+| `proof_not_required` | `unverified` | This task needs no regression proof, so no test cell was run and a not_applicable record was written for the apply gate to read | Call orch_apply with this run_id; the apply gate passes a run whose proof was never required |
+| `proof_project_unknown` | `blocked` | The records of run {runId} do not name the repository it was started in, so there is no repository to reproduce its baseline from | Locate that repository from your own records and apply the retained patch there by hand; orch_prove cannot infer the target |
+| `proof_project_unusable` | `blocked` | The repository this run was started in, {path}, is missing, is not a git repository, or has no commit to reproduce against | Restore that repository, then call orch_prove again |
+| `proof_record_unreadable` | `infrastructure_failed` | Something is at {path} but it is not a readable proof record | Look at what occupies that path and move it aside, then call orch_prove again |
+| `proof_run_not_found` | `blocked` | No run named {runId} is on this state root, so there is nothing to prove | Call orch_status with no arguments to list the recent runs |
+| `proof_run_unreadable` | `infrastructure_failed` | The records of that run could not be read, so the baseline, the frozen plan and the selected candidate a proof must reproduce are all unavailable | Call orch_status with no arguments to list the recent runs |
 | `provider_below_security_floor` | `blocked` | The {vendor} CLI at version {version} is below the security floor a write role requires | Update the {vendor} CLI to {floor} or newer, or pin a different vendor as the writer |
 | `provider_cli_not_found` | `provider_failed` | The {vendor} CLI was not found on PATH | Install the {vendor} CLI and check that PATH reaches it, then retry |
 | `provider_cli_shim_only` | `provider_failed` | Only a shell shim was found for the {vendor} CLI, and this server spawns without a shell | Install the native {vendor} executable, then retry |

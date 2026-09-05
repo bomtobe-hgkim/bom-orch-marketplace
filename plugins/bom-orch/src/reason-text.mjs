@@ -220,6 +220,14 @@ export const REASON_TEXT = deepFreeze({
     'Something is at {path} but it is not a readable patch file',
     'Look at what occupies that path, then start a new run rather than applying whatever is there',
   ),
+  apply_proof_failed: text(
+    'The regression proof for run {runId} did not pass, so nothing was applied; allow_unproven does not override a proof that ran and disagreed',
+    'Read the proof record for the failing cell, fix the candidate and start a new run; a failed proof is a fact about the patch, not about this call',
+  ),
+  apply_proof_missing: text(
+    'Run {runId} needs a regression proof and this state root has none that matches the patch about to be applied, so nothing was applied',
+    'Call orch_prove with this run_id and apply once it reports proved, or pass allow_unproven true to apply without a proof',
+  ),
   apply_run_not_found: text('No run named {runId} is on this state root, so there is nothing to apply', RECOVERY_STATUS_LIST),
   apply_project_unknown: text(
     'The records of run {runId} do not name the repository it was started in, so there is no repository to apply its patch to',
@@ -523,6 +531,55 @@ export const REASON_TEXT = deepFreeze({
   preflight_gateway_env_unsupported: text('This host selects a vendor gateway deployment ({names}), which this server does not support', 'Unset {names} in the shell that starts this server, or start it from a shell without them, then retry the run'),
   preflight_no_provider_available: text('No vendor CLI answered the preflight, so no role could be filled', RECOVERY_INSTALL),
   preflight_provider_unavailable: text('The {role} role was pinned to {vendor}, which the preflight reported unavailable', 'Install that vendor CLI and check that PATH reaches it, then retry the run'),
+
+  // proof — `orch_prove` 가 재현에 실패한 자리들. 회복 문구가 「다시 실행하라」로 모이는 것은 이
+  // 도구의 실패가 재시도로 낫는 종류가 아니기 때문이다: 어긋난 것은 이 호출이 아니라 실행이 남긴
+  // 기록과 오늘의 저장소 사이의 사실이고, 같은 저장소에서 다시 불러도 같은 답이 온다.
+  proof_baseline_unavailable: text(
+    'The baseline commit this run was written against is gone from {path}, so the b0 cells have no tree to run on',
+    'Start a new run against the repository as it is now; a pruned baseline cannot be rebuilt from the run records',
+  ),
+  proof_candidate_mismatch: text(
+    'Applying this run\'s patch to the reproduced baseline does not rebuild the tree the run recorded for its selected candidate, so the proof would vouch for a different tree',
+    'Start a new run against the repository as it is now rather than proving a tree nobody selected',
+  ),
+  proof_candidate_unavailable: text(
+    'Run {runId} has no single selected candidate to prove: it ended in a tie or with no candidate, or its representative patch is no longer on this state root',
+    'Call orch_status with this run_id to see how the selection ended',
+  ),
+  proof_delta_mismatch: text(
+    'The test-only delta recomputed for this candidate does not match the digest the run recorded, so the br cells would measure a different set of test files',
+    'Start a new run against the repository as it is now; a proof cannot be spliced onto a delta the run never measured',
+  ),
+  proof_environment_drift: text(
+    'The frozen test plan re-derived from this run\'s baseline no longer carries the plan and environment fingerprints the run recorded, so evidence collected now would not be evidence for that run',
+    'Restore the toolchain and test command this run used, or start a new run in the environment as it is now',
+  ),
+  proof_in_progress: text(
+    'Another proof of run {runId} is already running on this state root, so this call did not start a second one',
+    'Wait for that proof to finish and read its record; a lock left by a killed process expires on its own and the next call reclaims it',
+  ),
+  proof_not_required: text(
+    'This task needs no regression proof, so no test cell was run and a not_applicable record was written for the apply gate to read',
+    'Call orch_apply with this run_id; the apply gate passes a run whose proof was never required',
+  ),
+  proof_project_unknown: text(
+    'The records of run {runId} do not name the repository it was started in, so there is no repository to reproduce its baseline from',
+    'Locate that repository from your own records and apply the retained patch there by hand; orch_prove cannot infer the target',
+  ),
+  proof_project_unusable: text(
+    'The repository this run was started in, {path}, is missing, is not a git repository, or has no commit to reproduce against',
+    'Restore that repository, then call orch_prove again',
+  ),
+  proof_record_unreadable: text(
+    'Something is at {path} but it is not a readable proof record',
+    'Look at what occupies that path and move it aside, then call orch_prove again',
+  ),
+  proof_run_not_found: text('No run named {runId} is on this state root, so there is nothing to prove', RECOVERY_STATUS_LIST),
+  proof_run_unreadable: text(
+    'The records of that run could not be read, so the baseline, the frozen plan and the selected candidate a proof must reproduce are all unavailable',
+    RECOVERY_STATUS_LIST,
+  ),
   provider_below_security_floor: text('The {vendor} CLI at version {version} is below the security floor a write role requires', 'Update the {vendor} CLI to {floor} or newer, or pin a different vendor as the writer'),
   provider_cli_not_found: text('The {vendor} CLI was not found on PATH', RECOVERY_INSTALL_VENDOR),
   provider_cli_shim_only: text('Only a shell shim was found for the {vendor} CLI, and this server spawns without a shell', 'Install the native {vendor} executable, then retry'),
@@ -975,6 +1032,8 @@ export const SAMPLE_PARAMS = deepFreeze({
   apply_patch_empty: { path: '<project>' },
   apply_patch_missing: { runId: 'run-0000000000000-aaaaaaaa' },
   apply_patch_unreadable: { path: '<stateRoot>/patches/run-0000000000000-aaaaaaaa.patch' },
+  apply_proof_failed: { runId: 'run-0000000000000-aaaaaaaa' },
+  apply_proof_missing: { runId: 'run-0000000000000-aaaaaaaa' },
   apply_project_unknown: { runId: 'run-0000000000000-aaaaaaaa' },
   apply_project_unusable: { path: '<project>' },
   apply_run_not_found: { runId: 'run-0000000000000-aaaaaaaa' },
@@ -1033,10 +1092,10 @@ export const SAMPLE_PARAMS = deepFreeze({
   //   실재로 만들었다 — 골든이 "… is not a tool this server serves" 라고 적은 채 그 도구를
   //   서빙하게 된다(리서치 메모 §C.1 이 미리 적어 둔 함정이다).
   //   그래서 이번에는 **예약 목록에서 고르지 않는다** — 예약된 이름은 언젠가 실재가 되고, 그때
-  //   같은 자기모순이 세 번째로 돌아온다. `orch_cancel` 은 WS0 계약이 여덟으로 못박은 도구
-  //   집합 **밖**이고(취소는 `orch_status` 가 서빙한다), 그래서 호출자가 실제로 틀리는 이름
-  //   이면서 실재가 될 자리가 없다. `test/tool-contract.test.mjs` 가 두 사실을 잰다.
-  config_tool_unknown: { name: 'orch_cancel', tools: 'orch_models, orch_run, orch_config, orch_stats, orch_status, orch_apply, orch_reward, orch_reset' },
+  //   같은 자기모순이 세 번째로 돌아온다. `orch_cancel` 은 지금 아홉으로 못박힌 도구 집합
+  //   **밖**이고(취소는 `orch_status` 가 서빙한다), 그래서 호출자가 실제로 틀리는 이름이면서
+  //   실재가 될 자리가 없다. `test/tool-contract.test.mjs` 가 두 사실을 잰다.
+  config_tool_unknown: { name: 'orch_cancel', tools: 'orch_models, orch_run, orch_config, orch_stats, orch_status, orch_prove, orch_apply, orch_reward, orch_reset' },
   config_uncommitted: { file: '.bom-orch.json' },
   config_unreadable: { file: '.bom-orch.json', detail: 'the repository could not say whether it exists (exit 128: fatal: not a git repository)' },
   config_wait_ms_invalid: { waitMs: -1 },
@@ -1078,6 +1137,13 @@ export const SAMPLE_PARAMS = deepFreeze({
   learning_write_boundary_failed: { name: 'after-pending', detail: 'EPERM: operation not permitted' },
   preflight_gateway_env_unsupported: { names: 'CLAUDE_CODE_USE_BEDROCK' },
   preflight_provider_unavailable: { role: 'verifier', vendor: 'codex' },
+  proof_baseline_unavailable: { path: '<project>' },
+  proof_candidate_unavailable: { runId: 'run-0000000000000-aaaaaaaa' },
+  proof_in_progress: { runId: 'run-0000000000000-aaaaaaaa' },
+  proof_project_unknown: { runId: 'run-0000000000000-aaaaaaaa' },
+  proof_project_unusable: { path: '<project>' },
+  proof_record_unreadable: { path: '<stateRoot>/proofs/run-0000000000000-aaaaaaaa/proof.json' },
+  proof_run_not_found: { runId: 'run-0000000000000-aaaaaaaa' },
   provider_below_security_floor: { vendor: 'claude', version: '1.0.0', floor: '2.0.0' },
   provider_cli_not_found: { vendor: 'codex' },
   provider_cli_shim_only: { vendor: 'claude' },
@@ -1099,9 +1165,9 @@ export const SAMPLE_PARAMS = deepFreeze({
   resume_environment_mismatch: { runId: 'run-0000000000000-aaaaaaaa' },
   resume_manifest_unreadable: { runId: 'run-0000000000000-aaaaaaaa' },
   resume_run_not_found: { runId: 'run-0000000000000-aaaaaaaa' },
-  // ★ 엔진의 `MAX_WAIT_MS` 와 같은 수다(WS3 §0-W1 이 3,600,000 → 3,300,000 으로 내렸다).
-  //   여기서 engine 을 import 하면 순환이 생기므로(engine 이 이 파일을 부른다) 값을 적고,
-  //   `test/guards/wait-budget-inequality.test.mjs` 가 두 수가 갈리는 순간 붉어진다.
+  // ★ `src/deadline.mjs` 의 `MAX_WAIT_MS` 와 같은 수다(WS3 §0-W1 이 3,600,000 → 3,300,000 으로 내렸다).
+  //   WS9 태스크 4 뒤에는 순환이 아니지만 여전히 **안 수입한다**: 이 파일을 무는 모든 실패 경로의
+  //   폐포에 `deadline` 이 얹히고, 그 값보다 `wait-budget-inequality` 가드가 싸다.
   run_deadline_exceeded: { waitMs: 3_300_000 },
   run_nested_invocation: { runId: 'run-0000000000000-aaaaaaaa' },
   run_tool_failed: { detail: 'Cannot read properties of undefined' },

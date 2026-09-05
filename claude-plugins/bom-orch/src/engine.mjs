@@ -1,7 +1,7 @@
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { snapshotStoreArtifactAuthority } from './artifact-settlement.mjs';
 import { confidenceOfRun } from './confidence.mjs';
-import { haltSignal, timeoutSignal } from './deadline.mjs';
+import { MAX_WAIT_MS, haltSignal, timeoutSignal } from './deadline.mjs';
 import { ARTIFACT_PATH_JSON_BUDGET, validateArtifactPathBudget } from './content-projection.mjs';
 import { failure } from './envelope.mjs';
 import { inspectRepo as defaultInspectRepo } from './git.mjs';
@@ -17,6 +17,7 @@ import {
   sweepLogs as defaultSweepLogs,
   sweepPatches as defaultSweepPatches,
   sweepPlans as defaultSweepPlans,
+  sweepProofs as defaultSweepProofs,
   sweepRuns as defaultSweepRuns,
   sweepScratch as defaultSweepScratch,
   trackChild as defaultTrackChild,
@@ -172,30 +173,6 @@ export { VERIFIER_TOOLS, WORKER_TOOLS } from './run-lane-adapters.mjs';
 /** 스텝 수 상한. 한 번의 도구 호출이 무한정 델리게이트를 부르지 않게 한다. */
 export const MAX_BUDGET = 10;
 
-/**
- * ★★ 엔진 자체의 절대 상한. **`waitMs` 와 무관하다.**
- *
- * 브리프는 "데드라인이 정지의 유일한 권위" 라고 요구하는데, `waitMs: 0`(기본값)은
- * `timeoutSignal` 이 `undefined` 를 돌려주므로 **권위가 아예 없는 상태**였다. 그 둘은
- * 양립하지 않는다. 그래서 `waitMs` 를 "호출자가 정한 상한", 이 값을 "그것과 무관한 상한"
- * 으로 나눈다 — 호출자가 0 을 주면 이 값이 데드라인이 되고, 더 큰 값을 주면 이 값으로 깎인다.
- *
- * 못이지 예산이 아닌 이유: 정상적인 오케스트레이션(최대 10스텝 × 플래너·워커·테스트·
- * 베리파이어)이 여기 닿는 것은 이상 상태이고, 그때는 부분 결과라도 내보내는 편이
- * MCP 요청이 영영 매달리는 것보다 낫다.
- *
- * ★★ 55분인 이유(WS3 §0-W1). 이 값은 **호스트의 도구 타임아웃보다 먼저** 만료해야 한다 —
- * 호스트가 먼저 끊으면 사용자에게 가는 것은 봉투가 아니라 전송 오류이고, 부분 결과도 사유
- * 코드도 아무 채널에 안 남는다. 호스트 값(Claude `.mcp.json` 의 `timeout`, Codex 의
- * `tool_timeout_sec` — 둘 다 3,600,000 ms)은 **올리지 않는다**: 우리가 못 고치는 남의 설정에
- * 기대게 되기 때문이다. 그래서 엔진을 내린다. 3,600,000 − 70,000 = 3,530,000 이 상한이고
- * 70초는 abort **뒤에** 우리가 아직 쓰는 시간이다(하드스톱 유예 10초 `HARD_STOP_GRACE_MS`
- * + 워크트리 정리 최대 60초). 부등식은 `test/guards/wait-budget-inequality.test.mjs` 가 두
- * 호스트 설정의 소스와 exporter 산출물 양쪽에서 지킨다. 기본 `wait_ms` 1,800,000 은 그대로다
- * — 같이 내리면 기본 실행이 데드라인에 더 자주 걸린다(로드맵 §3.5).
- */
-export const MAX_WAIT_MS = 3_300_000;
-
 /** 데드라인 뒤 주입 이음매가 signal 을 무시할 때 기다리는 단계별 유예. */
 const HARD_STOP_GRACE_MS = 10_000;
 const HARD_STOP = Symbol('bom-orch:hard-stop');
@@ -289,7 +266,7 @@ export { FORWARD_PLACEMENT, REVERSED_PLACEMENT } from './learn/effective-choices
  *
  * @param {{ task: string, projectPath: string, isolation?: string, budget?: number, candidateCount?: 1|2,
  *           waitMs?: number, decisions?: { mix?: string, placement?: string, tier?: string },
- *           planner?: string, worker?: string, verifier?: string,
+ *           planner?: string, worker?: string, verifier?: string, requireProof?: boolean,
  *           onProgress?: Function, hostSignal?: AbortSignal, deps?: object }} spec
  * @returns MCP 봉투(`src/envelope.mjs`). content 는 JSON 문자열이다.
  */
@@ -311,7 +288,12 @@ export async function runOrchestration(spec) {
   try {
     const snapshot = snapshotOwnDataObject(options, [
       'task', 'projectPath', 'isolation', 'budget', 'candidateCount', 'allowSingle', 'waitMs',
-      'decisions', 'planner', 'writer', 'worker', 'verifier', 'onProgress', 'hostSignal', 'resumeRunId', 'scopeAllow', 'deps',
+      'decisions', 'planner', 'writer', 'worker', 'verifier', 'onProgress', 'hostSignal', 'resumeRunId', 'scopeAllow',
+      // ★ 오너 결정 B(2026-08-31). 화이트리스트에 없으면 `toEngineOptions` 가 실어 보낸 값이
+      //   여기서 조용히 잘려 `classifyProofRequirement` 는 항상 부재(=required)를 본다 —
+      //   그 자체는 fail-closed 라 안전 쪽이지만, `require_proof:false` 를 지정한 호출자가
+      //   자기 선택이 반영됐다고 믿는데 실제로는 무시되는 결함이 된다.
+      'requireProof', 'deps',
     ]);
     if (snapshot === null) {
       return failure({ status: 'invalid', reasonCode: REASON.config_arguments_invalid });
@@ -506,6 +488,10 @@ async function prepareRunNamespace(options, deps) {
   //   없었고, 남는 것은 모델이 쓴 계획 초안이라 평문이다 — 부팅 스윕과 실행 시작 스윕이 같은
   //   함수를 부르는 이유는 나머지 넷과 같다(장수 서버는 부팅이 며칠에 한 번이다).
   const sweepPlans = deps.sweepPlans ?? defaultSweepPlans;
+  // ★ `proofs` 가 여섯 번째 행이다. 증명은 실행 기록 **밖**에 살아서(끝난 실행의 runs/<runId>/ 에는
+  //   한 바이트도 안 쓴다) 실행 스윕이 못 본다 — 실측: 실행 9(2026-08-28)는 증명 여섯 칸이 55분
+  //   상한에 잘려 실행 안에서 끝나지 못했고, 그 뒤로 증명은 별도 디렉터리에 따로 쌓인다.
+  const sweepProofs = deps.sweepProofs ?? defaultSweepProofs;
   const sweepNow = now();
   let sweptRemoved = 0;
   let sweptSkipped = 0;
@@ -517,6 +503,7 @@ async function prepareRunNamespace(options, deps) {
     ['plans', sweepPlans, [stateRoot, sweepNow]],
     ['patches', sweepPatches, [stateRoot, sweepNow, { excludeRunId: runId }]],
     ['runs', sweepRuns, [stateRoot, sweepNow, { excludeRunId: runId }]],
+    ['proofs', sweepProofs, [stateRoot, sweepNow, { excludeRunId: runId }]],
     ['logs', sweepLogs, [{ stateRoot, now: sweepNow }]],
   ]) {
     try {
@@ -608,7 +595,10 @@ async function prepareRunNamespace(options, deps) {
   // ★★ 분류 둘은 순수 함수이고 입력이 `task` 와 방금 얼어붙은 계획뿐이라, 여기가 가장 이른 자리다
   //   — 워크트리보다도 크레딧보다도 앞이다. 태스크 2 의 preflight 가 크레딧 전에 이 둘을 읽는다.
   const taskClass = classifyTask({ task, testSource: frozenTestPlan.source ?? null });
-  const proofRequirement = classifyProofRequirement({ task, taskClass });
+  // ★ 오너 결정 B(2026-08-31): 이 호출은 이제 `task`도 `taskClass`도 안 넘긴다 — 분류기가 보는
+  //   것은 `runOptions.requireProof` 하나뿐이다(`src/regression-proof.mjs` 의 WHY). `taskClass`
+  //   는 여전히 계산한다 — 학습·봉투가 그 값을 따로 쓴다.
+  const proofRequirement = classifyProofRequirement({ requireProof: runOptions.requireProof });
   // ★ 계획 파생이 낸 알림(지금은 「검증만 되고 아직 소비되지 않는 설정 키」 하나). 계획 객체는
   //   지문에 들어가는 정확한 키 집합이라 실을 자리가 없어서 사설 런타임에서 꺼낸다. 원본 identity
   //   로 읽는다 — 주입된 계획은 복제를 거치므로 그쪽에는 애초에 런타임이 없다(빈 배열).
@@ -939,7 +929,23 @@ async function prepareRunNamespace(options, deps) {
     // 서수를 받고, 종료 경로는 여기서 알림을 짓는다 — 두 소비자가 같은 값을 읽는다.
     resume,
   };
+  // ★★ 증거 워크트리도 레인과 **같은** 프로비저닝을 받는다. 2026-08-28 라이브 실측(실행 1–7 전부): 위 루프는
+  //   레인 둘만 채웠고, 테스트를 실제로 돌리는 증거 워크트리(c/1·c/2·b0·br)는 맨 `git worktree` 였다 — 이
+  //   저장소의 테스트 파일 대부분이 `@modelcontextprotocol/sdk` 를 못 찾아 로드에 실패했고, verifier 가 본
+  //   「npm test 실패」는 사실상 전부 그것이었다. 같은 설정·같은 baseline·같은 캐시·같은 신호로, 레인
+  //   어댑터가 증거 워크트리를 만든 직후에 부른다(`src/run-lane-adapters.mjs`). 알림은 싣지 않는다 —
+  //   레인 프로비저닝이 이미 「설치했다」를 말했고, 증거마다 같은 문장을 반복하면 봉투가 시끄럽다.
+  const provisionEvidenceWorktree = (worktreePath) => provisionDependencies({
+    config: baselineConfig,
+    baselineCommit: baseline.commit,
+    worktreePath,
+    stateRoot,
+    runId,
+    signal: deadline,
+    onSpawn: (child) => onSpawn(child, { worktreePath, ownerWorktreePath: worktreePath }),
+  });
   PREPARATION_PRIVATE.set(prepared, {
+    provisionEvidenceWorktree,
     taskClass, decisions, decisionSources, plannerProvider, writerProvider, verifierProvider,
     laneProviders, judgeBindings: Object.freeze([...judgeBindings]), tier, plannerNotices, callProvider, pathBudget, progress,
     effectiveChoices, learningMutationEnabled: controls.mutationEnabled, faultRegistry,

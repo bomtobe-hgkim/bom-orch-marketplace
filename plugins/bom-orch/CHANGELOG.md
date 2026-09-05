@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.1.0 - 2026-09-05
+
+Two changes that came out of an audit against another orchestrator's stall monitor. Neither
+changes the tool surface, the envelope contract, or the state format.
+
+- **Read-only roles no longer start your MCP servers.** The claude planner and judge calls now
+  carry `--strict-mcp-config`, as the writer and verifier already did. `--tools ""` only disables
+  Claude Code's built-in tools; MCP servers configured at the user level still started for every
+  planner and judge call. Measured on 2026-09-05 with the exact read-only argv: without the flag
+  the bom-orch plugin's own MCP server attached to the call with eight tools, and the same one-word
+  answer cost 37% more than with the flag. Nothing else in the argv moves — `--setting-sources user`
+  still applies to write roles only, so your own model and auth settings keep reaching the
+  read-only roles.
+
+- **Every vendor call now leaves a `provider settle` line in the run log**, paired with the
+  existing `provider spawn` line: elapsed milliseconds, milliseconds since the vendor's last
+  stream event (`quietMs`), the event count, whether a child process actually started, whether
+  the pipe stayed open after a kill (`hung`), the vendor's stop reason, and whether the answer was
+  truncated. A call that was cut or threw logs at `warn`, so it appears in the default log tail
+  that `orch_status` returns; a healthy call stays at `info`. Until now a run that ended at its
+  deadline could not be read back as "the vendor went silent" versus "the vendor was still
+  producing output when it was cut". On a normal claude call the settle line arrives within half
+  a second of the last event.
+
+- Documented residual risk: codex's user-level `config.toml [mcp_servers]` is not closed by the
+  argv this server builds; only a nested bom-orch is refused (by `BOM_ORCH_RUN_ID`). Whether
+  `-c mcp_servers={}` would empty it is unverified, so nothing is added there yet.
+
 ## 1.0.1 - 2026-08-27
 
 A documentation fix. There is no code change in this release: the server, the tool surface and

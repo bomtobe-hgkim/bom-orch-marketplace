@@ -130,7 +130,13 @@ const COMMIT_IDENTITY = Object.freeze({
  *     못 막는다.
  */
 const RUN_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-const PURPOSE_PATTERN = /^(?:lane-[ab]|lane-[ab]-\d{3}-(?:b0|br|c)-[12])$/;
+/**
+ * 워크트리 목적. 넷째·다섯째 갈래(`prove-NNN`·`prove-NNN-(b0|br|c)-[12]`)는 `orch_prove` 의 것이다 —
+ * 앵커 하나와 여섯 칸. 실행의 레인 문법을 재사용하지 않는 이유: 증명은 실행이 **끝난 뒤**에 돌고,
+ * 같은 이름을 쓰면 실행이 남긴 레인 워크트리와 증명의 것이 리퍼 원장에서 겹친다(실측: 실행 9,
+ * 2026-08-28 은 다섯 번째 스위트 뒤 55분 상한에 잘려 워크트리를 남긴 채 끝났다).
+ */
+const PURPOSE_PATTERN = /^(?:lane-[ab]|prove-\d{3}|lane-[ab]-\d{3}-(?:b0|br|c)-[12]|prove-\d{3}-(?:b0|br|c)-[12])$/;
 
 /**
  * A logical Run ID is durable authority; this value is only its bounded filesystem projection.

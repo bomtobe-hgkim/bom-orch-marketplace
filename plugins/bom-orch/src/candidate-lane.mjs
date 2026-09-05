@@ -196,7 +196,12 @@ export function decideAttempt(input) {
     if (input?.budgetRemaining) return { action: 'repair', reason: REASON.verifier_issues_open };
     return { action: 'reject', terminalClass: 'rejected', reason: REASON.verifier_issues_open };
   }
-  if (input?.proof?.required === true && input.proof.status !== 'proved') {
+  // ★★ 실행 9(2026-08-28): c-1 초록 3,240 증인 · verifier PASS 인 첫 수용 후보가 여기서
+  //   `usable_unverified` 로 떨어졌다. 여섯 칸 증명은 이 저장소에서 42분이고 55분 상한이
+  //   다섯 번째 스위트 실행에서 실행을 끊어 증명이 `unavailable` 이 됐기 때문이다. 유예는
+  //   실패가 아니므로 이 가지에 안 들어온다 — 규칙을 지우지 않는 이유는 `not_proven`·`flaky`
+  //   의 정본이 여기이고, 그 값은 `orch_prove` 가 낸다.
+  if (input?.proof?.required === true && !['proved', 'deferred'].includes(input.proof.status)) {
     if (input.proof.repairable === true && input.budgetRemaining) return { action: 'repair', reason: REASON.test_proof_not_proven };
     if (input.proof.repairable === true) return { action: 'reject', terminalClass: 'rejected', reason: REASON.test_proof_not_proven };
     return { action: 'accept', terminalClass: 'usable_unverified', reason: REASON.evidence_unavailable };
@@ -214,6 +219,11 @@ function defaultTests() {
   };
 }
 
+/**
+ * ★★ 여기 기본값은 `deferred` 가 **아니다**. 이 값은 「증거 평가를 받지 못했다」의 모양이다 —
+ *   attempt 가 하나도 안 돌았거나 `cloneData` 가 평가 결과를 못 베낀 경우다. `deferred` 는
+ *   증거 러너가 c 둘을 실제로 돌리고 낸 사실이라 그 자리(`src/regression-proof.mjs`)에서만 태어난다.
+ */
 function defaultProof(requirement) {
   return {
     required: requirement?.required === true,
@@ -470,6 +480,34 @@ function failureFingerprints(evaluation) {
     : [];
 }
 
+/** verifier 프롬프트에 싣는 실패 테스트 이름의 상한 — 슬롯(`EXCERPT_CHARS`)이 다시 자르지만 개수도 유계여야 한다. */
+const MAX_FAILURE_NAMES = 12;
+
+/**
+ * 이번 실행의 실패 지문에 붙은 이름들. 신뢰할 수 있는 완결 실행의 지문에 붙은 것만 남긴다 —
+ * 지문이 없는 이름은 출처가 없고, 이름이 없는 지문은 예전처럼 산문 없이 간다.
+ *
+ * ★ 2026-08-28 라이브 실측: 재시도 워커가 이슈 본문을 받게 된 뒤에도 verifier 가 못 짚은 실패(폐포
+ *   헤더 숫자 하나)는 아무에게도 안 가 3·4차가 같은 패치를 냈다. 기계가 아는 이름은 기계가 말한다.
+ */
+function labelledFailures(evaluation) {
+  const fingerprints = new Set(failureFingerprints(evaluation));
+  const seen = new Set();
+  const kept = [];
+  for (const entry of Array.isArray(evaluation?.failureLabels) ? evaluation.failureLabels : []) {
+    if (typeof entry?.fingerprint !== 'string' || typeof entry?.label !== 'string' || entry.label === '' ||
+        !fingerprints.has(entry.fingerprint) || seen.has(entry.fingerprint)) continue;
+    seen.add(entry.fingerprint);
+    kept.push({ fingerprint: entry.fingerprint, label: entry.label });
+  }
+  return kept.sort((left, right) => compareUtf8(left.label, right.label));
+}
+
+const machineLabels = (evaluation) =>
+  Object.fromEntries(labelledFailures(evaluation).map(({ fingerprint, label }) => [fingerprint, label]));
+const failingTestNames = (evaluation) =>
+  labelledFailures(evaluation).slice(0, MAX_FAILURE_NAMES).map((entry) => entry.label);
+
 function recovery(code, spec, attempt, parent) {
   return deepFreeze({ code, path: spec.authoringWorktree.path, lastSealedParent: parent ?? null, attemptId: attempt ?? null });
 }
@@ -685,6 +723,7 @@ export async function runCandidateLane(spec, deps) {
       trusted: evaluation.tests?.trusted === true,
       completed: evaluation.tests?.complete === true && evaluation.tests?.execution === 'completed',
       failureFingerprints: evaluation.tests?.failureFingerprints ?? [],
+      labels: machineLabels(evaluation),
     });
     if (machineLedger?.ok === false) {
       const attempt = normalizedAttempt({ spec, binding, ordinal, retryOf, writerResult: 'sealed', sealed, writerUsage, verifierUsage, result: 'rejected', feedback: ledger });
@@ -727,6 +766,7 @@ export async function runCandidateLane(spec, deps) {
             stability: evaluation.tests?.stability ?? 'unknown',
             trusted: evaluation.tests?.trusted === true,
             complete: evaluation.tests?.complete === true,
+            failures: failingTestNames(evaluation),
             evidenceIds: [...sealed.evidenceIds],
           },
           formatCorrection: formatAttempt === 1, formatOnly: formatAttempt === 1,

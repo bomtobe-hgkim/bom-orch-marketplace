@@ -3,16 +3,16 @@
  *
  * ★ 방향은 하나뿐이다: 여기서 `src/run-artifacts.mjs` 를 수입하지 않는다.
  *
- * ★ 실측 폐포(WS5 T12 뒤): **16개 모듈 / 6,095줄**(자기 자신 450 포함) — `reason-codes`·`reason-text`(실패 어휘는 전역 제약 5 때문에
+ * ★ 실측 폐포(WS5 T12 뒤): **16개 모듈 / 6,239줄**(자기 자신 450 포함) — `reason-codes`·`reason-text`(실패 어휘는 전역 제약 5 때문에
  *   같이 온다), `run-manifest`(`boundedString` 하나 — 태스크 3 뒤 `manifest-selection`·`candidate-selection`·`verdict`·`preflight`
  *   를 끈다), `util/{errors,freeze,fs-atomic,hash,objects,paths,strings}`. 저장소 모듈도 `content-projection` 도 없다.
  *   태스크 1 의 첫 판은 그보다 4,000줄 넘게 컸고 차이는 함수 하나였다: `inspectRunArtifactCollision` 이 부르는
  *   `validateArtifactPathBudget` 가 `content-projection` → `envelope`·`patch-scope` → `git` → `providers/*` 를 달고 왔다. 그래서 그것은 저장소로 돌아갔다 — 여기로 다시 옮기면 폐포는 그 시절로 되돌아간다.
  *
  * ★ 수입하는 쪽은 셋뿐이다: `src/run-artifacts.mjs`(원시 12개), `src/reaper.mjs`(`verifyArtifactOwnerOnly` 하나),
- *   `test/candidate-artifacts.test.mjs`. 실측 폐포(src/reaper.mjs): **44개 모듈 / 17,049줄**(자기 자신 697 포함)
- *   (태스크 3 — run-manifest 가 selection 잎들을 끌고, 리퍼 자신도 `manifest-transition` 을 수입한다)이다: 저장소가
- *   달고 오던 `content-projection` 무리는 빠진 채고, 매니페스트 이름 다섯은 여전히 `src/run-manifest.mjs` 에서 직접 간다.
+ *   `test/candidate-artifacts.test.mjs`. 실측 폐포(src/reaper.mjs): **45개 모듈 / 17,762줄**(자기 자신 707 포함)
+ *   (태스크 3 — run-manifest 가 selection 잎들을 끌고, 리퍼 자신도 `manifest-transition` 을 수입한다; follow-up ③
+ *   2026-09-01, +24 — `sweepOrphans` 가 `sweepProofs` 를 부팅 스윕에 마저 부른다)이다: 저장소가 달고 오던 `content-projection` 무리는 빠진 채고, 매니페스트 이름 다섯은 여전히 `src/run-manifest.mjs` 에서 직접 간다.
  */
 
 import { randomBytes } from 'node:crypto';

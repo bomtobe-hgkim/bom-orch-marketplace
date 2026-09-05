@@ -106,10 +106,10 @@ export function buildClaudeArgs({
   if (typeof effort === 'string' && effort !== '') args.push('--effort', effort);
 
   if (readOnly) {
-    // 빈 문자열이 "도구 전부 끔"이다. 이 값을 걸러내면 정반대로 전부 켜진다.
-    // allowedTools 가 들어와도 여기서는 쓰지 않는다 — 읽기 전용이 권한 상승
-    // 경로가 되면 안 된다.
-    args.push('--tools', '');
+    // 빈 문자열이 "도구 전부 끔"이다. 이 값을 걸러내면 정반대로 전부 켜진다. allowedTools 가
+    // 들어와도 여기서는 쓰지 않는다 — 읽기 전용이 권한 상승 경로가 되면 안 된다.
+    // ★ `--tools ""` 는 내장 도구만 끈다 — 실측(2026-09-05) 이 플래그가 없으면 plugin:bom-orch MCP 가 도구 8개로 붙었다.
+    args.push('--tools', '', '--strict-mcp-config');
     return args;
   }
 
@@ -182,10 +182,10 @@ export function buildClaudeArgs({
   //    (그 사람 기계다 — 모델·인증 설정이 거기 있다)만 남긴다. `--strict-mcp-config` 는
   //    `--mcp-config` 로 준 것 말고는 아무 MCP 설정도 읽지 않게 한다.
   //
-  //    두 플래그는 읽기 전용 역할에는 붙이지 않는다 — 그쪽은 `--tools ''` 로 도구가
-  //    통째로 꺼져 있어 훅을 발화시킬 도구 호출 자체가 없다. (SessionStart 는 도구와
-  //    무관하지만, 읽기 전용 역할은 사용자 저장소가 아니라 일회용 **빈 디렉터리**에서
-  //    돌므로 프로젝트 settings 가 존재하지 않는다.)
+  //    `--setting-sources` 는 읽기 전용 역할에는 붙이지 않는다 — 일회용 **빈 디렉터리**에서
+  //    돌므로 프로젝트 settings 가 존재하지 않고, 사용자 자신의 모델·인증 설정은 남아야 한다.
+  //    `--strict-mcp-config` 는 읽기 전용에도 붙인다(2026-09-05) — 사용자 수준 MCP 서버는
+  //    `--tools ''` 와 무관하게 뜨고, 그 도구는 내장 집합 밖이라 읽기 전용 역할에 실릴 수 있다.
   args.push('--setting-sources', SETTING_SOURCES, '--strict-mcp-config');
 
   args.push('--permission-mode', permissionMode);

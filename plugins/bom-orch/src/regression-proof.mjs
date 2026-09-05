@@ -1,4 +1,4 @@
-import { selectTestDeltaWitnesses } from './test-evidence.mjs';
+import { failingTestLabels, selectTestDeltaWitnesses } from './test-evidence.mjs';
 import {
   checkFrozenTestPlanEnvironment,
   classifyFrozenTestPath,
@@ -19,9 +19,6 @@ import { boundedText, compareUtf8 } from './util/strings.mjs';
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const SAFE_MODE = new Set(['100644', '100755']);
-const BUG_FIX_PATTERN = /\b(?:bug|bugs|error|errors|failure|failures|regression|regressions|repair|repairs|fix|fixes|fixed|fixing)\b|버그|오류|실패|회귀|고쳐|(?:문제|결함|깨짐|고장)(?:을|를|이|가)?\s*(?:수정|고치|해결)/i;
-const NON_BUG_PATTERN = /\b(?:feature|features|refactor|refactors|refactoring|docs?|documentation)\b|기능|리팩터|문서/i;
-const CODE_CLASSES = new Set(['code:test-bearing', 'code:no-tests']);
 
 /**
  * 회귀 증명이 **증인으로 받아 주는** 어댑터. `ADAPTER_IDS` 보다 좁은 것이 의도다.
@@ -34,7 +31,15 @@ const CODE_CLASSES = new Set(['code:test-bearing', 'code:no-tests']);
  *   가 그 문장을 **이 목록에서** 유도한다. 목록↔분류기 결합은 `test/test-runner.test.mjs` 가 잰다.
  */
 export const REGRESSION_WITNESS_ADAPTERS = Object.freeze(['node-events-v1', 'pytest-events-v1']);
-const EVIDENCE_KEYS = [
+
+/**
+ * 증거 러너가 도는 **단계 표**. `run` 은 후보 스위트 둘(`c/1`·`c/2`)뿐이고 `prove` 는 여섯 칸
+ * (`c/1`·`b0`×2·`br`×2·`c/2`)이다. 실행 9(2026-08-28)가 근거다: 여섯 칸은 이 저장소에서 42분이고
+ * `MAX_WAIT_MS`(3,300,000ms)가 **다섯 번째 스위트 실행에서** 실행을 끊어 초록 후보가
+ * `evidence_unavailable` 로 나갔다. 셋째 값은 없다 — 표가 셋이 되면 계약도 셋이 된다.
+ */
+export const EVIDENCE_STAGES = Object.freeze(['run', 'prove']);
+export const EVIDENCE_KEYS = [
   'schemaVersion',
   'evidenceId',
   'attemptId',
@@ -86,14 +91,16 @@ function result(required, status, repairable, evidenceIds = [], reasonCodes = []
   };
 }
 
-/** Freeze the proof policy before provider-controlled work begins. */
+/**
+ * Freeze the proof policy before provider-controlled work begins.
+ *
+ * ★ 오너 결정 B(2026-08-31): 과제 글자·taskClass 로 짐작하던 옛 분류기는 라이브 실행에서
+ *   "고치세요" 를 놓쳐 `non_code_task` 를 냈다 — 키워드 목록은 완비될 수 없다. 이제 보는 것은
+ *   `requireProof` 하나뿐: `=== false` 만 빠지고 나머지(부재·비-불리언 포함)는 fail-closed.
+ */
 export function classifyProofRequirement(input = {}) {
-  const task = typeof input?.task === 'string' ? input.task : '';
-  const taskClass = typeof input?.taskClass === 'string' ? input.taskClass : '';
-  if (BUG_FIX_PATTERN.test(task)) return Object.freeze({ required: true, reason: 'explicit_bug_fix' });
-  if (NON_BUG_PATTERN.test(task)) return Object.freeze({ required: false, reason: 'explicit_non_bug' });
-  if (CODE_CLASSES.has(taskClass)) return Object.freeze({ required: true, reason: 'default_code_change' });
-  return Object.freeze({ required: false, reason: 'non_code_task' });
+  if (input?.requireProof === false) return Object.freeze({ required: false, reason: 'explicit_opt_out' });
+  return Object.freeze({ required: true, reason: 'default_required' });
 }
 
 function invalidPath(path) {
@@ -533,9 +540,15 @@ function attemptOrdinal(spec) {
   return /^\d{3}$/.test(ordinal) ? ordinal : null;
 }
 
+/**
+ * ★ 셋째 laneId `prove` 는 `orch_prove` 의 것이다. `attemptOrdinal` 은 접두사를 `spec.laneId` 로
+ *   짓기 때문에 한 글자도 안 바뀐다 — `<runId>/prove/001` 이 그대로 서수로 읽히고, 증거 id 는
+ *   `<runId>/prove/001/(B0|BR|C)/(1|2)` 로 파생돼 실행의 c/1 기록과 절대 안 겹친다(설계 §1.3).
+ */
 function validEvidenceSpec(spec) {
   return spec && typeof spec === 'object' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(spec.runId ?? '') &&
-    ['lane-a', 'lane-b'].includes(spec.laneId) && attemptOrdinal(spec) !== null &&
+    EVIDENCE_STAGES.includes(spec.stage) &&
+    ['lane-a', 'lane-b', 'prove'].includes(spec.laneId) && attemptOrdinal(spec) !== null &&
     OBJECT_ID_PATTERN.test(spec.baseline?.commit ?? '') && OBJECT_ID_PATTERN.test(spec.baseline?.tree ?? '') &&
     OBJECT_ID_PATTERN.test(spec.candidate?.commit ?? '') && OBJECT_ID_PATTERN.test(spec.candidate?.treeHash ?? '') &&
     SHA256_PATTERN.test(spec.candidate?.patchSha256 ?? '') && spec.candidate?.testPlanFingerprint === spec.frozenTestPlan?.planFingerprint &&
@@ -679,10 +692,12 @@ function operationalFailure(code) {
   return allowed.has(code) ? Object.freeze({ code }) : null;
 }
 
-function candidateEvidenceResult(tests, regressionProof, evidence, cleanup, reason = null) {
+function candidateEvidenceResult(tests, regressionProof, evidence, cleanup, reason = null, failureLabels = []) {
   return Object.freeze({
     tests,
     regressionProof,
+    // 후보 실행(c)의 실패 테스트 이름 — 기록에는 없고 이 결과에만 있다(`failingTestLabels` 의 WHY).
+    failureLabels: Object.freeze(failureLabels.map((entry) => Object.freeze({ ...entry }))),
     evidence: Object.freeze([...evidence].sort((a, b) => a.evidenceOrdinal - b.evidenceOrdinal)),
     cleanup: Object.freeze([...cleanup]),
     operationalFailure: operationalFailure(reason),
@@ -698,6 +713,18 @@ function initialFailureProof(spec, candidateRecords, reasonCode) {
   const required = spec.proofRequirement.required === true;
   if (!required) return result(false, 'not_applicable', false, candidateRecords.map((record) => record.evidenceId));
   return result(true, 'not_proven', true, candidateRecords.map((record) => record.evidenceId), [reasonCode]);
+}
+
+/**
+ * 실행 안(`stage: 'run'`)에서 c 둘이 다 초록일 때의 증명 — **유예**다. `unavailable` 로 적으면
+ * 「인프라가 못 냈다」가 되어 초록 후보가 `usable_unverified` 로 떨어진다(실행 9, 2026-08-28:
+ * 그 한 값 때문에 첫 수용 후보가 unverified 로 나갔다). 증명이 애초에 필요 없으면 유예도 아니다.
+ */
+function deferredProof(spec, candidateRecords) {
+  const evidenceIds = candidateRecords.map((record) => record.evidenceId);
+  return spec.proofRequirement.required === true
+    ? result(true, 'deferred', false, evidenceIds)
+    : result(false, 'not_applicable', false, evidenceIds);
 }
 
 /** Orchestrate bounded, revision-bound evidence without persisting raw output or binary patch bytes. */
@@ -720,6 +747,11 @@ export async function runCandidateEvidence(spec, deps = {}) {
   const inspectEnvironment = deps.checkFrozenEnvironment ?? ((input) =>
     checkFrozenTestPlanEnvironment(input.plan, deps.runnerDeps ?? {}));
   const selectWitnesses = deps.selectTestDeltaWitnesses ?? selectTestDeltaWitnesses;
+  // ★ 라벨은 **후보 실행(c)** 의 원본 기록에서만 뽑는다 — 권위 WeakMap 의 키가 그 객체다. c 는
+  //   캐시되지 않으므로(`runOne('c', …, false)`) 이 자리 하나로 충분하다. 지문 하나에 라벨 하나.
+  const labelsOf = deps.failingTestLabels ?? failingTestLabels;
+  const candidateLabels = new Map();
+  const labelsResult = () => [...candidateLabels].map(([fingerprint, label]) => ({ fingerprint, label }));
   const persist = typeof deps.persistEvidence === 'function' ? deps.persistEvidence : async () => ({ blocked: true });
   const handoffCleanup = typeof deps.handoffEvidenceCleanup === 'function'
     ? deps.handoffEvidenceCleanup
@@ -836,7 +868,18 @@ export async function runCandidateEvidence(spec, deps = {}) {
         if (!Buffer.isBuffer(spec.testDelta.patch) || sha256(spec.testDelta.patch) !== spec.testDelta.sha256) {
           throw queueError(REASON.test_delta_authority_mismatch);
         }
-        const applied = await applyPatch(worktree, { patch: spec.testDelta.patch, sha256: spec.testDelta.sha256 });
+        // ★★ 이 `worktree` 는 바로 위 `createWorktree` 가 방금 만들었고, 그 안에서 레인은
+        //   `createEvidenceWorktree`(`src/run-lane-adapters.mjs`), prove 는
+        //   `createProofWorktree`(`src/proof-stage.mjs`) 로 baseline 워크트리에 이미
+        //   lockfile 프로비저닝(`node_modules/` 등)을 마쳤다. b0·c 는 여기 안 들어오니 그
+        //   프로비저닝을 안 건드리고, `br` 만 그 위에 테스트 전용 델타를 얹는다 — 그래서 이
+        //   증거 셀에서만 `allowIgnored:true` 다: 프로비저닝된 무시 경로는 침입이 아니라 이번
+        //   실행이 기록한 환경 그 자체이므로 `applyPatchBytes` 의 pristine 판정에서 빼야
+        //   한다(WHY 는 `src/worktree-patch.mjs`). 실행 10, prove attempt 3(2026-08-31)
+        //   실측: `tests.provisionDeps:'lockfile-install'` 켜진 여섯 칸에서 c/1·b0/1·b0/2
+        //   초록 뒤 br/1 이 `test_delta_apply_failed` 로 죽어 증명이 `unavailable` 로
+        //   남았다(`cost.testRuns.count` 4).
+        const applied = await applyPatch(worktree, { patch: spec.testDelta.patch, sha256: spec.testDelta.sha256, allowIgnored: true });
         if (applied?.ok !== true) throw queueError(REASON.test_delta_apply_failed);
       }
       if (!(await checkEnvironment('before_spawn', kind, repetition))) throw queueError(operationalReason);
@@ -859,6 +902,16 @@ export async function runCandidateEvidence(spec, deps = {}) {
           }
         },
       }, { ...(deps.runnerDeps ?? {}), testQueue: spec.testQueue });
+      if (kind === 'c') {
+        let labels = [];
+        try { labels = labelsOf(raw); } catch { labels = []; }
+        for (const entry of Array.isArray(labels) ? labels : []) {
+          if (typeof entry?.fingerprint === 'string' && SHA256_PATTERN.test(entry.fingerprint) &&
+              typeof entry.label === 'string' && entry.label !== '' && !candidateLabels.has(entry.fingerprint)) {
+            candidateLabels.set(entry.fingerprint, entry.label);
+          }
+        }
+      }
       let projection;
       try {
         projection = selectWitnesses(raw, kind === 'b0' ? [] : spec.testDelta.paths);
@@ -993,6 +1046,7 @@ export async function runCandidateEvidence(spec, deps = {}) {
       evidence,
       cleanup,
       operationalReason,
+      labelsResult(),
     );
   }
   if (operationalReason !== null) {
@@ -1002,6 +1056,7 @@ export async function runCandidateEvidence(spec, deps = {}) {
       evidence,
       cleanup,
       operationalReason,
+      labelsResult(),
     );
   }
   if (c1.execution !== 'completed' || c1.outcome !== 'pass') {
@@ -1011,10 +1066,14 @@ export async function runCandidateEvidence(spec, deps = {}) {
       evidence,
       cleanup,
       operationalReason,
+      labelsResult(),
     );
   }
 
-  const prove = spec.proofRequirement.required === true && spec.testDelta?.status === 'separable';
+  // ★ 표가 b0/br 을 **제거한다** — 호출부가 끄는 스위치가 아니다. 실행 경로에 그 넷이 남아
+  //   있으면 계약이 둘이 되고, 실행 9 를 55분 상한에서 끊은 42분이 그대로 돌아온다.
+  const prove = spec.stage === 'prove' && spec.proofRequirement.required === true &&
+    spec.testDelta?.status === 'separable';
   if (prove) {
     for (const kind of ['b0', 'br']) {
       for (const repetition of [1, 2]) {
@@ -1034,6 +1093,8 @@ export async function runCandidateEvidence(spec, deps = {}) {
         ? REASON.evidence_persistence_failed
         : operationalReason,
     );
+  } else if (spec.stage === 'run') {
+    regressionProof = deferredProof(spec, candidate);
   } else {
     regressionProof = completeRegressionProof({
       required: spec.proofRequirement.required,
@@ -1051,5 +1112,6 @@ export async function runCandidateEvidence(spec, deps = {}) {
     evidence,
     cleanup,
     persistenceFailed ? REASON.evidence_persistence_failed : operationalReason,
+    labelsResult(),
   );
 }

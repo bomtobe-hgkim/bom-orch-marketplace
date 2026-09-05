@@ -12,7 +12,7 @@ When it cannot prove the change works, it says `unverified` and tells you why.
 **Requirements:** Node.js 22.11 or newer, with `claude`, `codex`, and `git` on the
 host application's `PATH`. Authenticate both worker CLIs before calling `orch_run`.
 
-## The eight tools
+## The nine tools
 
 | Tool | What it does |
 |---|---|
@@ -21,6 +21,7 @@ host application's `PATH`. Authenticate both worker CLIs before calling `orch_ru
 | `orch_config` | Reads or updates the model and effort behind each tier |
 | `orch_stats` | Read-only learning statistics: a compact summary by default, raw alpha/beta with `view:full`, plus optional recent runs |
 | `orch_status` | Reads one finished run back off disk, or lists the recent runs when called with no arguments |
+| `orch_prove` | Runs the six-suite regression proof for a finished run's selected candidate and writes it under the state root; applies nothing |
 | `orch_apply` | Applies a finished run's patch to your repository — the explicit step `orch_run` never takes on its own |
 | `orch_reward` | Human correction of a past run's automatic grade. Idempotent |
 | `orch_reset` | Clears learned posteriors only when called with `confirm:true`; optionally narrowed by task class |
@@ -37,11 +38,14 @@ claim success it cannot prove should lead with the cases where it stops.
   and issues. Callers that treated a prose approval as a pass need to be updated.
 - **`candidates: 2` roughly doubles cost.** Two lanes each author, each
   cross-verify, and each run their own regression evidence.
-- **Regression proof multiplies the test runs.** A run that must prove a regression
-  runs your whole test suite up to six times in series per candidate per attempt,
-  against two for a run that needs no proof — 22 at the default `budget: 5`, 42 with
-  `candidates: 2`. `cost.testRuns` reports what it actually took, and preflight warns
-  before any credit is spent when those runs cannot fit inside `wait_ms`.
+- **The regression proof runs once, in `orch_prove`.** In `orch_run` the whole
+  test suite runs twice per candidate per attempt (`c-1` and `c-2`) and the run
+  reports the proof as `deferred` — 10 serial suite runs at the default
+  `budget: 5`, 20 with `candidates: 2`. The regression proof itself — the whole
+  suite six times against two baselines — is run once by `orch_prove`, for the
+  selected candidate only. `cost.testRuns` reports what it actually took, and
+  preflight warns before any credit is spent when those runs cannot fit inside
+  `wait_ms`.
 - **One shared deadline.** `wait_ms` bounds the whole run, not each lane. After
   that shared deadline passes, no new provider, test, or judge call starts.
 - **A `tie` keeps both patches and produces no representative patch.** When the
@@ -69,7 +73,7 @@ claim success it cannot prove should lead with the cases where it stops.
 
 ## Post-install check
 
-Open a new host session and confirm all eight `orch_*` tools above are present,
+Open a new host session and confirm all nine `orch_*` tools above are present,
 then call `orch_models`. Neither step spends model tokens. Call `orch_run` only
 after both worker CLIs are authenticated.
 

@@ -95,14 +95,57 @@ export function workerInstruction({ task, plan, step, budget, feedback }) {
 }
 
 /**
- * 앞 스텝이 남긴 열린 이슈 한 줄 — `workerInstruction` 의 `feedback` 인자.
+ * 피드백에 싣는 이슈 본문 **하나**의 상한. 슬롯 전체는 `EXCERPT_CHARS` 가 다시 자른다.
+ *
+ * ★ 둘이 따로 있는 이유: 본문 하나가 슬롯을 다 먹으면 두 번째 이슈부터는 ID 조차 안 실린다.
+ *   400 이면 1,200 안에 본문 둘과 세 번째의 머리가 들어간다. 저장 상한(`MAX_ISSUE_CLAIM_CHARS`
+ *   500)을 안 쓰는 이유는 그 값을 수입하면 기록 모듈이 프롬프트 폐포에 들어오기 때문이다.
+ */
+export const FEEDBACK_CLAIM_CHARS = 400;
+
+/** 기계 증거 문단 안의 실패 테스트 이름 줄 상한 — 문단의 다른 줄(실행·판정·증거 ID)이 밀려나지 않게. */
+const FAILURE_NAMES_CHARS = 600;
+
+/**
+ * 열린 이슈를 **본문과 함께** 한 줄씩 — 워커의 재시도 피드백과 verifier 의 재점검 목록이 같이 쓴다.
+ *
+ * ★★ 왜 ID 만으로는 안 되는가(2026-08-28 라이브 실측, 진짜 저장소·두 벤더 교차검증): 재시도 워커가
+ *   받은 피드백 전부가 `열린 이슈: A-I001, A-I002` 였다. 워커는 새 세션이라 그 ID 가 무엇이었는지
+ *   알 길이 없고, 실제로 **바이트 동일한** 패치를 다시 내 `lane_stagnated` 로 끝났다. 재점검
+ *   verifier 도 같은 처지였다 — 자기가 안 쓴 ID 를 「다시 확인하라」고 받았다. 본문(claim)은 그때
+ *   이미 원장에 있었다(WS2 가 `orch_status` 를 위해 넓혔다). 프롬프트에만 안 실렸을 뿐이다.
+ * ★ machine 이슈에는 산문이 없다(지문뿐, 불변식 4) — 그때는 지어내지 않고 그 사실을 적는다.
+ * ★ 원장(`{openIds, entries}`)을 그대로 받는다. 호출부가 본문을 골라 넘기게 하면 그 고르는 코드가
+ *   두 호출부에 복사되고, 둘이 갈리는 순간 워커와 verifier 가 다른 이슈를 본다.
+ */
+export function openIssueLines(feedback) {
+  const openIds = Array.isArray(feedback?.openIds) ? feedback.openIds : [];
+  if (openIds.length === 0) return null;
+  const entries = Array.isArray(feedback?.entries) ? feedback.entries : [];
+  const byId = new Map(entries.map((entry) => [entry?.id, entry]));
+  return openIds.map((id) => {
+    const entry = byId.get(id);
+    const claim = entry?.issue?.claim;
+    const label = entry?.label;
+    const body = typeof claim === 'string' && claim.trim() !== ''
+      ? clipCounted(claim.trim(), FEEDBACK_CLAIM_CHARS)
+      : typeof label === 'string' && label !== ''
+        ? `실패한 테스트: ${clipCounted(label, FEEDBACK_CLAIM_CHARS)}`
+        : '우리가 돌린 테스트가 실패했다 (본문 없음 — 기계 증거)';
+    return `- ${id}: ${body}`;
+  }).join('\n');
+}
+
+/**
+ * 앞 스텝이 남긴 열린 이슈 — `workerInstruction` 의 `feedback` 인자.
  *
  * ★ 왜 호출부가 아니라 여기 있는가: 이 문장은 engine 의 워커 호출부에서 인라인으로 만들어졌고,
  *   그래서 프롬프트 한국어 한 조각이 블록 **밖**에 남아 있었다. 경로로 예외를 주는 이 모듈의
  *   전제가 "프롬프트 글자는 전부 여기" 이므로, 한 줄이라도 밖에 두면 그 전제가 거짓이 된다.
  */
-export function workerFeedback(openIds) {
-  return openIds?.length > 0 ? `열린 이슈: ${openIds.join(', ')}` : null;
+export function workerFeedback(feedback) {
+  const lines = openIssueLines(feedback);
+  return lines === null ? null : `열린 이슈:\n${lines}`;
 }
 
 /**
@@ -125,6 +168,9 @@ export function workerFeedback(openIds) {
 export function describeMachineEvidence(evidence) {
   if (!evidence || typeof evidence !== 'object') return '이 실행에 대한 기계 증거가 없습니다.';
   const ids = Array.isArray(evidence.evidenceIds) ? evidence.evidenceIds : [];
+  // 실패한 테스트의 **이름**(어댑터가 파싱한 `경로 › 이름`, 원문 아님) — 있을 때만, 유계로. 이 문단의
+  //   나머지가 잘리지 않게 이 줄 자체를 먼저 자른다(슬롯 1,200 중 600).
+  const failures = Array.isArray(evidence.failures) ? evidence.failures.filter((name) => typeof name === 'string' && name !== '') : [];
   if (evidence.execution === 'not_run') {
     return ['우리가 테스트를 실행하지 못했습니다.', `봉인된 증거: ${ids.join(', ') || '(없음)'}`].join('\n');
   }
@@ -136,6 +182,7 @@ export function describeMachineEvidence(evidence) {
     `신뢰 가능한 러너: ${evidence.trusted === true ? '예' : '아니오'}`,
     `완결: ${evidence.complete === true ? '예' : '아니오'}`,
     `봉인된 증거: ${ids.join(', ') || '(없음)'}`,
+    ...(failures.length > 0 ? [`실패한 테스트 ${failures.length}개: ${clipCounted(failures.join('; '), FAILURE_NAMES_CHARS)}`] : []),
   ].join('\n');
 }
 
@@ -147,6 +194,8 @@ export function describeMachineEvidence(evidence) {
  */
 export function verifierInstruction({ task, plan, files, tests, expected, feedback, formatOnly = false }) {
   const binding = JSON.stringify(expected);
+  // 재점검 목록도 본문으로 — 이유는 `openIssueLines` 에 있다. 슬롯 상한은 다른 발췌와 같다.
+  const recheck = openIssueLines(feedback);
   const schema = expected.phase === 'recheck'
     ? '{"schemaVersion":1,"candidateId":"...","attemptId":"...","candidatePatchSha256":"64 lowercase hex","evidenceIds":["..."],"verdict":"PASS|FAIL","checks":[{"id":"...","status":"resolved|persists","evidence":"..."}],"newIssues":[],"notes":[]}'
     : '{"schemaVersion":1,"candidateId":"...","attemptId":"...","candidatePatchSha256":"64 lowercase hex","evidenceIds":["..."],"verdict":"PASS|FAIL","summary":"...","issues":[{"category":"correctness|security|requirements|scope|tests","claim":"...","evidence":"...","requiredFix":"..."}],"notes":[]}';
@@ -167,7 +216,7 @@ export function verifierInstruction({ task, plan, files, tests, expected, feedba
     '',
     '테스트 결과:',
     clipCounted(tests, EXCERPT_CHARS),
-    ...(feedback?.openIds?.length > 0 ? ['', `다시 확인할 열린 이슈: ${feedback.openIds.join(', ')}`] : []),
+    ...(recheck === null ? [] : ['', '다시 확인할 열린 이슈:', clipCounted(recheck, EXCERPT_CHARS)]),
     '',
     '작업이 실제로 끝났는지, 빠진 것이나 잘못된 것이 있는지 판정하세요.',
   ].join('\n');

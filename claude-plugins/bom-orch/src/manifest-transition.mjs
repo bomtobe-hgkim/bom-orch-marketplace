@@ -11,7 +11,7 @@
  *   건드려도 되는지는 `validManifestStateTransition` 의 **닫힌 목록**이 정한다 — 목록에 없는 조합은 거부다.
  *
  * ★ 저장소 모듈(`run-artifacts`·`run-store-fs`·`run-records`·`run-inspect`)은 하나도 수입하지 않는다.
- * ★ 실측 폐포: **13개 모듈 / 4,150줄**(자기 자신 125 포함) — `run-manifest` 과 그것이 끄는 `manifest-vocabulary`·`manifest-selection`·`candidate-selection`·`verdict`·`reason-codes`·`preflight`(WS4b)·`util/{freeze,hash,objects,paths,strings}`.
+ * ★ 실측 폐포: **13개 모듈 / 4,228줄**(자기 자신 125 포함) — `run-manifest` 과 그것이 끄는 `manifest-vocabulary`·`manifest-selection`·`candidate-selection`·`verdict`·`reason-codes`·`preflight`(WS4b)·`util/{freeze,hash,objects,paths,strings}`.
  */
 
 import { sameJson } from './manifest-vocabulary.mjs';

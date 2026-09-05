@@ -6,14 +6,14 @@
  * **부르기만** 한다 — 판정은 전부 여기 있고, 그래서 전 주장을 `test/preflight.test.mjs` 가
  * 워크트리도 벤더도 시계도 없이 잰다.
  *
- * ★ 실측 폐포: **1개 모듈 / 334줄**(자기 자신 334 포함) — 상대 import 가 0 이라 폐포가 자기
+ * ★ 실측 폐포: **1개 모듈 / 328줄**(자기 자신 328 포함) — 상대 import 가 0 이라 폐포가 자기
  *   자신뿐이다. 저장소(`src/run-artifacts.mjs`)도 `src/engine.mjs` 도 당연히 0 개다.
  *
  * ## ★★ 왜 정본을 수입하지 않고 **인자로 받는가**
  *
  * 이 판정들이 쓰는 정본은 셋이고 전부 다른 파일에 산다: 증인 어댑터 목록
  * (`REGRESSION_WITNESS_ADAPTERS`, `src/regression-proof.mjs`) · 스위트 기본 타임아웃
- * (`DEFAULT_TIMEOUT_MS`, `src/test-spawn.mjs`) · 실행 대기 상한(`MAX_WAIT_MS`, `src/engine.mjs`).
+ * (`DEFAULT_TIMEOUT_MS`, `src/test-spawn.mjs`) · 실행 대기 상한(`MAX_WAIT_MS`, `src/deadline.mjs`).
  * 수입하면 값은 정확해지지만 폐포가 무너진다 — `regression-proof` 하나만 수입해도 이 판정기가
  * **25개 모듈 / 13,583줄**(실측)을 끌고 오고 그중에는 git 을 스폰하는 모듈이 있다. 그리고
  * `engine` 은 애초에 수입할 수 없다(module-directions 의 잎 규칙, 그리고 순환).
@@ -78,12 +78,6 @@ export const PROOF_MULTIPLIER_BASELINE = 2;
 export const PROOF_MULTIPLIER_PROVEN = 6;
 
 /**
- * 여섯 칸 중 **실행 전체가 공유하는** 둘 — 맨 베이스라인 `b0`×2 다. 캐시 키가 그 둘에만 테스트
- * 델타를 안 넣으므로(`cacheKey`, `src/regression-proof.mjs:574`) 레인·시도가 늘어도 다시 안 돈다.
- */
-export const SHARED_BASELINE_RUNS = 2;
-
-/**
  * 명령줄 전체의 OS 상한 — **실측 32,767**(Windows `CreateProcessW`, 끝의 NUL 포함), 8,191 이 아니다.
  * 8,191 은 `cmd.exe` 의 상한이고 이 저장소의 스폰은 `shell: false` 라 그것을 아예 안 지난다
  * (메모 §D.3, 이 상자에서 이진 탐색으로 두 번 독립 측정).
@@ -139,7 +133,7 @@ export function codexArgvChars(text) {
 /**
  * 태스크 텍스트를 뺀 지시문 상계 둘 — 모든 발췌 슬롯을 포화시킨 실측이고 단위는 위 `codexArgvChars`
  * 다. 워커는 따옴표가 없어 길이와 같고(2,676 → **3,099**, WS5 Task 5 = scope 고지 네 줄 419자 +
- * 줄바꿈 4), verifier 는 `BINDING_JSON`·스키마 줄의 따옴표 68개가 더 붙는다(5,892, 정정 판이 최장).
+ * 줄바꿈 4), verifier 는 `BINDING_JSON`·스키마 줄의 따옴표 68개가 더 붙는다(5,892 → **5,618**: 2026-08-28 에 재점검 슬롯이 무계 ID 나열에서 유계 본문 줄이 됐다 — `test/prompts-instructions.test.mjs`).
  *
  * ★★ **오프셋은 둘 중 큰 쪽이다**(최종 리뷰). 같은 raw `task` 가 워커와 verifier 지시문에 **둘 다**
  *   계수 1.0 으로 실리는데(어느 쪽도 `clip` 이 없다), 작은 쪽으로 재면 verifier 만 넘는 띠가
@@ -148,7 +142,7 @@ export function codexArgvChars(text) {
  * `test/prompts-instructions.test.mjs` 가 그 함수를 직접 태워서 지킨다.
  */
 export const CODEX_WORKER_PROMPT_OVERHEAD_CHARS = 3_099;
-export const CODEX_VERIFIER_PROMPT_OVERHEAD_CHARS = 5_892;
+export const CODEX_VERIFIER_PROMPT_OVERHEAD_CHARS = 5_618;
 export const CODEX_PROMPT_OVERHEAD_CHARS =
   Math.max(CODEX_WORKER_PROMPT_OVERHEAD_CHARS, CODEX_VERIFIER_PROMPT_OVERHEAD_CHARS);
 
@@ -205,34 +199,34 @@ export function evidenceReachable(input = {}) {
 }
 
 /**
- * 판정 2 — 증거 패스 **하나**가 스위트를 몇 칸 돌리는가. 값은 2 아니면 6 이다.
+ * 판정 2 — 증거 패스 **하나**가 스위트를 몇 칸 돌리는가. 실행 안에서는 언제나 2 다.
  *
- * 6 은 상계이자 조건부다("델리게이트가 실제로 분리 가능한 테스트 델타를 내면"). 그러나 2 는
- * 상계가 아니라 **하계**이기도 하다 — `c/1`·`c/2` 는 어느 패스에서나 돈다.
+ * ★★ 실행 9(2026-08-28)까지 이 값은 증인 어댑터가 받아들여질 때 6 이었다. 그 여섯 칸은 이
+ *   저장소에서 42분이고 `MAX_WAIT_MS`(3,300,000ms)가 **다섯 번째 스위트 실행에서** 실행을
+ *   끊었다 — 6 × 600,000 > 3,300,000 은 설계 때부터 참이었다. 그래서 여섯 칸은 실행 밖으로
+ *   나갔고(`orch_prove`), 실행이 도는 것은 `c/1`·`c/2` 둘뿐이다. 어댑터도 요건도 이 값을
+ *   더는 안 움직인다 — 그 둘이 사는 자리는 판정 1(증거 도달 가능성)이다.
+ * ★ `PROOF_MULTIPLIER_PROVEN` 은 지운 것이 아니라 **자리를 옮겼다**: `orch_prove` 봉투의
+ *   `cost.testRuns` 행이 그 6 을 쓴다. 여기서 지우면 그 도구가 자기 수를 다시 짓게 된다.
  */
-export function proofMultiplier(input = {}) {
-  return input?.proofRequirement?.required === true && witnessAccepted(input?.plan, input?.witnessAdapters)
-    ? PROOF_MULTIPLIER_PROVEN
-    : PROOF_MULTIPLIER_BASELINE;
+export function proofMultiplier() {
+  return PROOF_MULTIPLIER_BASELINE;
 }
 
 /**
- * 판정 2b — 이 **실행 전체**가 스위트를 최대 몇 번 직렬로 돌리는가.
+ * 판정 2b — 이 **실행 전체**가 스위트를 최대 몇 번 직렬로 돌리는가. 곱셈 하나다:
+ * `2 × candidateCount × budget`. 기본값(레인 1 · 시도 5)에서 **10**, `candidates: 2` 면 **20**.
  *
- * ★★ 위 칸 수는 패스 하나의 것이고 패스는 **레인마다 · 시도마다** 돈다(`src/candidate-lane.mjs:458`
- *   의 서수 루프가 `evaluateAttempt` 를 매 시도 부르고, `repair` 판정이 다음 서수로 잇는다).
- *   그리고 캐시가 실행 전체에 걸쳐 공유하는 것은 `b0` 둘뿐이라 나머지 넷은 레인·시도마다 다시
- *   돈다 — 후보 둘은 `cacheable: false` 라 아예 캐시가 없다. 그래서 상계는 이 곱셈이다:
- *   기본값(레인 1 · 시도 5)에서 **22**, `candidates: 2` 면 **42**.
- * ⚠ 6 을 실행 전체의 상계로 읽던 판에서는 선언 타임아웃 100초짜리 실행이 경고를 한 줄도 못 받고
- *   마감을 넘겼다 — 이 경고가 존재하는 이유 그 자체가 그 창이다(최종 리뷰 C1·I2).
+ * ★★ 캐시로 나누던 항이 사라진 이유는 나눌 것이 없어서다 — 실행 전체가 공유하던 둘은 맨
+ *   베이스라인 `b0` 였고 그 칸은 실행 9(2026-08-28) 뒤 `orch_prove` 로 나갔다. 남은 후보 둘
+ *   (`c/1`·`c/2`)은 `cacheable: false` 라 레인마다·시도마다 정직하게 다시 돈다.
+ * ⚠ 이 수는 증명 요건과 **무관하다**. 요건이 참이든 거짓이든 실행이 도는 칸 수가 같기 때문이고,
+ *   그래서 경고 `preflight_proof_time_exceeds_wait` 는 이제 「스위트가 대기 예산에 안 들어간다」를
+ *   말한다 — 증명이 비싸다가 아니라.
  */
 export function serialSuiteRuns(input = {}) {
-  const cells = proofMultiplier(input);
-  const passes = positiveInt(input?.candidateCount, 1) * positiveInt(input?.budget, 1);
-  return cells === PROOF_MULTIPLIER_PROVEN
-    ? SHARED_BASELINE_RUNS + (cells - SHARED_BASELINE_RUNS) * passes
-    : cells * passes;
+  return PROOF_MULTIPLIER_BASELINE *
+    positiveInt(input?.candidateCount, 1) * positiveInt(input?.budget, 1);
 }
 
 /**

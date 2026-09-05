@@ -213,6 +213,7 @@ async function run({
     evalTokens: runResult.usage?.outputTokens ?? null,
     truncated,
     doneReason,
+    hung: runResult.hung === true, // 끊은 뒤에도 파이프가 안 닫혔다(run-cli) — settle 로그 줄이 싣는 한 비트.
     // codex 는 OS 샌드박스가 있어 샌드박스 격차는 알릴 것이 없다. 다만 호출부가 도구
     // 집합 제한을 요청했는데 이 CLI 에는 그 채널이 없으면 그 사실은 알려야 한다 —
     // 조용히 무시하면 호출부는 워커에게 Bash 가 없다고 믿는다.

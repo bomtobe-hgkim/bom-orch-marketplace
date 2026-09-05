@@ -394,8 +394,9 @@ const readEnvValue = (env, name) => readEnvEntry(env, name)?.value;
  *                    실제 프로세스에 CLAUDECODE=1 을 설정하지 않고도 그것이 안 새는
  *                    것을 증명할 수 있다.
  * @param authNames   이 벤더의 인증·설정 변수 이름
- * @param runId       있으면 BOM_ORCH_RUN_ID 로 스탬프. reaper 원장의 소유권 식별 근거
- *                    이자 중첩 실행 탐지용
+ * @param runId       있으면 BOM_ORCH_RUN_ID 로 스탬프 — 중첩 실행 탐지용이고 유일한 독자는
+ *                    `src/server.mjs` 의 가드다(reaper 는 pid·startTime 과 원장으로 소유권을 가른다).
+ *                    델리게이트·프로비저닝 자식, 그리고 증거 실행 **안의** 증거 실행 자식만(`src/test-runner.mjs`).
  * @param extra       계산된 값(예: 릴레이 프록시의 BASE_URL). allowlist 를 우회한다
  * @param pathPrepend PATH 맨 앞에 둘 절대 경로들 (`compactPath` 의 prepend)
  * @param notes       주면 PATH 축약 사실을 사람이 읽을 문장으로 밀어 넣는다.
@@ -433,7 +434,7 @@ export function buildChildEnv(
     }
   }
 
-  // extra 다음에 찍는다. 이 값은 reaper 가 고아 프로세스의 소유권을 판정하는 근거라,
+  // extra 다음에 찍는다. 이 값은 중첩 실행 가드(`src/server.mjs`)의 유일한 근거라,
   // 호출부가 실수로 같은 이름을 extra 에 넣어도 덮이면 안 된다.
   if (typeof runId === 'string' && runId !== '') childEnv.BOM_ORCH_RUN_ID = runId;
 

@@ -67,25 +67,37 @@ export function createProviderCall({
       vendor: provider.id, kind, role: binding.role, model: binding.model ?? '', effort: binding.effort ?? '',
       laneId: laneId ?? '', attemptId: attemptId ?? '', tools: Array.isArray(tools) ? tools.join(',') : '',
     });
+    // ★ settle 줄의 재료(2026-09-05 감사). 벤더 스트림 이벤트가 마지막으로 온 시각을 여기서 잰다 —
+    //   이 이음매가 모든 벤더 호출의 onProgress 를 지나므로 프로바이더는 아무것도 더 낼 필요가 없다.
+    const spawnedAt = now();
+    let lastEventAt = spawnedAt;
+    let events = 0;
+    let spawnedChild = false;
+    let threw = true;
     try {
       result = await stage(`${kind} provider`, () => provider.run({
         role: binding.role, model: binding.model, effort: binding.effort, instruction, workspace,
         tools, allowedTools: tools, signal: deadline,
-        onSpawn: (child) => onSpawn(child, {
-          late: deadline?.aborted === true,
-          planner: kind === 'planner' || nonWorktree,
-          worktreePath: nonWorktree ? null : workspace,
-          ownerWorktreePath: workspace,
-          laneId,
-          attemptId,
-          role: binding.role,
-          judgeIndex,
-          reportIdentity: candidateCount === 2,
-        }),
+        onSpawn: (child) => {
+          spawnedChild = true;
+          return onSpawn(child, {
+            late: deadline?.aborted === true,
+            planner: kind === 'planner' || nonWorktree,
+            worktreePath: nonWorktree ? null : workspace,
+            ownerWorktreePath: workspace,
+            laneId,
+            attemptId,
+            role: binding.role,
+            judgeIndex,
+            reportIdentity: candidateCount === 2,
+          });
+        },
         // ★★ 접힌 `phase` 를 **양쪽 갈래에** 쓴다. 예전에는 후보가 하나일 때만 날 `kind` 가
         //   올라가서 같은 단계가 `writer`·`verifier_format`·`judge_format` 이라는 다른 이름으로
         //   보였다 — `candidates` 값이 사용자가 읽는 단어를 바꾸는 결함이다(WS0 §4).
         onProgress: (event) => {
+          events += 1;
+          lastEventAt = now();
           if (deadline?.aborted !== true) {
             try {
               runOptions.onProgress?.(candidateCount === 1
@@ -96,11 +108,26 @@ export function createProviderCall({
         },
         runId,
       }), { mayTouchWorktree: !nonWorktree && kind !== 'planner', worktreePath: workspace });
+      threw = false;
       recordProviderOutcome(provider.id, kind, laneId, result);
       if (result?.hardStopped === true) throw new Error('provider_effect_unknown');
       return result;
     } finally {
       usageAccumulator.settle(ticket, { promptTokens: result?.promptTokens ?? null, evalTokens: result?.evalTokens ?? null });
+      // ★ spawn 마다 settle 한 줄. 실행이 마감으로 끝났을 때 벤더가 **침묵하다** 잘렸는지(quietMs ≈ elapsedMs)
+      //   **출력하다** 잘렸는지를 가르는 유일한 기록이다 — 그 둘을 가를 데이터가 그전엔 아무 데도 없었다.
+      //   `spawned` 는 events 0 이 「침묵」인지 「자식이 못 뜸」인지를, `hung` 은 끊은 뒤 파이프가 안 닫혔는지를
+      //   가른다. `threw` 는 호출이 값을 못 돌려줬다는 관측이고, 하드스톱의 자체 throw 는 `hardStopped` 다.
+      //   잘렸거나 던졌으면 warn — `orch_status` 의 기본 로그 꼬리는 warn+error 만 싣는다(src/run-read.mjs).
+      //   평평한 값만: null 은 빈 문자열로, 시계가 뒤로 가도 음수는 안 나간다.
+      const settledAt = now();
+      const cut = threw || result?.hardStopped === true || result?.truncated === true;
+      logLine(cut ? 'warn' : 'info', null, 'provider settle', {
+        vendor: provider.id, kind, role: binding.role, laneId: laneId ?? '', attemptId: attemptId ?? '',
+        elapsedMs: Math.max(0, settledAt - spawnedAt), quietMs: Math.max(0, settledAt - lastEventAt), events, spawned: spawnedChild,
+        doneReason: typeof result?.doneReason === 'string' ? result.doneReason : '',
+        truncated: result?.truncated === true, hardStopped: result?.hardStopped === true, hung: result?.hung === true, threw,
+      });
     }
   };
 }

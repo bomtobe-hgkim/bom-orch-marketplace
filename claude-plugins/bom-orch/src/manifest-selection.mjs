@@ -13,20 +13,20 @@
  * ★ `boundedText` 를 직접 부른다. `src/run-manifest.mjs` 의 boolean 어댑터 `boundedString` 은 사본이 이미 셋이라
  *   (run-manifest:56 · candidate-selection:20 · content-projection:45) 넷째를 만들지 않는다 — 그 정리는 이 태스크 밖이다.
  *
- * ★ 실측 폐포: **10개 모듈 / 2,976줄**(자기 자신 190 포함) — `candidate-selection` 과 그것이 끄는 `verdict`·`reason-codes`·`preflight`(WS4b 가 판사 뷰 예산의 정본으로 붙였다), 그리고 `manifest-vocabulary`·`util/{freeze,hash,objects,strings}`.
+ * ★ 실측 폐포: **10개 모듈 / 3,044줄**(자기 자신 190 포함) — `candidate-selection` 과 그것이 끄는 `verdict`·`reason-codes`·`preflight`(WS4b 가 판사 뷰 예산의 정본으로 붙였다), 그리고 `manifest-vocabulary`·`util/{freeze,hash,objects,strings}`.
  *   저장소 모듈(`run-artifacts`·`run-store-fs`·`run-records`·`run-inspect`)도 `run-manifest` 도 없다 — 이 파일은 잎이다.
  * ★ 수입하는 쪽은 둘이다: `src/run-manifest.mjs`(`normalizeSelection`·`selectionConsistent`)와 `src/run-artifacts.mjs`(`completeIssueSummary`·`normalizeSelection`).
  */
 
 import { compareCandidateTuples, normalizeCandidateTestRank } from './candidate-selection.mjs';
-import { sameJson, validLane } from './manifest-vocabulary.mjs';
+import { PROOF_STATUSES, sameJson, validLane } from './manifest-vocabulary.mjs';
 import { exactDenseArray, exactObject } from './util/objects.mjs';
 import { boundedText, isSafeCount } from './util/strings.mjs';
 
 function normalizeComparisonTuple(value) {
   const array = exactDenseArray(value, 5);
   if (array === null || array.length !== 5 || !['verified', 'usable_unverified'].includes(array[0]) ||
-      !['proved', 'not_applicable', 'not_proven', 'unavailable', 'flaky'].includes(array[1]) ||
+      !PROOF_STATUSES.includes(array[1]) ||
       !['stable_repeated_full_pass', 'stable_one_pass', 'unknown_or_not_run', 'flaky'].includes(array[2]) ||
       !isSafeCount(array[3])) return null;
   const scope = exactDenseArray(array[4], 2);

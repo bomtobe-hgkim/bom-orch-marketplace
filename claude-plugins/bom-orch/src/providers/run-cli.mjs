@@ -150,6 +150,8 @@ export async function runCli({
   authNames = [],
   collect,
   sendStdin = true,
+  // 자체 못의 값 — 테스트가 줄이기 위해서만 받는다. 제품 호출자는 주지 않는다.
+  hangGuardMs = DEFAULT_TIMEOUT_MS,
 } = {}) {
   const fail = (extra) => ({
     ...collect(''),
@@ -269,10 +271,16 @@ export async function runCli({
 
     signal?.addEventListener('abort', onAbort, { once: true });
 
-    // 호출자가 안 주면 자체 상한이 선다. 상한이 아예 없으면 매달린 자식이 이 함수를,
-    // 그리고 그것을 기다리는 MCP 도구 호출을 통째로 붙잡는다.
-    const cap = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS;
-    timer = setTimeout(() => stop('timedOut'), cap);
+    // 호출자가 상한을 안 주면 자체 상한이 선다 — 단, **신호도 안 줬을 때만**(위 docblock 의 WHY 그대로).
+    // ★ 신호가 있으면 데드라인은 호출자의 것이다: 엔진은 모든 벤더 호출에 실행 마감을 준다
+    //   (`src/run-progress.mjs`). 그 위에 10분을 덧씌우자 복합 과제의 모델 턴 하나가 스폰 정확히 10분
+    //   뒤 잘렸다(2026-08-28 라이브 실측 셋 — 워커 한 번, 다음 실행에선 두 워커 다, 테스트 0회).
+    //   상한이 아예 없으면 매달린 자식이 이 함수를, 그리고 그것을 기다리는 MCP 도구 호출을 통째로
+    //   붙잡는다 — 그래서 신호 없는 호출(`orch_models` 의 프로브)에는 못이 그대로 선다.
+    const hasSignal = typeof signal?.addEventListener === 'function';
+    const guard = Number.isFinite(hangGuardMs) && hangGuardMs > 0 ? hangGuardMs : DEFAULT_TIMEOUT_MS;
+    const cap = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : hasSignal ? null : guard;
+    if (cap !== null) timer = setTimeout(() => stop('timedOut'), cap);
 
     // 지시문은 stdin 으로 보낸다. argv 로 보내면 Windows 명령줄 상한(CreateProcessW 의 32,767자, 명령줄 **전체**)에
     // 걸리고, `shell:false` 가 건너뛰는 것은 cmd.exe(8,191)뿐이라 libuv 의 인용은 그대로 만난다 — 단위는 `codexArgvChars` 다.

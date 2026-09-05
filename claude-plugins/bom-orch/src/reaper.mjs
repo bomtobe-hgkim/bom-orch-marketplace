@@ -16,6 +16,7 @@ import {
   sweepLogs,
   sweepPatches,
   sweepPlans,
+  sweepProofs,
   sweepRuns,
   sweepScratch,
   validRunId,
@@ -44,7 +45,7 @@ export {
   trackChild,
   trackWorktree,
 } from './reaper-tracking.mjs';
-export { sweepLogs, sweepPatches, sweepPlans, sweepRuns, sweepScratch };
+export { sweepLogs, sweepPatches, sweepPlans, sweepProofs, sweepRuns, sweepScratch };
 
 /**
  * 고아 프로세스 reaper.
@@ -151,6 +152,12 @@ export async function sweepOrphans({
     // ★ 로그도 여기서 치운다(WS2 §5). scratch·patches 와 **같은 함수**를 지나므로 소유권 판정과
     //   반환 모양이 한 글자도 다르지 않다 — 엔진의 실행별 스윕 표에도 같은 행이 있다.
     logs: { removed: 0, checked: 0 },
+    // ★★ follow-up ③ (2026-09-01): 증명(`<stateRoot>/proofs/<runId>/`)도 여기서 치운다. 그
+    //   디렉터리는 끝난 실행의 `runs/<runId>/` **밖**에 산다(불변식, 스펙 §2) — 아무도 안 치우면
+    //   지난 실행의 만료된 증명은 다음 `orch_run` 을 기다리는데, 그 실행이 다시 안 돌 수도 있다.
+    //   판정은 여전히 기록 자신의 `expiresAt` 이지 이 부팅의 시계가 아니다(「자기 시계로 치우지
+    //   않는다」) — `sweepProofs` 가 그 규율을 쥔다, 여기는 부르기만 한다.
+    proofs: { removed: 0, checked: 0 },
     runs: { removed: [], checked: 0, skipped: [] },
   };
   try {
@@ -162,6 +169,7 @@ export async function sweepOrphans({
       scratchRoomSweep = sweepScratchRooms,
       patchSweep = sweepPatches,
       logSweep = sweepLogs,
+      proofSweep = sweepProofs,
       planSweep = sweepPlans,
       runSweep = sweepRuns,
       npmCacheSweep = sweepNpmCache,
@@ -206,6 +214,8 @@ export async function sweepOrphans({
     result.plans = await planSweep(stateRoot, nowMs, { deadlineAt, nowMs: getNowMs });
     if (budgetExpired()) return result;
     result.logs = await logSweep({ stateRoot, now: nowMs, deadlineAt, clock: getNowMs });
+    if (budgetExpired()) return result;
+    result.proofs = await proofSweep(stateRoot, nowMs, { deadlineAt, nowMs: getNowMs });
     if (budgetExpired()) return result;
     const hasExclusion = excludeRunId !== undefined;
     const artifactFlagsValid = typeof shouldSweepPatches === 'boolean' && typeof shouldSweepRuns === 'boolean';

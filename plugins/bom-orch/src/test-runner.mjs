@@ -129,7 +129,7 @@ import { errorText } from './util/errors.mjs';
  * `PLAN_KEYS` 여야 하고 그중 지문 말고는 전부 지문의 입력이라, 상한 한 줄이 지문을 바꾸면
  * 재개의 계획 관문이 같은 프로젝트를 다른 계획이라고 말한다.
  *
- * ★ 실측 폐포: **28개 모듈 / 12,062줄**(자기 자신 1,274 포함). 세 잎 중 어느 것도 이 파일을
+ * ★ 실측 폐포: **28개 모듈 / 12,268줄**(자기 자신 1,309 포함). 세 잎 중 어느 것도 이 파일을
  *   수입하지 않고, 저장소 모듈(`run-*`)도 `engine` 도 없다 — 방향은 한쪽이다(WS5 T3 이 정본 export 로 `test-discovery` 를 73줄, 그 수정 파도가 다시 66줄 늘렸고, 받는 쪽이 `patch-scope` 라 모듈 수는 그대로다). T3 재심 N1–N3 수정 파도: `test-discovery` 가 다시 25줄 늘어 9,979 -> 10,004(모듈 수는 그대로 — 늘어난 것은 주석뿐이다).
  */
 
@@ -479,11 +479,21 @@ export async function runTests(spec) {
     //    그때 풀리는 것이 우리가 프로브한 그 노드여야 한다.
     //
     //    childEnvExtra: 도구별 계산값(pytest 의 PYTHONSAFEPATH). allowlist 를 우회한다.
-    const childEnv = buildChildEnv(options.env ?? process.env, {
+    //
+    //    ★★ runId 는 넘기지 않는다 — 그것은 델리게이트용 중첩 가드 스탬프(`BOM_ORCH_RUN_ID`, `src/server.mjs`)다.
+    //    2026-08-28 실행 8 실측: 대상 저장소가 bom-orch 자신일 때 테스트가 띄운 서버가 그 스탬프를 물려받아
+    //    모든 도구 호출을 `nested_invocation` 으로 거절했고, `test/server.test.mjs` 의 6개는 어떤 후보로도
+    //    통과할 수 없었다(같은 트리에서 스탬프만 빼면 22/22). 테스트 자식은 델리게이트가 아니다 — 대신
+    //    `BOM_ORCH_EVIDENCE_RUN_ID` 를 찍는다. 그 값이 **이 러너의** env 에 이미 있으면 여기는 둘째 층(대상의
+    //    테스트가 띄운 서버의 증거 실행)이고, 그 자식에는 델리게이트 스탬프를 찍어 셋째 층의 서버가 거절하게
+    //    한다 — 깊이는 둘에서 멎는다. (리뷰 실측: 이 조건 없이는 증거 가지가 매 층 열려 마감 시계만 재귀를 막았다.)
+    const parentEnv = options.env ?? process.env;
+    const insideEvidence = typeof parentEnv.BOM_ORCH_EVIDENCE_RUN_ID === 'string' && parentEnv.BOM_ORCH_EVIDENCE_RUN_ID !== '';
+    const childEnv = buildChildEnv(parentEnv, {
       authNames: [],
-      runId,
+      runId: insideEvidence ? runId : undefined,
       pathPrepend: [dirname(process.execPath)],
-      extra: options.childEnvExtra,
+      extra: { ...(options.childEnvExtra ?? {}), BOM_ORCH_EVIDENCE_RUN_ID: runId },
       notes,
     });
 
@@ -633,13 +643,38 @@ function publicDefinitionPins(definition) {
     .map(([path, values]) => ({ path, sha256: hashJson(values) }));
 }
 
+/**
+ * `scripts.test` 를 **글자 그대로** 토큰으로 — 셸을 지나지 않고 node 에 줄 수 있는 명령만 받는다.
+ *
+ * ★ 따옴표 밖의 글롭·`^`·`$`·`%` 는 거부한다: sh 는 펼치고 cmd 는 안 펼치므로 두 셸이 **다른 파일 집합**을
+ *   낼 수 있고, 그런 명령은 우리가 npm 과 같게 재현할 수 없다. 따옴표 **안**의 글롭과 `^` 는 받는다
+ *   (2026-08-28): sh 도 cmd 도 그 글자를 그대로 node 에 넘기고 `node --test` 가 스스로 펼친다 — 그 경로
+ *   하나만 우리와 npm 이 같다. 인접 따옴표 `""` 는 어디서든 거부한다 — sh 는 지우고 cmd 의 CRT 는
+ *   리터럴 `"` 로 내므로 두 셸이 다른 argv 를 준다(리뷰 실측). 라이브 실측에서 이 저장소 자신의 스위트가 따옴표 하나 때문에 어댑터
+ *   없이 돌아 실패 테스트 이름 0개로 두 벤더 실행이 두 번 막혔다. `"a"b"`·`""`·짝 안 맞는 따옴표는 거부.
+ */
 function tokenizeLiteralNodeScript(script) {
   if (typeof script !== 'string' || script === '' || script.length > 8_192 ||
-      /[\r\n\t'"\\$%!*?\[\]{}()~^;&|><`#]/.test(script)) return null;
+      /[\r\n\t'\\$%!()~;&|><`#]/.test(script) || script.includes('""')) return null;
   const trimmed = script.trim();
   if (trimmed === '') return null;
-  const tokens = trimmed.split(/ +/);
-  if (tokens.some((token) => token === '' || !/^[A-Za-z0-9._/@+=,:-]+$/.test(token))) return null;
+  const tokens = [];
+  let current = '';
+  let quoted = false;
+  let inQuote = false;
+  for (const char of trimmed) {
+    if (char === '"') { inQuote = !inQuote; quoted = true; continue; }
+    if (char === ' ' && !inQuote) {
+      if (current !== '' || quoted) tokens.push(current);
+      current = ''; quoted = false;
+      continue;
+    }
+    if (!(inQuote ? /[A-Za-z0-9._/@+=,:*?^\[\]{}-]/ : /[A-Za-z0-9._/@+=,:-]/).test(char)) return null;
+    current += char;
+  }
+  if (inQuote) return null;
+  if (current !== '' || quoted) tokens.push(current);
+  if (tokens.some((token) => token === '')) return null;
   if (tokens.length < 2 || !/^(?:node|node\.exe)$/i.test(tokens[0])) return null;
   const args = tokens.slice(1);
   if (args.filter((arg) => arg === '--test').length !== 1) return null;

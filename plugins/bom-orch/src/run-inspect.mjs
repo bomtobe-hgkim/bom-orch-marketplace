@@ -2,9 +2,9 @@
  * artifact·매니페스트 **참조를 읽기만 하는** 검사 — 경로 문법·존재·소유·바이트 일치·세대 추월을 재고 아무것도 쓰지 않는다.
  * ★ 저장소 핸들을 받지 않는다: 입력은 `{stateRoot, refs, nowMs}` 와 주입된 fs 의존성뿐이라 프로세스가 죽은 뒤의 실행도 잰다.
  *   방향은 하나뿐이다 — 여기서 `src/run-artifacts.mjs` 를 수입하지 않고, 저장소도 이 파일을 수입하지 않는다. 이쪽은 저장소의 **소비자**다.
- * ★ 실측 폐포: **17개 모듈 / 6,266줄**(자기 자신 171 포함) — `reason-codes`·`reason-text`·`run-manifest`(태스크 3 뒤 `manifest-selection`·`candidate-selection`·`verdict`, WS4b 뒤 `preflight`, WS5 T12 뒤 `manifest-vocabulary` 를 끈다)·`run-store-fs`
+ * ★ 실측 폐포: **17개 모듈 / 6,410줄**(자기 자신 171 포함) — `reason-codes`·`reason-text`·`run-manifest`(태스크 3 뒤 `manifest-selection`·`candidate-selection`·`verdict`, WS4b 뒤 `preflight`, WS5 T12 뒤 `manifest-vocabulary` 를 끈다)·`run-store-fs`
  *   (소유 검증·`lstatAbsent`·`canonicalRoot`·`cloneExactData`)·`util/{errors,freeze,fs-atomic,hash,objects,paths,strings}`. 저장소 본체도 `content-projection` 도 없다.
- * ★ 수입하는 쪽은 둘이다: `src/tools/context.mjs`(`inspectArtifactRefs` 하나 — 실측 폐포(src/tools/context.mjs): **18개 모듈 / 6,390줄**(자기 자신 124 포함); 그 수는 태스크 1 의 21개 / 10,618줄에서 컷 셋을 지나 내려온 것이다)와 `test/candidate-artifacts.test.mjs`.
+ * ★ 수입하는 쪽은 둘이다: `src/tools/context.mjs`(`inspectArtifactRefs` 하나 — 실측 폐포(src/tools/context.mjs): **18개 모듈 / 6,565줄**(자기 자신 155 포함); 그 수는 태스크 1 의 21개 / 10,618줄에서 컷 셋을 지나 내려온 것이다)와 `test/candidate-artifacts.test.mjs`.
  */
 
 import { isAbsolute, relative, resolve, sep } from 'node:path';

@@ -141,9 +141,9 @@ import { samePath } from './util/paths.mjs';
  *
  * ## 실측 폐포 (2026-08-27, WS6 npm cache lease)
  *
- * **21개 모듈 / 7,721줄**(자기 자신 594 포함): `deadline`(80) · `git`(1,128)과 그것이 끄는
+ * **21개 모듈 / 7,838줄**(자기 자신 594 포함): `deadline`(109) · `git`(1,128)과 그것이 끄는
  * `providers/error-catalog`(437)·`providers/resolve-binary`(291)·`state-root`(34) ·
- * `project-config`(489) · `providers/child-env`(465) · `reason-codes`(716) · `reason-text`(1,294) ·
+ * `project-config`(489) · `providers/child-env`(466) · `reason-codes`(737) · `reason-text`(1,360) ·
  * `npm-cache-retention`(896)와 그 잎 `lockfile`(193)·`lockfile-acquire`(122)·
  * `process-identity`(202)·`real-path`(54)·
  * `util/fs-atomic`(206)·`util/paths`(60)·`util/strict-json`(116) · `util/errors`(120) · `util/freeze`(43) ·

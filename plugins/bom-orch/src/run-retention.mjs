@@ -6,9 +6,10 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { lstat, mkdir, open, opendir, readdir, rename, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, open, opendir, readFile, readdir, rename, rm, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { validateRunManifestTransitionV1 } from './manifest-transition.mjs';
+import { normalizeProofRecord, proofLockLive } from './proof-record.mjs';
 import { canonical } from './real-path.mjs';
 import {
   MAX_JSON_ARTIFACT_BYTES,
@@ -1469,6 +1470,118 @@ export function sweepPatches(stateRoot, nowMs, options) {
     deadlineAt: parsed.deadlineAt,
     clock: parsed.nowMs,
   });
+}
+
+/**
+ * 그 증명 디렉터리가 만료됐는가. 판정 셋이고, **순서가 뜻을 갖는다**.
+ *
+ * ★★ 살아 있는 `.lock` 이 가장 먼저, 그리고 무조건 이긴다. 오래된 실행 하나가 재증명
+ *   (`orch_prove`) 을 도는 동안 다른 `orch_run` 이 자기 `excludeRunId` 로 이 스윕을 돌리면, 그
+ *   실행의 옛 기록은 여전히 만료로 읽힌다 — 도는 재증명의 발밑(그 디렉터리)이 지워지는 사고다.
+ *   `proofLockLive`(`src/proof-record.mjs`, `acquireProofLock` 이 잠그고 재는 것과 **같은 정본**)가
+ *   살아 있다고 답하면 기록이 뭐라 하든 이 유닛은 만료가 아니다.
+ * ★★ 잠금이 죽었거나 없으면, 기록이 읽히는 한 기록의 `expiresAt` 이 답이다. 증명은 실행이 끝난
+ *   한참 뒤에 돌 수 있어서(실측: 실행 9 는 2026-08-28 에 55분 상한이 다섯 번째 스위트 실행에서
+ *   끊어 증명 없이 끝났고, 증명은 그 뒤 별도 호출로 돈다) 디렉터리의 mtime 은 그 실행의 나이가
+ *   아니다 — mtime 으로만 재면 어제 만든 증명이 「30일 지난 실행의 것」이라는 이유로 남고, 그
+ *   반대도 생긴다.
+ * ★ 기록을 못 읽을 때만 나이(30일)로 잰다. 그 자리에 있는 것이 우리 것이 아닐 수 있으므로
+ *   `patches` 스윕과 같은 규율이다 — 이름 모양 + 나이 + `canonical` 담김 셋이 다 맞아야 지운다.
+ * ★ 바이트 상한을 먼저 본다: `readFile` 에는 상한이 없고, 남이 심은 1GB 짜리 `proof.json` 을
+ *   통째로 읽으면 스윕 하나가 서버를 멈춘다. 상한 밖은 「못 읽는다」로 접어 나이 판정으로 간다.
+ */
+async function expiredProofUnit(dir, nowMs, readOne, statOne) {
+  if (await proofLockLive(join(dir, '.lock'), nowMs, { readFile: readOne, stat: statOne })) return false;
+  const path = join(dir, 'proof.json');
+  const info = await statOne(path).catch(() => null);
+  if (info !== null && info.isFile() && info.size <= MAX_JSON_ARTIFACT_BYTES) {
+    let parsed = null;
+    try {
+      parsed = normalizeProofRecord(JSON.parse(await readOne(path, 'utf8')));
+    } catch {
+      parsed = null;
+    }
+    if (parsed !== null) return Number.isSafeInteger(parsed.expiresAt) && parsed.expiresAt <= nowMs;
+  }
+  const own = await statOne(dir).catch(() => null);
+  return own !== null && nowMs - Number(own.mtimeMs) >= RUN_ARTIFACT_RETENTION_MS;
+}
+
+/**
+ * 보존 기간이 지난 **증명 디렉터리**(`<stateRoot>/proofs/<runId>/`)를 치운다. 실행과 같은 30일이다.
+ *
+ * ★★ 왜 여기 여섯 번째 스윕이 필요한가: 증명은 실행 기록 **밖**에 산다(끝난 실행의
+ *   `runs/<runId>/` 에는 한 바이트도 안 쓴다는 불변식). 밖으로 내면서 아무도 안 치우는
+ *   디렉터리를 하나 만들면 그것은 `logs` 가 이미 한 번 낸 결함의 다른 얼굴이다 — 전체 스위트
+ *   여섯 번의 증거가 실행마다 영구히 쌓인다.
+ * ★ 반환 모양은 `sweepPatches` 와 같은 `{removed, checked}` 다. `sweepAged` 를 못 쓰는 이유
+ *   하나뿐이다: 그 함수는 나이만 보고 파일을 읽지 않는데, 이 판정의 정본은 **기록 안**에 있다.
+ * ★ 던지지 않는다. 어떤 입력에도 `{removed:0, checked:0}` 이하로만 답한다.
+ * ★★ 스캔 루프 자체도 안 던진다(리뷰 F3, 실측 재현: 고침 전에는 주입된 `readdir` 이
+ *   `[{ name: 'run-x' }]` 하나만 내도 `entry.isDirectory is not a function` 으로 죽어 그때까지
+ *   센 것까지 사라졌다 — 문서의 위 문장을 어겼다). `direntKind` 로 종류를 접고(가짜 dirent 는
+ *   `other` 로 떨어진다), `sweepAged` 와 같은 try/catch 로 루프 본문을 감싼다 — 중간의 하나가
+ *   (동기든 비동기든) 던지면 그때까지 센 `{removed, checked}` 는 보존하고 나머지는 다음 스윕에
+ *   남긴다.
+ * ★★ 부팅 예산(follow-up ③, 2026-09-01): `sweepOrphans` 의 다섯 형제(scratch·plans·logs·patches·
+ *   runs)는 전부 `deadlineAt`/시계를 받아 부팅 총예산을 넘기면 스스로 멈춘다. 이 함수만 없으면
+ *   그 형제 중 하나가 시간을 다 쓴 부팅에서 증명 스윕이 무한정 돈다 — 지난 실행의 만료된 증명이
+ *   다음 부팅을 다시 기다리는 것으로 끝나면 그나마 다행이고, 최악은 부팅 자체가 이 스윕에
+ *   묶인다. 옵션 이름이 `sweepPlans`/`sweepScratch` 와 같은 `{ deadlineAt, nowMs: <시계> }` 인
+ *   이유도 같다 — 위치 인자 `nowMs`(현재 시각 값)와 이름이 겹치지만 `sweepOrphans` 의 호출부가
+ *   형제들과 한 글자도 다르지 않아야 실수로 갈리지 않는다. 판정은 **기록의 `expiresAt`** 이지
+ *   부팅 시계가 아니다(「자기 시계로 치우지 않는다」) — `deadlineAt` 은 언제 스캔을 멈출지만
+ *   정하고, 무엇을 지울지는 여전히 `expiredProofUnit` 이 정한다. 자리는 `sweepAged` 와 같은
+ *   자리: 항목 상한(`AGED_SWEEP_ENTRY_CAP`)을 보는 그 한 줄에 얹는다 — 마감을 지나면 그때까지
+ *   센 것을 보존하고 멈춘다, 던지지 않는다.
+ */
+export async function sweepProofs(stateRoot, nowMs, options) {
+  const empty = { removed: 0, checked: 0 };
+  const parsed = exactFunctionOptions(
+    options, new Set(['excludeRunId', 'readdir', 'readFile', 'rm', 'lstat', 'deadlineAt', 'nowMs']),
+  );
+  if (parsed === null || typeof stateRoot !== 'string' || stateRoot === '' || !isAbsolute(stateRoot) ||
+      !Number.isSafeInteger(nowMs) || nowMs < 0 ||
+      Object.hasOwn(parsed, 'excludeRunId') && !validRunId(parsed.excludeRunId)) return empty;
+  const expired = agedDeadline(parsed.deadlineAt, parsed.nowMs);
+  if (expired === null) return empty;
+  // ★ 형제(`sweepAged`)와 같은 선지급 확인 — 예산이 이미 끝났으면 readdir 한 번도 안 한다(리뷰 2026-09-01).
+  if (expired()) return empty;
+  const listEntries = parsed.readdir ?? readdir;
+  const readOne = parsed.readFile ?? readFile;
+  const statOne = parsed.lstat ?? exactLstat;
+  const remove = parsed.rm ?? rm;
+  const realRoot = await canonical(stateRoot);
+  if (realRoot === null) return empty;
+  // 그 자리가 정션이면 실체는 상태 루트 밖일 수 있다 — `sweepAged` 와 같은 두 겹이다.
+  const dir = await canonical(join(realRoot, 'proofs'));
+  if (dir === null || !contained(realRoot, dir)) return empty;
+  let entries;
+  try {
+    entries = await listEntries(dir, { withFileTypes: true });
+  } catch {
+    return empty;
+  }
+  let removed = 0;
+  let checked = 0;
+  let scanned = 0;
+  try {
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      if (scanned >= AGED_SWEEP_ENTRY_CAP || expired()) break;
+      scanned += 1;
+      // `direntKind` 는 lstat 계열이고, `isDirectory` 가 없는 가짜 dirent 도 `other` 로 접는다
+      // (`entry.isDirectory()` 를 직접 부르던 예전 판은 그런 항목 하나에 죽었다).
+      if (direntKind(entry) !== 'directory' || !validRunId(entry.name) || entry.name === parsed.excludeRunId) continue;
+      checked += 1;
+      const full = await canonical(join(dir, entry.name));
+      if (full === null || !contained(dir, full)) continue;
+      if (!await expiredProofUnit(full, nowMs, readOne, statOne)) continue;
+      if (await remove(full, { force: true, recursive: true }).then(() => true, () => false)) removed += 1;
+    }
+  } catch {
+    // 읽은 prefix까지만 처리하고 나머지는 다음 sweep에 보존한다 (sweepAged 와 같은 규율).
+  }
+  return { removed, checked };
 }
 
 /**

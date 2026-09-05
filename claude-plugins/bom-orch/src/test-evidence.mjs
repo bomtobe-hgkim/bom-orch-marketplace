@@ -26,7 +26,7 @@
  *   루트(`src` 포함)와 **다르게** 정해야 한다. 그 결합은 `test/test-runner.test.mjs` 가 못 박는다.
  *
  * ★ XML 부분집합 토크나이저는 여기 없다 — `src/xml-subset.mjs`(수정 라운드 커밋 2, 바이트 보존 이동). 이 파일이 갖는 것은 그 위의 **JUnit 계약**이다: 어느 루트가 적법한지, 어느 자식이 실패를 뜻하는지, 어느 속성이 경로인지, 그리고 여섯 생산자의 문서가 어떻게 한 실행으로 합쳐지는지. 속성 값 상한만 옵션(`maxAttributeChars`)으로 넘긴다 — 그 수는 어댑터의 것이라 잎이 알 이유가 없다.
- * ★ 실측 폐포: **8개 모듈 / 2,562줄**(자기 자신 1,068 포함) — `real-path`(54)·`reason-codes`(716)·`util/{freeze,hash,objects,strings}`(470)·`xml-subset`(254). 태스크 7 은 모듈을 늘리지 않았고 수정 라운드가 하나 늘렸다(그 하나는 이 파일에서 잘라낸 잎이라 **폐포 줄 수는 +51**, 새 헤더·export 블록·상한 docblock 뿐이다). 태스크 10 은 모듈을 안 늘리고 이름 둘(`ADAPTER_IDS`·`JUNIT_WITNESS_PRODUCERS`)을 공개 표면에 얹었다(**+13**). `reason-text` 도 `git` 도 `providers/*` 도 저장소 모듈도 **0개**다 — 실패 어휘는 코드(`REASON`)로만 나가고 문장은 부르는 쪽이 만든다.
+ * ★ 실측 폐포: **8개 모듈 / 2,637줄**(자기 자신 1,122 포함) — `real-path`(54)·`reason-codes`(737)·`util/{freeze,hash,objects,strings}`(470)·`xml-subset`(254). 태스크 7 은 모듈을 늘리지 않았고 수정 라운드가 하나 늘렸다(그 하나는 이 파일에서 잘라낸 잎이라 **폐포 줄 수는 +51**, 새 헤더·export 블록·상한 docblock 뿐이다). 태스크 10 은 모듈을 안 늘리고 이름 둘(`ADAPTER_IDS`·`JUNIT_WITNESS_PRODUCERS`)을 공개 표면에 얹었다(**+13**). `reason-text` 도 `git` 도 `providers/*` 도 저장소 모듈도 **0개**다 — 실패 어휘는 코드(`REASON`)로만 나가고 문장은 부르는 쪽이 만든다.
  * ★ 수입하는 쪽(실측 grep): `src/test-runner.mjs`(이름 14개)·`src/regression-proof.mjs`(`selectTestDeltaWitnesses` 하나)와 테스트 셋(`test/test-runner.test.mjs`·`test/junit-xml-adapter.test.mjs`·`test/distribution-bundle.test.mjs`). 다섯뿐이다.
  */
 
@@ -65,6 +65,7 @@ export {
   cleanupOwnedEvidence,
   createOwnedEventFile,
   eventFileUnchanged,
+  failingTestLabels,
   insertNodeReporter,
   pathUnderRoot,
   persistableRecord,
@@ -272,14 +273,29 @@ function sameNodeRecord(entry, event, path, name) {
 function parseNodeEvidence(bytes, worktreePath = null, witnessPolicy = DEFAULT_NODE_WITNESS_POLICY) {
   const events = parseJsonLines(bytes);
   if (events === null) return invalidEvidence();
-  const stack = [];
-  const witnesses = [];
+  // ★★ 스택이 아니라 **정체성**으로 짝짓는다(2026-08-28 라이브 실측). node 는 한 파일의 최상위 테스트를
+  //   정의 시점에 전부 enqueue 한 뒤 차례로 완료한다(enqueue 14 → pass 14) — LIFO 스택은 두 번째 테스트
+  //   에서 어긋나 스위트 전체가 `collection` 무효가 됐고, 커밋된 캡처가 테스트 하나짜리라 한 번도 안 보였다.
+  //   `--test-concurrency` 는 파일 사이 이벤트도 섞는다. 부모는 「같은 파일에서 열려 있는, nesting 이 하나
+  //   작은 가장 최근 노드」다: 자식의 enqueue 는 부모가 열려 있는 동안에만 온다. 자식을 가진 `test`(t.test)
+  //   는 suite 처럼 컨테이너로 다루되 소스가 정의한 테스트이므로 증인은 된다 — 그 실패 지문은 자기
+  //   본문 실패(`testCodeFailure`)에만 붙고, 자식 실패(`subtestsFailed`)는 자식이 든다.
+  const open = new Map();
+  const openByPath = new Map();
+  const witnesses = new Set();
+  // ★ 같은 파일·같은 fullName 은 node 가 허용한다(실측: 이 저장소에 열한 쌍). 둘째부터 완료 순서의 서수를
+  //   붙여 가른다 — 첫 것의 정체성은 그대로라 커밋된 캡처·회귀 증명과 호환되고, 스위트 전체를 버리던
+  //   중복 거절은 이제 진짜 충돌(`#n` 까지 같은 경우)에만 선다.
+  const seenNames = new Map();
   const failureFingerprints = [];
   const witnessAuthority = [];
   let failureKind = 'unknown';
   let terminal = null;
   let completedCount = 0;
   let failedCount = 0;
+  // ★ 이름에 ' > ' 가 있어도 받는다(실측: 이 저장소의 테스트 이름 「disputed > unverified > verified」). 구분자
+  //   충돌로 두 노드가 같은 증인 id 를 내면 아래 중복 검사가 스트림을 **거절**하지 오귀속하지 않는다.
+  const markDescendantFailed = (node) => { for (let parent = node.parent; parent !== null; parent = parent.parent) parent.descendantFailed = true; };
   for (let index = 0; index < events.length; index += 1) {
     const event = events[index];
     if (event?.type === 'terminal') {
@@ -291,84 +307,96 @@ function parseNodeEvidence(bytes, worktreePath = null, witnessPolicy = DEFAULT_N
     const keys = ['type', 'kind', 'name', 'file', 'line', 'column', 'nesting', 'failureType'];
     if (!hasExactKeys(event, keys) || !['enqueue', 'pass', 'fail'].includes(event.type) ||
         !['test', 'suite'].includes(event.kind) ||
-        typeof event.name !== 'string' || event.name === '' || event.name.length > 1_024 || event.name.includes(' > ') ||
+        typeof event.name !== 'string' || event.name === '' || event.name.length > 1_024 ||
         !Number.isInteger(event.line) || event.line < 1 || !Number.isInteger(event.column) || event.column < 0 ||
         !Number.isInteger(event.nesting) || event.nesting < 0 || event.nesting > 64 ||
         (event.failureType !== null && typeof event.failureType !== 'string')) return invalidEvidence();
     const path = safeRelativeSourcePath(event.file, worktreePath);
     const name = normalizeFullTestName(event.name);
     if (path === null || name === null) return invalidEvidence();
+    const key = JSON.stringify([path, event.kind, name, event.line, event.column, event.nesting]);
     if (event.type === 'enqueue') {
-      if (event.failureType !== null || event.nesting !== stack.length ||
-          (stack.length > 0 && (stack.at(-1).path !== path || stack.at(-1).kind !== 'suite'))) return invalidEvidence();
-      for (const parent of stack) parent.hasChild = true;
-      const fullName = [...stack.map((entry) => entry.name), name].join(' > ');
+      if (event.failureType !== null || open.has(key)) return invalidEvidence();
+      const byNesting = openByPath.get(path) ?? new Map();
+      const parent = event.nesting === 0 ? null : byNesting.get(event.nesting - 1) ?? null;
+      if (event.nesting > 0 && parent === null) return invalidEvidence();
+      const fullName = parent === null ? name : `${parent.fullName} > ${name}`;
       if (normalizeFullTestName(fullName) === null) return invalidEvidence();
-      stack.push({
-        path,
-        kind: event.kind,
-        name,
-        fullName,
-        line: event.line,
-        column: event.column,
-        nesting: event.nesting,
-        hasChild: false,
-        descendantFailed: false,
-      });
+      const node = { path, kind: event.kind, fullName, parent, openChildren: 0, hasChild: false, descendantFailed: false };
+      if (parent !== null) { parent.openChildren += 1; parent.hasChild = true; }
+      open.set(key, node);
+      byNesting.set(event.nesting, node);
+      openByPath.set(path, byNesting);
       continue;
     }
-    const current = stack.at(-1);
-    if (!current || event.nesting !== stack.length - 1 || !sameNodeRecord(current, event, path, name)) return invalidEvidence();
-    stack.pop();
+    const current = open.get(key);
+    if (!current || current.openChildren !== 0) return invalidEvidence();
+    open.delete(key);
+    const byNesting = openByPath.get(path);
+    if (byNesting?.get(event.nesting) === current) byNesting.delete(event.nesting);
+    if (current.parent !== null) current.parent.openChildren -= 1;
     completedCount += 1;
+    const failed = event.type === 'fail';
+    let ownFailure = false;
     if (current.kind === 'suite') {
+      // suite 는 증인이 아니다. 자식이 실패했으면 subtestsFailed 로 실패해야 하고, 자식 없이(또는 자식이 다
+      // 통과했는데) 실패했으면 describe 콜백이 던진 것 — 러너 인프라 실패이지 assertion 이 아니다.
       if (current.descendantFailed) {
-        if (event.type !== 'fail' || event.failureType !== 'subtestsFailed') return invalidEvidence('infrastructure');
-        for (const parent of stack) parent.descendantFailed = true;
-      } else if (event.type === 'fail') {
-        failureKind = 'infrastructure';
-        failedCount += 1;
-        for (const parent of stack) parent.descendantFailed = true;
-      } else if (event.failureType !== null) {
+        if (!failed || event.failureType !== 'subtestsFailed') return invalidEvidence('infrastructure');
+        markDescendantFailed(current);
+      } else if (failed) {
         return invalidEvidence('infrastructure');
       }
       continue;
     }
-    if (current.hasChild) return invalidEvidence('infrastructure');
-    if (event.type === 'fail') {
-      if (event.failureType !== 'testCodeFailure') return invalidEvidence('infrastructure');
+    if (current.hasChild) {
+      if (current.descendantFailed) {
+        if (!failed || event.failureType !== 'subtestsFailed') return invalidEvidence('infrastructure');
+        markDescendantFailed(current);
+      } else if (failed) {
+        if (event.failureType !== 'testCodeFailure') return invalidEvidence('infrastructure');
+        ownFailure = true;
+      }
+    } else {
+      if (failed) {
+        if (event.failureType !== 'testCodeFailure') return invalidEvidence('infrastructure');
+        ownFailure = true;
+      } else if (event.failureType !== null) {
+        // ★★ `skip`/`todo` 는 **몸통이 안 돌았다**는 directive 이지 스트림이 깨졌다는 신호가 아니다. 그 항목만
+        //   증인에서 빼면 충분하다 — 돌지 않은 테스트는 어떤 파일도 덮었다고 주장하지 않으므로 위조 위험이
+        //   늘지 않고, 설계 §9.4 의 「C 에서 대상 test 가 skip 되어 green 이 됨」도 그 증인이 **없는** 것으로
+        //   그대로 걸린다. 그 밖의 모르는 directive 는 여전히 치명적이다.
+        if (event.failureType !== 'skip' && event.failureType !== 'todo') return invalidEvidence();
+        continue;
+      }
+    }
+    if (ownFailure) {
       failureKind = 'assertion';
       failedCount += 1;
-      for (const parent of stack) parent.descendantFailed = true;
-    } else if (event.failureType !== null) {
-      // ★★ `skip`/`todo` 는 **몸통이 안 돌았다**는 directive 이지 스트림이 깨졌다는 신호가
-      //   아니다. 이 자리에서 스트림 전체를 무효로 만들면 출력 digest 가 사라져
-      //   `trusted:false` 가 되고, 테스트 하나만 skip 해 둔 저장소는 `verified` 에도
-      //   회귀 증명에도 영영 닿지 못한다. 그 항목만 증인에서 빼면 충분하다 — 돌지 않은
-      //   테스트는 어떤 파일도 덮었다고 주장하지 않으므로 위조 위험이 늘지 않고,
-      //   설계 §9.4 의 「C 에서 대상 test 가 skip 되어 green 이 됨」도 그 증인이 **없는** 것
-      //   으로 그대로 걸린다. 그 밖의 모르는 directive 는 여전히 치명적이다.
-      if (event.failureType !== 'skip' && event.failureType !== 'todo') return invalidEvidence();
-      continue;
+      markDescendantFailed(current);
     }
     if (!pathAllowedByPolicy('node-events-v1', path, witnessPolicy)) continue;
-    const id = witnessId('node-events-v1', path, current.fullName);
-    if (witnesses.includes(id)) return invalidEvidence();
-    witnesses.push(id);
+    const nameKey = `${path}\0${current.fullName}`;
+    const occurrence = (seenNames.get(nameKey) ?? 0) + 1;
+    seenNames.set(nameKey, occurrence);
+    const witnessName = occurrence === 1 ? current.fullName : `${current.fullName} #${occurrence}`;
+    const id = witnessId('node-events-v1', path, witnessName);
+    if (witnesses.has(id)) return invalidEvidence();
+    witnesses.add(id);
     witnessAuthority.push({
       adapterId: 'node-events-v1',
       path,
-      fullName: current.fullName,
-      outcome: event.type === 'fail' ? 'fail' : 'pass',
+      fullName: witnessName,
+      outcome: ownFailure ? 'fail' : 'pass',
       witnessId: id,
     });
-    if (event.type === 'fail') failureFingerprints.push(sha256(Buffer.from(`assertion\0${id}`, 'utf8')));
+    if (ownFailure) failureFingerprints.push(sha256(Buffer.from(`assertion\0${id}`, 'utf8')));
   }
-  if (terminal === null || stack.length !== 0 || terminal.count !== completedCount) return invalidEvidence();
+  if (terminal === null || open.size !== 0 || terminal.count !== completedCount) return invalidEvidence();
   return {
     trusted: true,
     complete: true,
-    witnessIds: witnesses.sort(),
+    witnessIds: [...witnesses].sort(),
     failureFingerprints: failureFingerprints.sort(),
     failureKind,
     observedOutcome: failedCount > 0 ? 'fail' : 'pass',
@@ -835,6 +863,32 @@ function boundedDiagnostics(values) {
     .filter((value) => typeof value === 'string' && value !== '')
     .slice(0, MAX_DIAGNOSTICS)
     .map((value) => value.slice(0, MAX_DIAGNOSTIC_CHARS));
+}
+
+/** 라벨 하나의 상한. 이름은 프로그램 출력이라 길이가 무계다 — 프롬프트 슬롯은 유계여야 한다. */
+const FAILING_LABEL_CHARS = 160;
+
+/**
+ * 실패한 테스트의 **이름** — `{fingerprint, label}` 로, 지문은 `failureFingerprints` 의 그 지문이고
+ * 라벨은 어댑터가 파싱한 `경로 › 이름` 이다. 권위가 없는 기록(어댑터 미장착·신뢰 불가)은 빈 목록.
+ *
+ * ★★ 왜 생겼나(2026-08-28 라이브 실측, 진짜 저장소·두 벤더): 기계 채널은 pass/fail 과 해시뿐이라
+ *   verifier 도 재시도 워커도 **어느 테스트가** 떨어졌는지 몰랐다. 가드가 「헤더를 실측으로 고쳐라」
+ *   라고 숫자까지 찍어 주는 실패를 두고 두 실행이 55분씩 같은 자리에서 멈췄다.
+ * ★ 원문이 아니다. stdout 한 글자도 안 나간다 — 이벤트 리포터가 구조화한 파일·이름뿐이고, 그것도
+ *   프롬프트로만 간다. 봉인 기록·매니페스트·봉투에는 여전히 지문만 실린다(불변식 4 는 모델 산문을
+ *   막는 규칙이고 이 값은 프로그램 출력의 구조화 필드다 — 그래도 같은 절제를 지킨다).
+ */
+function failingTestLabels(record) {
+  const authority = TEST_RECORD_WITNESS_AUTHORITY.get(record);
+  if (authority === undefined) return deepFreeze([]);
+  return deepFreeze(authority
+    .filter((entry) => entry.outcome === 'fail')
+    .map((entry) => ({
+      fingerprint: sha256(Buffer.from(`assertion\0${entry.witnessId}`, 'utf8')),
+      label: `${entry.path} › ${entry.fullName}`.slice(0, FAILING_LABEL_CHARS),
+    }))
+    .sort((left, right) => (left.label < right.label ? -1 : left.label > right.label ? 1 : 0)));
 }
 
 function persistableRecord(plan, raw, evidence, diagnostics = []) {

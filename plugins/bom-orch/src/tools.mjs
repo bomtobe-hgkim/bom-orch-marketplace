@@ -19,6 +19,7 @@ import { TASK_CLASSES } from './learn/classify.mjs';
 import { INSTALL_RECOVERY, errorText } from './util/errors.mjs';
 import { toEngineDeps, toEngineOptions } from './tools/context.mjs';
 import { runOrchApply } from './tools/apply.mjs';
+import { runOrchProve } from './tools/prove.mjs';
 import { runOrchReward } from './tools/reward.mjs';
 import {
   AXIS_NOTES,
@@ -83,6 +84,7 @@ export const TOOL_SPECS = Object.freeze([
       'Orchestrate one task across two vendor CLIs: a worker edits inside a disposable git worktree, ' +
       'this server runs the tests itself, and a verifier reads the result without changing it. ' +
       'The result is a patch you can apply to your own repository. ' +
+      'This call reports the regression proof as deferred - orch_prove runs it for the selected candidate. ' +
       'project must be an absolute path, because the working directory of an MCP stdio server is ' +
       'whatever the host handed down and is not fixed. ' +
       'Pass resume_run_id to continue an earlier run: its sealed attempts are read instead of run ' +
@@ -128,6 +130,19 @@ export const TOOL_SPECS = Object.freeze([
         required: false,
         default: false,
         description: 'Explicitly allow this run to proceed with only one provider.',
+      }),
+      // ★ 오너 결정 B(2026-08-31, 실측): 과제 글자로 증명 필요를 짐작하던 분류기가 라이브
+      //   실행에서 "고치세요" 를 놓쳐 증명 없이 통과했다 — 키워드 목록은 완비될 수 없으므로
+      //   기본을 fail-closed 로 뒤집는다. `classifyProofRequirement` 가 보는 것은 이 값
+      //   하나뿐이다(`src/engine.mjs` 호출부).
+      require_proof: Object.freeze({
+        type: 'boolean',
+        required: false,
+        default: true,
+        description: 'Whether the selected candidate needs the six-suite regression proof before ' +
+          "orch_apply can apply it. The default is fail-closed: true, so orch_apply refuses the patch " +
+          "until orch_prove has proved it (or the caller passes allow_unproven there). Pass false only " +
+          'for a task whose patch needs no regression proof, such as documentation or prose.',
       }),
       writer: Object.freeze({
         type: 'string',
@@ -227,8 +242,28 @@ export const TOOL_SPECS = Object.freeze([
     }),
   }),
   Object.freeze({
+    name: 'orch_prove',
+    // ★ 인자 둘의 권위는 설계 2026-08-28 §1.1 이다. `wait_ms` 의 두 수는 `orch_run` 과 **같은
+    //   규칙**이고(기본 1,800,000 · 상한 `MAX_WAIT_MS`), 그것이 이 도구가 존재하는 이유의 절반이다:
+    //   실행 9 는 증명 여섯 번이 55분 상한에 안 들어가 잘렸다(2026-08-28 실측).
+    description:
+      "Run the six-suite regression proof for the candidate a finished run selected, and write the " +
+      'result under this server state root. orch_run no longer proves: it runs the candidate suite ' +
+      'twice and reports the proof as deferred, and this call runs the remaining four cells - the ' +
+      'baseline twice, and the baseline with the candidate test files twice - against a worktree it ' +
+      "rebuilds from the run's own manifest. It refuses, each with its own registered code, a run " +
+      'this state root does not hold, a run whose baseline commit or frozen test plan no longer ' +
+      'reproduces, and a candidate whose tree or test delta no longer matches what the run recorded. ' +
+      'It applies nothing and writes not one byte into the run directory. orch_apply reads what this ' +
+      'call writes, so call it before you apply. orch_status is where a run_id comes from.',
+    args: Object.freeze({
+      run_id: Object.freeze({ type: 'string', required: true }),
+      wait_ms: Object.freeze({ type: 'number', min: 0, required: false, default: 1_800_000 }),
+    }),
+  }),
+  Object.freeze({
     name: 'orch_apply',
-    // ★ 인자 둘의 권위는 WS0 §1.4 와 `contract/envelope.json` 이다. WS0 §1.4 가 함께 적은
+    // ★ 인자 셋의 권위는 WS0 §1.4 와 `contract/envelope.json` 이다. WS0 §1.4 가 함께 적은
     //   `three_way`·`candidate_id` 는 **안 받는다** — 그 이유는 `src/tools/apply.mjs` 머리말에 있다.
     description:
       "Apply a finished run's patch to your own repository. This is the explicit step: orch_run " +
@@ -236,10 +271,13 @@ export const TOOL_SPECS = Object.freeze([
       'until this call is made. It refuses, each with its own registered code, a run this state root ' +
       'does not hold, a run whose records cannot be read, and a run whose patch is gone or is not a ' +
       'file. Pass check_only to have the call report what it would do and change nothing. ' +
+      'A run whose task needed a regression proof is refused until orch_prove has proved this exact ' +
+      'patch, unless allow_unproven is passed, which never lifts a proof that ran and failed. ' +
       'orch_status is where a run_id comes from.',
     args: Object.freeze({
       run_id: Object.freeze({ type: 'string', required: true }),
       check_only: Object.freeze({ type: 'boolean', required: false, default: false }),
+      allow_unproven: Object.freeze({ type: 'boolean', required: false, default: false }),
     }),
   }),
   Object.freeze({
@@ -709,6 +747,7 @@ const HANDLERS = {
   orch_config: runOrchConfig,
   orch_stats: runOrchStats,
   orch_status: runOrchStatus,
+  orch_prove: runOrchProve,
   orch_apply: runOrchApply,
   orch_reward: runOrchReward,
   orch_reset: runOrchReset,

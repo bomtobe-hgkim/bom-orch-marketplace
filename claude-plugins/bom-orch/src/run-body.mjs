@@ -527,7 +527,16 @@ export function buildRunBody(input) {
     issues,
     candidates: candidates.map(contentCandidate),
     attempts,
-    regressionProof: { status: proofStatus, selectedCandidateId, evidenceRefs, omittedEvidenceCount },
+    // ★★ 유예된 증명은 **다음 걸음을 이름으로** 말한다. 실행 9(2026-08-28) 뒤 여섯 칸은
+    //   `orch_prove` 가 지므로, 본문만 읽는 쪽이 「무엇이 남았는가」를 사유 코드 없이 알아야
+    //   한다. 키는 언제나 있고 값만 갈린다 — 있다가 없으면 호출부가 키 존재로 분기한다.
+    regressionProof: {
+      status: proofStatus,
+      next: proofStatus === 'deferred' ? 'orch_prove' : null,
+      selectedCandidateId,
+      evidenceRefs,
+      omittedEvidenceCount,
+    },
     selection,
     artifacts: {
       manifestPath: manifestRef?.path ?? pathBudget.paths.manifestPath,

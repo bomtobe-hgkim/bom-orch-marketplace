@@ -2,7 +2,7 @@
  * attempt·evidence **기록의 정규화기** — 놓였거나 놓일 JSON 하나가 이 실행의 것인지 재는 자리. 매니페스트는 그 기록들의 **참조**만 든다(`src/run-manifest.mjs`).
  * ★ 방향은 하나뿐이다 — 여기서 `src/run-artifacts.mjs` 를 수입하지 않는다. 유일한 역참조였던 `finalPathForIdentity` 는 `verifySealedEvidenceAuthority` 의 **인자**로 들어온다(WS4a 메모 B.2):
  *   봉인된 evidence 는 커밋 목록에서 그때그때 찾은 identity 마다 경로가 필요하므로 경로 하나가 아니라 해석기를 받는다. 이 파일에서 바이트가 바뀐 줄은 그 둘뿐이다.
- * ★ 실측 폐포: **17개 모듈 / 6,450줄**(자기 자신 355 포함) — `reason-codes`·`reason-text`·`run-manifest`(태스크 3 뒤 `manifest-selection`·`candidate-selection`·`verdict`, WS4b 뒤 `preflight`, WS5 T12 뒤 `manifest-vocabulary` 를 끈다)·`run-store-fs`(`verifyStorePath` 하나)·`util/{errors,freeze,fs-atomic,hash,objects,paths,strings}`. 저장소 본체도 `content-projection` 도 없다.
+ * ★ 실측 폐포: **17개 모듈 / 6,594줄**(자기 자신 355 포함) — `reason-codes`·`reason-text`·`run-manifest`(태스크 3 뒤 `manifest-selection`·`candidate-selection`·`verdict`, WS4b 뒤 `preflight`, WS5 T12 뒤 `manifest-vocabulary` 를 끈다)·`run-store-fs`(`verifyStorePath` 하나)·`util/{errors,freeze,fs-atomic,hash,objects,paths,strings}`. 저장소 본체도 `content-projection` 도 없다.
  * ★ 수입하는 쪽은 셋이다: `src/run-artifacts.mjs`(일곱), `src/run-read.mjs`(`normalizeAttemptRecord`·`normalizePlanRecord`), `src/candidate-lane.mjs`(`MAX_ISSUE_CLAIM_CHARS`) — 앞의 둘은 태스크 9 의 다섯째 kind 로 각각 하나씩 늘었다.
  */
 

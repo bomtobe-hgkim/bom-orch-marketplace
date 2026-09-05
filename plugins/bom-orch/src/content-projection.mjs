@@ -7,11 +7,11 @@ import { SCOPE_RULES } from './patch-scope.mjs';
 import { AUTH_NOT_LOGGED_IN, AUTH_UNKNOWN, EVIDENCE_POSSIBLE, EVIDENCE_UNREACHABLE } from './preflight.mjs';
 import { REASON, REASON_CODES, STOP_REASONS, isReasonCode, normalizeLegacyReasonCode } from './reason-codes.mjs';
 import { NOTICE_TEXT, fail, renderNotice } from './reason-text.mjs';
-import { LANES, validLane } from './manifest-vocabulary.mjs';
+import { LANES, PROOF_STATUSES as PROOF_STATUS_VALUES, validLane } from './manifest-vocabulary.mjs';
 import { deepFreeze } from './util/freeze.mjs';
 import { exactDenseArray, exactObject, ownDataValue } from './util/objects.mjs';
 import { boundedText as cleanText, clipPlain, clipWhole, compareUtf8, safeInteger } from './util/strings.mjs';
-/** ★ 실측 폐포: **31개 모듈 / 13,165줄**(자기 자신 1,798 포함). */
+/** ★ 실측 폐포: **31개 모듈 / 13,323줄**(자기 자신 1,807 포함). */
 /**
  * 바닥 한 장의 크기는 **두 반쪽**이고 이 상수가 그 둘을 가르는 선이다. 둘의 합이
  * `MAX_CONTENT_CHARS` 를 넘지 않아야 「관문을 지난 실행의 봉투는 본문을 싣는다」가 참이 된다.
@@ -53,7 +53,7 @@ const RUN_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const WINDOWS_DEVICE_PATTERN = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
 const SELECTED_OUTCOMES = new Set(['winner', 'single_survivor', 'equivalent']);
 const ALL_OUTCOMES = new Set([...SELECTED_OUTCOMES, 'tie', 'none']);
-const PROOF_STATUSES = new Set(['proved', 'not_applicable', 'not_proven', 'unavailable', 'flaky']);
+const PROOF_STATUSES = new Set(PROOF_STATUS_VALUES);
 /**
  * 봉투가 싣는 스코프 사유의 상한(스펙 §4: ≤10). 생산자의 `MAX_REASONS`(100)와 **다른 수**이고
  * 그것이 맞다: 생산자는 장부를 쓰고, 봉투는 사람이 읽을 만큼만 나른다. 자를 때 개수를
@@ -412,7 +412,9 @@ const TUPLE_TERMINALS = new Set(['verified', 'usable_unverified']);
 const TUPLE_TESTS = new Set(['stable_repeated_full_pass', 'stable_one_pass', 'unknown_or_not_run', 'flaky']);
 const DECISIVE_FIELDS = new Set(['terminalClass', 'proof', 'tests', 'openIssues', 'scope']);
 const TERMINAL_RANK = Object.freeze({ verified: 1, usable_unverified: 0 });
-const PROOF_RANK = Object.freeze({ proved: 4, not_applicable: 3, not_proven: 2, unavailable: 1, flaky: 0 });
+// ★ `src/candidate-selection.mjs:255` 의 사본이다 — 두 표가 갈리면 선택기가 낸 튜플을 본문
+//   투영이 거절해 실행이 봉투를 못 낸다. `deferred` 는 `not_applicable` 과 같은 칸이다.
+const PROOF_RANK = Object.freeze({ proved: 4, not_applicable: 3, deferred: 3, not_proven: 2, unavailable: 1, flaky: 0 });
 const TEST_RANK = Object.freeze({ stable_repeated_full_pass: 3, stable_one_pass: 2, unknown_or_not_run: 1, flaky: 0 });
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
@@ -1083,6 +1085,9 @@ function projectEvidence(value, limit = null, authority = null) {
   return { entries: kept, omitted: malformed + entries.length - kept.length };
 }
 
+/** 유예된 증명이 가리키는 다음 도구 하나(계약 runBody 의 regressionProof 행). 나머지 다섯은 `null` 이다. */
+const proofNext = (status) => status === 'deferred' ? 'orch_prove' : null;
+
 function projectRegressionProof(value, evidenceLimit = null, authority = null) {
   const projected = projectEvidence(data(value, 'evidenceRefs'), evidenceLimit, authority);
   const status = data(value, 'status');
@@ -1092,6 +1097,7 @@ function projectRegressionProof(value, evidenceLimit = null, authority = null) {
       priorOmitted === null) throw new TypeError('Invalid regression proof projection.');
   return {
     status,
+    next: proofNext(status),
     selectedCandidateId,
     evidenceRefs: projected.entries,
     omittedEvidenceCount: checkedAdd(priorOmitted, projected.omitted),
@@ -1663,9 +1669,11 @@ function buildFixedContentProjection(summary) {
     const legacyPatch = data(summary, 'aliasDurable') === true && Object.hasOwn(floor, 'patch') ? floor.patch : null;
     const selectedFloorCandidate = floor.selection.selectedCandidateId === null ? null
       : floor.candidates.find((candidate) => candidate.candidateId === floor.selection.selectedCandidateId);
+    const floorProofStatus = selectedFloorCandidate?.proofStatus ??
+      (rawProof?.selectedCandidateId === floor.selection.selectedCandidateId ? rawProof.status : 'unavailable');
     const proof = {
-      status: selectedFloorCandidate?.proofStatus ??
-        (rawProof?.selectedCandidateId === floor.selection.selectedCandidateId ? rawProof.status : 'unavailable'),
+      status: floorProofStatus,
+      next: proofNext(floorProofStatus),
       selectedCandidateId: floor.selection.selectedCandidateId,
       evidenceRefs: [],
       omittedEvidenceCount: floor.omittedCounts.evidence,
@@ -1696,6 +1704,7 @@ function buildFixedContentProjection(summary) {
       attempts: [],
       regressionProof: {
         status: proof.status,
+        next: proof.next,
         selectedCandidateId: proof.selectedCandidateId,
         evidenceRefs: [],
         omittedEvidenceCount: proof.omittedEvidenceCount,

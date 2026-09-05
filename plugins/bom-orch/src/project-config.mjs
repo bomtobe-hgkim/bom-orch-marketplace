@@ -44,9 +44,9 @@ import { deepFreeze } from './util/freeze.mjs';
  * 무엇을 저장할지 정하기 전에 무엇을 돌릴지가 정해진다. 반대 방향도 없다: 저장소 모듈이
  * 이 파일을 수입하지 않는다.
  *
- * ★ 실측 폐포: **9개 모듈 / 4,613줄**(자기 자신 489 포함) — `git`(1,128)과 그것이 끄는
+ * ★ 실측 폐포: **9개 모듈 / 4,700줄**(자기 자신 489 포함) — `git`(1,128)과 그것이 끄는
  *   `providers/error-catalog`(437)·`providers/resolve-binary`(291)·`state-root`(34),
- *   `reason-codes`(716)·`reason-text`(1,294), `util/freeze`(43)·`util/strings`(181).
+ *   `reason-codes`(737)·`reason-text`(1,360), `util/freeze`(43)·`util/strings`(181).
  *   저장소 모듈은 **0개**이고 `content-projection` 도 `run-*` 도 없다.
  * ★ 수입하는 쪽(실측 grep): `src/engine.mjs`(`verifyProjectConfigSealed`) · `src/test-discovery.mjs`
  *   (`PROJECT_CONFIG_FILE`·`readProjectConfig`) · `src/deps-provision.mjs`(`PROJECT_CONFIG_FILE`, 태스크 5) ·

@@ -21,7 +21,7 @@
  */
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
-import { LANES, sameJson, validLane } from './manifest-vocabulary.mjs';
+import { LANES, PROOF_STATUSES, sameJson, validLane } from './manifest-vocabulary.mjs';
 import { normalizeSelection, selectionConsistent } from './manifest-selection.mjs';
 import { deepFreeze } from './util/freeze.mjs';
 import { sha256 } from './util/hash.mjs';
@@ -156,7 +156,17 @@ function normalizeInitialManifest(value, runId) {
   const proof = exactObject(object.proofRequirement, ['required', 'reason']).value ?? null;
   const planner = normalizeRoleBinding(object.plannerBinding, 'planner');
   const laneEntries = exactDenseArray(object.laneBindings, 2);
-  const reasons = ['explicit_bug_fix', 'explicit_non_bug', 'default_code_change', 'non_code_task'];
+  // ★ 오너 결정 B(2026-08-31, `src/regression-proof.mjs`): 앞 둘(`default_required`·
+  //   `explicit_opt_out`)만 이제부터 **쓰인다** — classifyProofRequirement 는 requireProof
+  //   하나로만 결정하고 과제 글자·taskClass 는 안 본다. 뒤 넷(`explicit_bug_fix`·
+  //   `explicit_non_bug`·`default_code_change`·`non_code_task`)은 그 이전 실행이 디스크에
+  //   남긴 **레거시** 값이다(예: 라이브 실행 10의 매니페스트, `test/fixtures/runs/v022/run.json`)
+  //   — 읽히기만 하고 다시는 안 쓰인다. 목록을 좁히면 옛 매니페스트가 통째로 무효가 되고
+  //   `src/reaper.mjs` 는 그 실행을 noncanonical_manifest 로 영원히 회수하지 못한다.
+  const reasons = [
+    'default_required', 'explicit_opt_out',
+    'explicit_bug_fix', 'explicit_non_bug', 'default_code_change', 'non_code_task',
+  ];
   if (baseline === null || !OBJECT_ID_PATTERN.test(baseline.commit) || !OBJECT_ID_PATTERN.test(baseline.tree) ||
       plan === null || !SHA256_PATTERN.test(plan.planFingerprint) || !SHA256_PATTERN.test(plan.environmentFingerprint) ||
       proof === null || typeof proof.required !== 'boolean' || !reasons.includes(proof.reason) || planner === null ||
@@ -484,7 +494,7 @@ function normalizeCandidateRef(value) {
       !['verified', 'usable_unverified', 'rejected', 'blocked'].includes(object.terminalClass) ||
       !(object.treeHash === null || OBJECT_ID_PATTERN.test(object.treeHash)) || patchRef === null && object.patchRef !== null ||
       patchRef !== null && (patchRef.kind !== 'candidate' || patchRef.candidateId !== object.candidateId) ||
-      !['proved', 'not_applicable', 'not_proven', 'unavailable', 'flaky'].includes(object.proofStatus) || tests === null || scope === null) return null;
+      !PROOF_STATUSES.includes(object.proofStatus) || tests === null || scope === null) return null;
   if (object.terminalClass === 'blocked' && object.sourceAttemptId === null && (object.treeHash !== null || patchRef !== null)) return null;
   return {
     candidateId: object.candidateId,
